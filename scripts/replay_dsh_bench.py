@@ -178,16 +178,29 @@ def main():
     #   长 prompt 下几个预填是**串行**的(解码起点错开几十秒)⇒ 聚合值被严重稀释 ✗
     #   ⇒ 每请求速率**与重叠无关**,跨 C 可比;投机下 chunk≠token,所以分子必须用 usage 的真实 token 数 ✓
     rates = []
+    tot_tok, tot_span = 0, 0.0
     for v in ok:
         m = v["marks"]
         if len(m) >= 2 and int(v.get("n") or 0) > 0:
             span = m[-1] - m[0]
             if span > 1e-6:
                 rates.append((int(v["n"]) - 1) / span)
+                tot_tok += int(v["n"])
+                tot_span += span
     if rates:
         print(f"  ⭐⭐ 每请求解码速率 中位 {statistics.median(rates):.2f} tok/s"
               f"  (mean {statistics.mean(rates):.2f}; 各请求 "
               + " ".join(f"{r:.1f}" for r in sorted(rates)) + ")✓")
+    # ⭐⭐⭐ 2026-10-10(用户定口径):**精确解码吞吐 = 解码输出 token / 解码段时长**,
+    #   分母只用每个请求**自己**的 `末 token − 首 token` ⇒ **已排除预填、TTFT 与"混合期"**
+    #   (长 prompt 下几个预填串行、解码起点错开 ⇒ 任何用"全局墙钟"的口径都会被稀释 ✗)✓
+    #   Σtoken/Σ解码段 = 每请求解码速率的加权平均(≈"一路解码有多快");
+    #   乘并发数 = **全 C 路同时解码时的聚合吞吐** ✓
+    if tot_span > 0:
+        _r = tot_tok / tot_span
+        print(f"  ⭐⭐⭐ 精确解码吞吐 Σtoken/Σ解码段 = {_r:.2f} tok/s"
+              f"  (Σtoken={tot_tok}, Σ解码段={tot_span:.1f}s; ⛔ 不含预填/TTFT/混合期)"
+              f"  ⇒ 全 {len(ok)} 路同时解码的聚合 ≈ **{_r*len(ok):.1f} tok/s**✓")
     if ntok and nchunks:
         _tt = statistics.median(ttfts) if ttfts else 0.0
         _dec = max(0.1, wall - _tt)

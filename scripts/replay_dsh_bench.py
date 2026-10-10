@@ -172,6 +172,22 @@ def main():
 
     print(f"完成 {len(ok)}/{len(recs)} 条 · 墙钟 {wall:.1f}s")
     print(f"  生成 token {ntok}(服务端 usage) · 输出吞吐 {ntok/wall:.2f} tok/s")
+    # ⭐⭐ 2026-10-10 新增(用户指出"长 prompt 的数还是不对"后定的口径):
+    #   **每请求解码速率** = (该请求的真实 token 数 − 1) / (它自己的末 chunk − 首 chunk 时刻) ✓
+    #   为什么不看"聚合":聚合的分母 `max末token − min首token` **默认 c 路解码期重叠** ——
+    #   长 prompt 下几个预填是**串行**的(解码起点错开几十秒)⇒ 聚合值被严重稀释 ✗
+    #   ⇒ 每请求速率**与重叠无关**,跨 C 可比;投机下 chunk≠token,所以分子必须用 usage 的真实 token 数 ✓
+    rates = []
+    for v in ok:
+        m = v["marks"]
+        if len(m) >= 2 and int(v.get("n") or 0) > 0:
+            span = m[-1] - m[0]
+            if span > 1e-6:
+                rates.append((int(v["n"]) - 1) / span)
+    if rates:
+        print(f"  ⭐⭐ 每请求解码速率 中位 {statistics.median(rates):.2f} tok/s"
+              f"  (mean {statistics.mean(rates):.2f}; 各请求 "
+              + " ".join(f"{r:.1f}" for r in sorted(rates)) + ")✓")
     if ntok and nchunks:
         _tt = statistics.median(ttfts) if ttfts else 0.0
         _dec = max(0.1, wall - _tt)

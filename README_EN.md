@@ -42,61 +42,23 @@ Every performance number below was taken on this machine:
 
 ## Performance
 
-* Metric: **aggregate throughput** -- `prefill (tok/s) = concurrency x prompt_tokens / TTFT`, `decode (tok/s) = (output tokens - concurrency) / (last-token time - first-token time)`
-  * The aggregate decode formula is only meaningful when the per-request decode windows **overlap**: with a
-    long prompt the prefills run **serially** (decode start times stagger), so it **under-reports** and is
-    not comparable across concurrency. For publishable decode numbers use the **per-request decode window**
-    metric (see the "measurement ground rules" in `docs/EXPERIMENTS.md`).
-  * Under speculative decoding the number of SSE **chunks is not** the number of tokens (one flush carries
-    ~acceptance-length tokens): always count tokens from the server `usage`.
-  > **What is real** is that mixing a long prefill with a decoding request on one engine starves the
-  > decoder (measured, **B277**/**B279**): its inter-token latency is bounded below by the prefill
-  > scheduled between its steps divided by prefill throughput. Injecting a 32768-token prompt into a
-  > running decode took that request's ITL from a **64.8 ms median to about 8.4 s, sustained for the
-  > whole 57.6 s prefill window** -- it gets exactly one token per step, and each step is filled by one
-  > `MBT`-sized prefill chunk. Shrinking the chunk (`--long-prefill-token-threshold`) also destroys
-  > prefill efficiency, because every chunk re-streams all forty layers of weights (a 2048-token chunk
-  > runs at about 410 tok/s against roughly 1000 for 8192), so it makes the throughput **worse**
-  > (1.25 -> 0.57 tok/s). There is no scheduler knob that fixes this.
-  > * **Single-stream serving** (the 1M x `seqs=1` preset): `--max-num-seqs 1` serialises requests so
-  >   nothing is mixed; per-stream ITL stays a steady ~65 ms. Pick by scenario: **1M x 1 / 512K x 2 /
-  >   256K x 4**, plus the **`512K` x 4 combination production uses** (high ceiling + many short tasks;
-  >   only about **2 full-length lanes** can run at once, the rest **queue** rather than fail).
-  >   `seqs x maxlen <= pool` is a **saturation threshold, not a hard invariant**. See
-  >   `docs/MODEL_GUIDES.md` section 0.1b.
-  > * **Multi-user concurrency**: use **prefill/decode disaggregation**, not `max-num-seqs`,
-  >   `max-num-batched-tokens` or `long-prefill-token-threshold`.
-  > * **Root cause**: prefill throughput is **DMA / assembly-bound** -- every chunk re-streams about
-  >   **3.84 GB** of weights per card per layer; the device-side **strided transpose** measures only
-  >   **84 GB/s** against **1361 GB/s** contiguous, and assembly takes **250 ms/layer = 85%**, while that
-  >   layer's MoE compute needs only **5-50 ms**. Faster prefill needs the strided transpose removed or the
-  >   assembly fused, not scheduling.
-  > * The old note that "`--max-num-seqs` must be >=2" holds only for **benchmarking**: with `seqs=1` a
-  >   `C=2` run degrades to serial and depresses short-C=2 aggregate prefill to 54 (a **configuration**
-  >   problem, **B124**). Use `seqs>=2` for concurrency benchmarks and `seqs=1` for single-stream serving.
-* Dataset: **random tokens**, with `--random-input-len` pinned to short 128 / long 16384 and output 128; prefix caching on; 8 requests per cell with **a distinct seed per cell**.
-* "actual tokens" = `total_input_tokens / completed` (includes a small chat-template overhead).
-  Configuration details, criteria and the `MBT` trade-off live in `docs/TUNING_GUIDE.md` section 8 and `docs/EXPERIMENTS.md`.
+* The **DeepSeek-V4.1-Flash row is the 2026-10-12 measurement on the current production config** (the authoritative numbers in this table); **GLM-5.3 and MiMo-V2.6 rows are legacy** v0.2.4-v0.2.6 numbers (random dataset, aggregate metric), pending re-measurement.
+* Metrics: **prefill** = `sum(prefill tokens) / (last decode start)`, measured **cold** (cache-missed); **decode** = **per-request decode window** `(own tokens - 1) / (own last - first token)` -- overlap-independent, directly comparable across concurrency; **aggregate decode = per-request x C**. Ground rules: "measurement ground rules" in `docs/EXPERIMENTS.md` and **B388** (under speculation, SSE chunks are not tokens; always count from server `usage`).
+* Config details, criteria and the `MBT` trade-off: `docs/TUNING_GUIDE.md` section 8 and `docs/MODEL_GUIDES.md` section 0.1.
 
-| Model (optimal config) | prompt | actual tokens | conc. | prefill (tok/s) | decode (tok/s) |
+| Model (optimal config) | load | actual tokens | conc. | prefill (tok/s) | decode (tok/s) |
 |---|---|---|---|---|---|
-| **GLM-5.3-Flash**<br>TP=2 · util 0.85 · **MAXLEN 262144**<br>MBT 12288 · MTP off | short | 140 | 1 | **115.2** | **22.0** |
-| | short | 140 | 2 | **140.8** | **27.8** |
-| | long | 16,396 | 1 | **266.3** | **21.4** |
-| | long | 16,396 | 2 | pending | pending |
-| **DeepSeek-V4.1-Flash**<br>TP=2 · util 0.90 · **MAXLEN 524288**<br>**MBT 8192** · **seqs 4** · **DSpark k=5** (v0.2.7 production config) | short | 128 | 1 | **261.1** | —† |
-| | short | 128 | 2 | **269.8** | —† |
-| | short | 128 | 4 | **276.2** | —† |
-| | long | 16,384 | 1 | **1011.0** | —† |
-| | long | 16,384 | 2 | **1010.1** | —† |
-| | long | 16,384 | 4 | **1005.0** | —† |
-| | **genuine DSH transcript**‡ | ≈9,300 | 1 | — | **48.7** |
-| | genuine DSH transcript‡ | ≈9,300 | 2 | — | **35.2** |
-| | genuine DSH transcript‡ | ≈9,300 | 4 | — | **23.8** |
+| **GLM-5.3-Flash**<br>TP=2 · util 0.85 · **MAXLEN 262144**<br>MBT 12288 · MTP off | short (random) | 140 | 1 | **115.2** | **22.0** |
+| | short (random) | 140 | 2 | **140.8** | **27.8** |
+| **DeepSeek-V4.1-Flash**<br>TP=2 · util 0.90 · **MAXLEN 524288**<br>**MBT 8192** · **seqs 4** · **DSpark k=5** (v0.2.7 production config) | genuine DSH transcript‡ | ≈9,340 | 1 | **1,041** | **48.7** |
+| | genuine DSH transcript‡ | ≈9,340 | 2 | **1,045** | **70.4** |
+| | genuine DSH transcript‡ | ≈9,340 | 4 | **1,156** | **95.2** |
+| **MiMo-V2.6-Flash-RL**<br>TP=2 · util 0.85 · **MAXLEN 131072**<br>MBT 8192 · **seqs 4** · **MTP k=1** · **GPU prefill on (threshold 4096)** | short (random) | 128 | 1 | **232.0** | **30.5** |
+| | short (random) | 128 | 2 | **367.5** | **40.7** |
+| | long (random) | 16,384 | 1 | **811.3** | **27.3** |
+| | long (random) | 16,384 | 2 | **1455.3** | **39.6** |
 
-GLM-5.3-Flash is as labeled in the table; the DeepSeek production config runs **DSpark k=5** and MiMo-V2.6 runs **MTP k=1**.
-† Random tokens are the **worst case** for speculation (unpredictable, acceptance ≈1): spec-decode throughput is not published under the random metric.
-‡ Decode load: **genuine DSH session transcripts** (4 records, ≈9.3K-token prefix each, natural long output), greedy, `max_tokens=1024` as a **cap only** (natural stop); metric = **per-request decode window** (overlap-independent, see the "measurement ground rules" in `docs/EXPERIMENTS.md`); ≥8 pooled requests per level ⇒ **aggregate = per-request × C**. Measured 2026-10-12 on the production instance (`seqs=4`) after full warm-up; all self-checks pass; **these numbers supersede** the 2026-10-10 set (2.4x / 2.4x / 1.8x), which was inflated by `min_tokens`-forced continuations — history, gains vs non-speculative (≈2.9x / 2.1x / 1.7x) and full data: [v0.2.7 release notes](RELEASE_NOTES_v0.2.7.md).
+‡ Load = **4 genuine DSH session transcripts** (each ≈9,340 tokens, distinct, natural long output). **The decode column is aggregate throughput** (= per-request x C): **48.7 / 70.4 / 95.2** at C=1/2/4, i.e. per-request 48.7 / 35.2 / 23.8. Method: greedy, `max_tokens=1024` is a **cap only** -- beyond ~1K tokens these transcripts provably loop into format regurgitation (degeneracy check: 8-gram copy rate >70%), so the cap sits inside the non-degenerate window (**B388**); >=8 pooled requests per level; all self-checks pass (tokens/chunk ≈ acceptance length 3.9-4.5); gain over non-speculative **≈2.9x / 2.1x / 1.7x** (the old 2.4x/2.4x/1.8x set was inflated by `min_tokens`-forced continuation and is retired). **Prefill**: the same transcripts with a random-salt head forcing a cache miss (`cached_tokens=0` self-check); prefills run **serially** at C>=2, so aggregate prefill barely rises and decode starts stagger (the per-request decode metric is unaffected). Full data: [v0.2.7 release notes](RELEASE_NOTES_v0.2.7.md).
 
 ## Quick start
 

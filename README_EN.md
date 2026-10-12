@@ -43,6 +43,12 @@ Every performance number below was taken on this machine:
 ## Performance
 
 * Metric: **aggregate throughput** -- `prefill (tok/s) = concurrency x prompt_tokens / TTFT`, `decode (tok/s) = (output tokens - concurrency) / (last-token time - first-token time)`
+  * The aggregate decode formula is only meaningful when the per-request decode windows **overlap**: with a
+    long prompt the prefills run **serially** (decode start times stagger), so it **under-reports** and is
+    not comparable across concurrency. For publishable decode numbers use the **per-request decode window**
+    metric (see the "measurement ground rules" in `docs/EXPERIMENTS.md`).
+  * Under speculative decoding the number of SSE **chunks is not** the number of tokens (one flush carries
+    ~acceptance-length tokens): always count tokens from the server `usage`.
   > **What is real** is that mixing a long prefill with a decoding request on one engine starves the
   > decoder (measured, **B277**/**B279**): its inter-token latency is bounded below by the prefill
   > scheduled between its steps divided by prefill throughput. Injecting a 32768-token prompt into a
@@ -82,16 +88,18 @@ Every performance number below was taken on this machine:
 | | short | 128 | 2 | **350.4** | **28.0** |
 | | long | 16,384 | 1 | **903.9** | **19.3** |
 | | long | 16,384 | 2 | **1204.2** | **15.4** |
-| **DeepSeek-V4.1-Flash**<br>TP=2 · util 0.90 · **MAXLEN 524288**<br>**MBT 8192** · **seqs 4** · **DSpark k=5** (v0.2.7 production config) | short | 128 | 1 | **261.1** | **37.9** |
-| | short | 128 | 2 | **269.8** | **49.5** |
-| | short | 128 | 4 | **276.2** | **57.0** |
-| | long | 16,384 | 1 | **1011.0** | **41.0** |
-| | long | 16,384 | 2 | **1010.1** | pending |
-| | long | 16,384 | 4 | **1005.0** | pending |
+| **DeepSeek-V4.1-Flash**<br>TP=2 · util 0.90 · **MAXLEN 524288**<br>**MBT 8192** · **seqs 4** · **DSpark k=5** (v0.2.7 production config) | short | 128 | 1 | **261.1** | see release notes |
+| | short | 128 | 2 | **269.8** | see release notes |
+| | short | 128 | 4 | **276.2** | see release notes |
+| | long | 16,384 | 1 | **1011.0** | see release notes |
+| | long | 16,384 | 2 | **1010.1** | see release notes |
+| | long | 16,384 | 4 | **1005.0** | see release notes |
 
-GLM-5.3-Flash and the DeepSeek CED rows run without speculative decoding. **DSpark k=5** (the v0.2.7
-DeepSeek production config) is substantially faster on decode — see the v0.2.7 release notes for the
-2026-10-10 erratum on that decode column.
+GLM-5.3-Flash and the DeepSeek CED rows run without speculative decoding; the DeepSeek production
+config runs **DSpark k=5** and MiMo-V2.6 runs **MTP k=1**. The DSpark decode column lives in the
+**[v0.2.7 release notes](RELEASE_NOTES_v0.2.7.md)**: measured over 4096-token generations with a
+per-request decode-window metric, decode is **2.4x / 2.4x / 1.8x faster than non-speculative
+at C=1 / 2 / 4**.
 
 ## Quick start
 

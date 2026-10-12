@@ -84,22 +84,19 @@ Every performance number below was taken on this machine:
 | | short | 140 | 2 | **140.8** | **27.8** |
 | | long | 16,396 | 1 | **266.3** | **21.4** |
 | | long | 16,396 | 2 | pending | pending |
-| **DeepSeek-V4.1-Flash**<br>TP=2 · util 0.85 · **MAXLEN 262144**<br>MBT 8192 · **CED on** (long rows) · spec decode off | short | 128 | 1 | **254.3** | **19.8** |
-| | short | 128 | 2 | **350.4** | **28.0** |
-| | long | 16,384 | 1 | **903.9** | **19.3** |
-| | long | 16,384 | 2 | **1204.2** | **15.4** |
-| **DeepSeek-V4.1-Flash**<br>TP=2 · util 0.90 · **MAXLEN 524288**<br>**MBT 8192** · **seqs 4** · **DSpark k=5** (v0.2.7 production config) | short | 128 | 1 | **261.1** | see release notes |
-| | short | 128 | 2 | **269.8** | see release notes |
-| | short | 128 | 4 | **276.2** | see release notes |
-| | long | 16,384 | 1 | **1011.0** | see release notes |
-| | long | 16,384 | 2 | **1010.1** | see release notes |
-| | long | 16,384 | 4 | **1005.0** | see release notes |
+| **DeepSeek-V4.1-Flash**<br>TP=2 · util 0.90 · **MAXLEN 524288**<br>**MBT 8192** · **seqs 4** · **DSpark k=5** (v0.2.7 production config) | short | 128 | 1 | **261.1** | —† |
+| | short | 128 | 2 | **269.8** | —† |
+| | short | 128 | 4 | **276.2** | —† |
+| | long | 16,384 | 1 | **1011.0** | —† |
+| | long | 16,384 | 2 | **1010.1** | —† |
+| | long | 16,384 | 4 | **1005.0** | —† |
+| | **genuine DSH transcript**‡ | ≈9,300 | 1 | — | **48.7** |
+| | genuine DSH transcript‡ | ≈9,300 | 2 | — | **35.2** |
+| | genuine DSH transcript‡ | ≈9,300 | 4 | — | **23.8** |
 
-GLM-5.3-Flash and the DeepSeek CED rows run without speculative decoding; the DeepSeek production
-config runs **DSpark k=5** and MiMo-V2.6 runs **MTP k=1**. The DSpark decode column lives in the
-**[v0.2.7 release notes](RELEASE_NOTES_v0.2.7.md)**: measured over 4096-token generations with a
-per-request decode-window metric, decode is **2.4x / 2.4x / 1.8x faster than non-speculative
-at C=1 / 2 / 4**.
+GLM-5.3-Flash is as labeled in the table; the DeepSeek production config runs **DSpark k=5** and MiMo-V2.6 runs **MTP k=1**.
+† Random tokens are the **worst case** for speculation (unpredictable, acceptance ≈1): spec-decode throughput is not published under the random metric.
+‡ Decode load: **genuine DSH session transcripts** (4 records, ≈9.3K-token prefix each, natural long output), greedy, `max_tokens=1024` as a **cap only** (natural stop); metric = **per-request decode window** (overlap-independent, see the "measurement ground rules" in `docs/EXPERIMENTS.md`); ≥8 pooled requests per level ⇒ **aggregate = per-request × C**. Measured 2026-10-12 on the production instance (`seqs=4`) after full warm-up; all self-checks pass; **these numbers supersede** the 2026-10-10 set (2.4x / 2.4x / 1.8x), which was inflated by `min_tokens`-forced continuations — history, gains vs non-speculative (≈2.9x / 2.1x / 1.7x) and full data: [v0.2.7 release notes](RELEASE_NOTES_v0.2.7.md).
 
 ## Quick start
 

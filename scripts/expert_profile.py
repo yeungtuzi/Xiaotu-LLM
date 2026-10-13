@@ -63,26 +63,29 @@ def loo_hit_rate(all_lines, slots, folds=10):
 def read_bin(path, decode_only=True):
     """读 XTU-RDUMP 二进制流:rec = [u64 tag][u32 qlen][u32 k][u64 ts_ns][i32 ids...](见 binding.cpp xtu_rd)。
     产出 (tag, qlen, k, ts, ids) 序列;tag(引擎指针) ⇒ 层身份(首见序 → 层号)。"""
-    import struct
+    import struct, glob as _glob
+    files = sorted(_glob.glob(path)) if any(c in path for c in "*?[") else [path]
     lay = {}
     recs = []
-    with open(path, "rb") as f:
-        buf = f.read()
-    off = 0
-    while off + 24 <= len(buf):
-        tag, qlen, k, ts = struct.unpack_from("<QIIQ", buf, off)
-        n = qlen * k
-        if n <= 0 or qlen > 1000000 or k > 64:
-            break  # 流损坏/截断 ⇒ 到此为止(尽力而为)
-        if off + 24 + 4 * n > len(buf):
-            break
-        ids = list(struct.unpack_from(f"<{n}i", buf, off + 24))
-        off += 24 + 4 * n
-        if decode_only and qlen > 16:
-            continue  # decode 形态(M≤16);prefill 记录单独口径
-        if tag not in lay:
-            lay[tag] = len(lay)
-        recs.append((lay[tag], ts, ids))
+    for fp in files:
+        with open(fp, "rb") as f:
+            buf = f.read()
+        off = 0
+        while off + 24 <= len(buf):
+            tag, qlen, k, ts = struct.unpack_from("<QIIQ", buf, off)
+            n = qlen * k
+            if n <= 0 or qlen > 1000000 or k > 64:
+                break  # 流损坏/截断 ⇒ 到此为止(尽力而为)
+            if off + 24 + 4 * n > len(buf):
+                break
+            ids = list(struct.unpack_from(f"<{n}i", buf, off + 24))
+            off += 24 + 4 * n
+            if decode_only and qlen > 16:
+                continue  # decode 形态(M≤16);prefill 记录单独口径
+            if tag not in lay:
+                lay[tag] = len(lay)
+            recs.append((lay[tag], ts, ids))
+    recs.sort(key=lambda r: r[1])  # 多 pid 文件(TP=2 双 worker)按时间归并
     return recs, len(lay)
 
 

@@ -459,7 +459,10 @@ static void ensure_init() {
         const char* p = std::getenv("XIAOTU_ROUTING_DUMP");
         if (!p || !*p) return;
         g_buf = (char*)calloc(kSlots * kSlotBytes, 1);
-        g_fd = ::open(p, O_CREAT | O_WRONLY | O_APPEND | O_CLOEXEC, 0644);
+        // TP=2 有两个 worker 进程 ⇒ 同文件会交错写坏记录流;pid 后缀分文件,reader 按 ts 归并。
+        char pathbuf[600];
+        snprintf(pathbuf, sizeof(pathbuf), "%s.pid%d", p, (int)::getpid());
+        g_fd = ::open(pathbuf, O_CREAT | O_WRONLY | O_APPEND | O_CLOEXEC, 0644);
         if (!g_buf || g_fd < 0) {
             fprintf(stderr, "[xtu-rdump] 初始化失败(buf=%p fd=%d)⇒ 保持关闭\n",
                     (void*)g_buf, g_fd);
@@ -468,7 +471,7 @@ static void ensure_init() {
         g_on.store(true);
         std::thread(writer_loop).detach();
         fprintf(stderr, "[xtu-rdump] active → %s(环 %zu 槽 × %zu MiB)\n",
-                p, kSlots, kSlotBytes >> 20);
+                pathbuf, kSlots, kSlotBytes >> 20);
     });
 }
 

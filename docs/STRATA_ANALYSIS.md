@@ -1,5 +1,7 @@
 # Strata 技术分析报告 —— 特色剖析与对本项目的建议
 
+> ⚠️ **【2026-10-13 备注】分析报告属于过程文档,本项目未采纳,具体原因见尾部追加内容。**
+
 > **分析对象**:[Niko1221/Strata](https://github.com/Niko1221/Strata)(`main`,engine v0.1.40.3)
 > **分析日期**:2026-10-08 · **方法**:clone 到 `/tmp/Strata`(depth-1)后通读 README / AGENTS.md / `docs/**`(31 篇)+ 核心头文件与源码目录;未逐行审内核
 > **读者**:本项目(vllm-xiaotu-moe)内部 · **性质**:技术调研 + 建议,**不是**发布面材料
@@ -339,3 +341,23 @@ CPU 专家池 = 663.6 MB 专家字节/token ÷ ~40 GB/s = 16.2 ms
 **本项目内部出处**:`README.md`(专家层常驻的否决记录 / 显存优先级)、`docs/EXPERIMENTS.md`(B277/B279 长 prefill 饿死解码;B2/B80/B81 MBT 曲线)、`docs/PRODUCTION_8070.md`、`docs/RUNBOOK.md`、`docs/KNOWN_LIMITATIONS.md`、`dev-docs/HANDOFF_DEGEN_AND_MBT_2026-10-06.md`(§4.0 推迟裁决)、`dev-docs/SPEC_mbt_budget.md`、`dev-docs/report/tuning/IRON_RULES.md`(R34/R35)、`dev-docs/BUG_REGISTRY.md`(A58–A65)、`dev-docs/USER_QA_LEDGER.md`(#58–#63)。
 
 **局限**(重复 §0 声明):本报告**未运行** Strata,其全部数字为**自报**;其量化档位与本项目差 2–3 倍,**跨项目的绝对数字不可直接比较**,本报告只把**机理与相对差值**作为参考;R1/R4/R5 的代价评估含**推算成分**,需以本机实测覆盖。
+
+---
+
+## 追加(2026-10-13):采纳结果 = 未采纳,及逐条原因
+
+> 顶部备注所指。结论来源:`PLAN_DECODE_2_2026-10-12` 调研 + B388–B392 实测;**本报告的分析仍然成立,但它给出的建议大多已被证实"我们已有等价物"或"在我们的架构下不成立"**。
+
+| 建议 | 结局 | 原因(证据) |
+|---|---|---|
+| R1 显存留白/ACT_RESERVE 实测化 | 未单独立项 | 该问题在我们这里由 **MBT/ACT_RESERVE 预算线**(`SPEC_mbt_budget`,R34)承担,Strata 的"0 MiB free ⇒ 7×"只是我们已登记结论的同构复述 |
+| R2 profile 二次校验 | — | 本就是**我们自己**的 SPEC 改动①②,非 Strata 输入 |
+| R3 细粒度热专家槽位(Strata 核心) | **不做** | ① **E3 实测**(B391):真转录 top-C 覆盖 C=64 仅 76.5%、无悬崖 ⇒ VRAM 热缓存收益上限低;② 架构不同:我们权重已在**本地 DRAM**(node 分片+mbind,§519),740 GB/s 直读,不存在 Strata 面对的"40 GB/s PCIe 墙"这堵它要绕的墙;③ Strata 不支持 DeepSeek 系(其 issue #310) |
+| R4 chunk 间插入解码窗口 | **已测,更差** | 同族机制 LPT=2048+adaptive 在 B273 实测 **p99 +25%、TTFT +113%,净更差** ✗(饿死问题归 R4 铁律线单独处理)|
+| R5 短 chunk 门槛扫描 | 已有实现 | `VLLM_XIAOTU_GPU_PREFILL_MIN_TOKENS=2560` 正是这个门槛,且已按勘误 C1 校准 |
+| R6 prompt-lookup 草稿 | 不需要 | DSpark(带训练置信头)AL 3.84–4.47,机制更强且已上线 |
+| R7 会话边界检查点 | 随 LMCache 禁用消失 | 调研动机("改写最后一条消息")属 LMCache 线 |
+| R8 台账证据等级列 | 已有等价制度 | 我们的台账本就强制【实测/推算】标注 + QA 错题本 |
+
+**另**:Strata 的 tail-skip(损失型 +13–16%)列入永久评审位未采纳;intra-layer overlap 其自报 **−7%**;SpecMoEOff 式"跨行复用权重行"经代码审计**我们内核已实现**(`moe_v2_packed4_base.inc` ktransformers 模式,B389)。
+**教训(泛化)**:镜像项目调研报告的价值在"同一堵墙的独立证词",不在建议清单本身——落地前必须先对照"我们是否已有等价物 + 墙是不是同一堵"。

@@ -65,9 +65,14 @@ def read_bin(path, decode_only=True):
     产出 (tag, qlen, k, ts, ids) 序列;tag(引擎指针) ⇒ 层身份(首见序 → 层号)。"""
     import struct, glob as _glob
     files = sorted(_glob.glob(path)) if any(c in path for c in "*?[") else [path]
+    # ⛔ TP 冗余纪律(B399):同路由 TP 下每文件=完整流;多文件直连合并 = 每步计两次,
+    #    第二份必中 ⇒ 命中率虚高(apparent=(true+1)/2)。**取第一个文件即全量**,其余丢弃。
+    if len(files) > 1:
+        print(f"[expert_profile] 检测到 {len(files)} 个 rank 文件,只用 {files[0]}(TP 路由冗余)")
+        files = files[:1]
     recs = []
     for fp in files:
-        lay = {}  # ⚠️ 层身份映射**每文件独立**:engine 指针跨进程不同,但注册首见序一致 ⇒ 首见序=层号
+        lay = {}  # 每文件首见序 = 模块注册序 = 层号
         with open(fp, "rb") as f:
             buf = f.read()
         off = 0
@@ -123,6 +128,26 @@ def lru_sweep(recs, caps, slot_gib=0.01752, base_frac=0.0):  # 18.81MB/槽=0.017
         print(f"  [{tag:8s}] cap={cap:6d} 槽(≈{cap*slot_gib:5.2f} GiB): 命中={rate*100:5.1f}%")
 
 
+def emit_table(recs, n_layers, path, slots=None):
+    """SPEC §2 钉选表:全局频率降序 (layer u16, expert u16) 条目 + 头。slots=None ⇒ 全量降序。
+    层号 = 每文件首见序(=模块注册序=层号);跨进程归一纪律同 read_bin。"""
+    import struct, collections
+    cnt = collections.Counter()
+    for (l, _, ids) in recs:
+        for e in ids:
+            cnt[(l, e)] += 1
+    entries = sorted(cnt.items(), key=lambda kv: -kv[1])
+    if slots:
+        entries = entries[:slots]
+    with open(path + ".tmp", "wb") as f:
+        f.write(struct.pack("<4sIIII", b"XTUP", 1, n_layers, 1024, len(entries)))  # E 上限字段=1024 保守
+        for (l, e), _ in entries:
+            f.write(struct.pack("<HH", l, e))
+    import os
+    os.rename(path + ".tmp", path)  # 落盘纪律:tmp+rename(Strata)
+    print(f"emit-table: {len(entries)} 条目 → {path}(最大频率={entries[0][1]})")
+
+
 def main():
     ap = argparse.ArgumentParser()
     ap.add_argument("jsonl", nargs="?")
@@ -131,6 +156,8 @@ def main():
     ap.add_argument("--base", default="0,0.25,0.5", help="受保护常驻占比扫描(Strata 形状 vs 纯LRU)")
     ap.add_argument("--all-prefill", action="store_true", help="read-bin 时不排除 prefill 记录")
     ap.add_argument("--slots", default="64,128,192,256")
+    ap.add_argument("--emit-table", default=None)
+    ap.add_argument("--emit-slots", default=None)
     ap.add_argument("--folds", type=int, default=10)
     a = ap.parse_args()
     if a.read_bin:
@@ -139,6 +166,9 @@ def main():
         caps = [int(x) for x in a.lru.split(",")]
         for bf in [float(x) for x in a.base.split(",")]:
             lru_sweep(recs, caps, base_frac=bf)
+        if a.emit_table:
+            emit_table(recs, n_layers, a.emit_table,
+                       slots=(int(a.emit_slots) if a.emit_slots else None))
         return
     if not a.jsonl:
         ap.error("需要 jsonl 或 --read-bin")

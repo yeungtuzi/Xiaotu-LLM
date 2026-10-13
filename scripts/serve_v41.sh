@@ -435,7 +435,7 @@ fi
   numactl --interleave=all "$PY" -m vllm.entrypoints.openai.api_server \
     --model "$CKPT" --served-model-name DeepSeek-V4.1-Flash \
     --load-format "$LOAD" \
-    --max-model-len "$MAXLEN" --tensor-parallel-size "$TP" --max-num-seqs "${MAXSEQS:-2}" \
+    --max-model-len "$MAXLEN" --tensor-parallel-size "$TP" --max-num-seqs "${MAXSEQS:-4}" \
     $( [ "${MBT}" -gt 0 ] 2>/dev/null && echo --max-num-batched-tokens "$MBT" ) \
     $( [ "${LPT:-0}" -gt 0 ] 2>/dev/null && echo --long-prefill-token-threshold "$LPT" ) \
     $( [ "${LPT_ADAPTIVE:-0}" = "1" ] && echo --long-prefill-token-threshold-adaptive ) \

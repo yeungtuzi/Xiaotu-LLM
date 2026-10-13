@@ -60,12 +60,70 @@ def loo_hit_rate(all_lines, slots, folds=10):
     return hits / tot if tot else float("nan")
 
 
+def read_bin(path, decode_only=True):
+    """读 XTU-RDUMP 二进制流:rec = [u64 tag][u32 qlen][u32 k][u64 ts_ns][i32 ids...](见 binding.cpp xtu_rd)。
+    产出 (tag, qlen, k, ts, ids) 序列;tag(引擎指针) ⇒ 层身份(首见序 → 层号)。"""
+    import struct
+    lay = {}
+    recs = []
+    with open(path, "rb") as f:
+        buf = f.read()
+    off = 0
+    while off + 24 <= len(buf):
+        tag, qlen, k, ts = struct.unpack_from("<QIIQ", buf, off)
+        n = qlen * k
+        if n <= 0 or qlen > 1000000 or k > 64:
+            break  # 流损坏/截断 ⇒ 到此为止(尽力而为)
+        if off + 24 + 4 * n > len(buf):
+            break
+        ids = list(struct.unpack_from(f"<{n}i", buf, off + 24))
+        off += 24 + 4 * n
+        if decode_only and qlen > 16:
+            continue  # decode 形态(M≤16);prefill 记录单独口径
+        if tag not in lay:
+            lay[tag] = len(lay)
+        recs.append((lay[tag], ts, ids))
+    return recs, len(lay)
+
+
+def lru_sweep(recs, caps, slot_gib=0.0177):
+    """全局 (layer,expert) 槽的 LRU 时序模拟 ⇒ 会话级命中率主判据(QA #166)。
+    ids 是层内专家号(引擎对象本身带层身份)⇒ 缓存键必须带层维。"""
+    import collections
+    for cap in caps:
+        cache = collections.OrderedDict()  # 末端=MRU,popitem(last=False) 逐出最久未用
+        hits = tot = 0
+        for (l, _, ids) in recs:
+            for e in ids:
+                key = (l, e)
+                if key in cache:
+                    cache.move_to_end(key)
+                    hits += 1
+                else:
+                    tot += 1
+                    if len(cache) >= cap:
+                        cache.popitem(last=False)
+                    cache[key] = None
+        rate = hits / (hits + tot) if hits + tot else float("nan")
+        print(f"  cap={cap:6d} 槽(≈{cap*slot_gib:5.2f} GiB): LRU 命中={rate*100:5.1f}%")
+
+
 def main():
     ap = argparse.ArgumentParser()
-    ap.add_argument("jsonl")
+    ap.add_argument("jsonl", nargs="?")
+    ap.add_argument("--read-bin", default=None, help="XTU-RDUMP 二进制文件")
+    ap.add_argument("--lru", default="200,400,700,1200,2400,5120")
+    ap.add_argument("--all-prefill", action="store_true", help="read-bin 时不排除 prefill 记录")
     ap.add_argument("--slots", default="64,128,192,256")
     ap.add_argument("--folds", type=int, default=10)
     a = ap.parse_args()
+    if a.read_bin:
+        recs, n_layers = read_bin(a.read_bin, decode_only=not a.all_prefill)
+        print(f"records={len(recs)} 层数={n_layers}(首见序)")
+        lru_sweep(recs, [int(x) for x in a.lru.split(",")])
+        return
+    if not a.jsonl:
+        ap.error("需要 jsonl 或 --read-bin")
     per_key = load(a.jsonl)
     slot_list = [int(x) for x in a.slots.split(",")]
     print(f"dumps per key: { {k: len(v) for k, v in list(per_key.items())[:5]} } "

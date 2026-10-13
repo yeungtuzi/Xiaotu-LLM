@@ -40,6 +40,7 @@
 #include <thread>
 #include <chrono>
 #include <cstdlib>
+#include <cstdint>
 #include <memory>
 #include <mutex>
 #include <unordered_map>
@@ -393,12 +394,115 @@ static bool async_init(CpuDecodeState* st) {
 }
 
 
+// ==================== [XTU-RDUMP] decode 路由 ID 环形转储(P0.3) ====================
+// 为什么在 binding 里:decode 的 python 侧在 FULL 图 replay 时**不执行**(graph-dead),
+// 路由 ID 唯一必然过手的地点就是这里(ids 已完成 D2H;hostfunc 与异步握手两条路径共用
+// run_moe_and_ep ⇒ 单点全覆盖)。层身份 = engine 指针(e2.jsonl "mod<addr>" 同款先例;
+// P1 是单窗口 trace,指针跨 boot 不稳定不影响会话级 LRU 模拟)。
+// env XIAOTU_ROUTING_DUMP=<file>:关闭时 = 一个 relaxed bool 判断 ⇒ 生产零成本;
+// 记录格式 [u64 ts_ns][u64 tag=engine ptr][u32 qlen][u32 k][i32 ids qlen*k]。
+// 槽内存布局:[0,8)=ready flag(不落盘) [8,16)=tag [16,20)=qlen [20,24)=k [24,32)=ts [32,..)=ids。
+// 过载语义:环被写满 ⇒ drop++(计数器可见),宁丢不堵;**绝不**在关键路径上阻塞。
+namespace xtu_rd {
+constexpr size_t kSlots = 64, kSlotBytes = 1u << 20, kHdr = 32;
+static std::atomic<bool> g_on{false};
+static std::atomic<uint64_t> g_drops{0}, g_skips{0}, g_records{0};
+static char* g_buf = nullptr;
+static std::atomic<uint64_t> g_wseq{0}, g_rseq{0};
+static int g_fd = -1;
+
+static inline uint64_t now_ns() {
+    return (uint64_t)std::chrono::duration_cast<std::chrono::nanoseconds>(
+        std::chrono::steady_clock::now().time_since_epoch()).count();
+}
+
+static void writer_loop() {
+    uint64_t last_stats = now_ns();
+    while (true) {
+        bool stop = !g_on.load(std::memory_order_relaxed);
+        uint64_t w = g_wseq.load(std::memory_order_acquire);
+        while (g_rseq.load(std::memory_order_relaxed) < w) {
+            uint64_t r = g_rseq.load(std::memory_order_relaxed);
+            char* p = g_buf + (r % kSlots) * kSlotBytes;
+            auto* flag = reinterpret_cast<std::atomic<uint64_t>*>(p);
+            uint64_t t0 = now_ns();
+            while (flag->load(std::memory_order_acquire) != r + 1) {
+                if (now_ns() - t0 > 20000000ull) { g_drops.fetch_add(1, std::memory_order_relaxed); break; }
+                std::this_thread::yield();
+            }
+            if (flag->load(std::memory_order_acquire) == r + 1) {
+                uint32_t qlen, kk;
+                memcpy(&qlen, p + 16, 4); memcpy(&kk, p + 20, 4);
+                size_t bytes = kHdr + (size_t)qlen * kk * 4;
+                ssize_t wr = ::write(g_fd, p + 8, bytes - 8);  // ready flag 不落盘                (void)wr;  // 短写/失败 ⇒ 丢该行,不重试不阻塞(转储是尽力而为)
+                g_records.fetch_add(1, std::memory_order_relaxed);
+            }
+            flag->store(0, std::memory_order_relaxed);
+            g_rseq.fetch_add(1, std::memory_order_relaxed);
+        }
+        if (stop) break;
+        uint64_t t = now_ns();
+        if (t - last_stats >= 60000000000ull) {
+            last_stats = t;
+            fprintf(stderr, "[xtu-rdump] records=%llu drops=%llu skips=%llu\n",
+                    (unsigned long long)g_records.load(), (unsigned long long)g_drops.load(),
+                    (unsigned long long)g_skips.load());
+        }
+        std::this_thread::sleep_for(std::chrono::milliseconds(20));
+    }
+    if (g_fd >= 0) { ::close(g_fd); g_fd = -1; }
+}
+
+static void ensure_init() {
+    static std::once_flag once;
+    std::call_once(once, [] {
+        const char* p = std::getenv("XIAOTU_ROUTING_DUMP");
+        if (!p || !*p) return;
+        g_buf = (char*)calloc(kSlots * kSlotBytes, 1);
+        g_fd = ::open(p, O_CREAT | O_WRONLY | O_APPEND | O_CLOEXEC, 0644);
+        if (!g_buf || g_fd < 0) {
+            fprintf(stderr, "[xtu-rdump] 初始化失败(buf=%p fd=%d)⇒ 保持关闭\n",
+                    (void*)g_buf, g_fd);
+            return;
+        }
+        g_on.store(true);
+        std::thread(writer_loop).detach();
+        fprintf(stderr, "[xtu-rdump] active → %s(环 %zu 槽 × %zu MiB)\n",
+                p, kSlots, kSlotBytes >> 20);
+    });
+}
+
+static inline void capture(uintptr_t tag, int qlen, int k, const uint32_t* ids) {
+    if (!g_on.load(std::memory_order_relaxed)) {
+        ensure_init();
+        if (!g_on.load(std::memory_order_relaxed)) return;
+    }
+    if (qlen <= 0 || k <= 0) return;
+    size_t n = (size_t)qlen * (size_t)k;
+    if (n > (kSlotBytes - kHdr) / 4) { g_skips.fetch_add(1, std::memory_order_relaxed); return; }
+    uint64_t s = g_wseq.fetch_add(1, std::memory_order_acq_rel);
+    if (s - g_rseq.load(std::memory_order_acquire) >= kSlots) {
+        g_drops.fetch_add(1, std::memory_order_relaxed);
+        return;  // 环满:丢记录保序推进,绝不阻塞计算
+    }
+    char* p = g_buf + (s % kSlots) * kSlotBytes;
+    uint32_t q32 = (uint32_t)qlen, k32 = (uint32_t)k;
+    uint64_t ts = now_ns();
+    memcpy(p + 8, &tag, 8);
+    memcpy(p + 16, &q32, 4); memcpy(p + 20, &k32, 4);
+    memcpy(p + 24, &ts, 8);  // ts 在 payload 区,与 ready flag([0,8))不重叠
+    memcpy(p + kHdr, ids, n * 4);
+    reinterpret_cast<std::atomic<uint64_t>*>(p)->store(s + 1, std::memory_order_release);
+}
+}  // namespace xtu_rd
+
 // 【第 217 轮】"CPU MoE + EP 归约"抽成独立函数:host-func 路径与异步握手
 // 路径(worker 线程)共用同一份实现,避免两份代码漂移。
 template <typename MOET>
 static void run_moe_and_ep(MOET* engine, int qlen, int k, const uint16_t* hid,
                            const uint32_t* ids, const float* wts, float* out,
                            double* ep_ms_out, double* fwd_ms_out = nullptr) {
+        xtu_rd::capture(reinterpret_cast<uintptr_t>(engine), qlen, k, ids);
         static const bool fake_cpu = std::getenv("XIAOTU_MOE_FAKE_CPU") != nullptr;
         // 【§619b】把 `forward_many` 自己的耗时单独量出来。`[cd-timing] compute` 包住的是
         // `run_moe_and_ep`(= forward_many + EP 归约),而 `[NS-PROF] TOTAL` 只包 forward_many;

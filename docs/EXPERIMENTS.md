@@ -13868,3 +13868,20 @@ qfn prefill 口径在 14% 槽位处约 40-50%,**闸门线 ≥55% 属悬而未决
 
 #### ④ 过程
 qfn 数据不可外推 ds41f(纪律),本轮全部数字只用于**校准工具**;崩溃谱两个小 bug(chain 展平/层 dumps<folds)已修在工具内。
+---
+
+### B395(2026-10-13)P0 收口:decode 路由钩子落进 binding(`xtu_rd`),reader+LRU 模拟器自检全绿 【代码+离线】
+
+#### ① 钩子(binding.cpp `namespace xtu_rd`,默认关)
+- 落点 `run_moe_and_ep`:hostfunc 与异步握手两路径的公共点,ids 已过 D2H,**decode python graph-dead 下唯一必然过手处**;层身份 = engine 指针(e2 "mod\<addr\>" 先例);
+- 格式 `[tag8|qlen4|k4|ts8|ids×4]`;环 64×1MiB seqlock,写满 **drop++ 不阻塞**;60s 打 `[xtu-rdump] records/drops/skips` 计数(丢了必须看得见);
+- `XIAOTU_ROUTING_DUMP=<file>` 未设 = 一次 relaxed bool 判断 ⇒ 生产零成本;`g++ -fsyntax-only` rc=0。
+
+#### ② 一个被自检抓住的真 bug
+首版把 ts  memcpy 进 `[0,8)` —— **与 ready flag 同 8 字节**,落盘记录会丢时间戳(writer 从 p+8 起写"绕开"了它,看起来能跑)。自检设计成先验 reader 往返才信任 LRU 数字,时间戳单调性断言直接把布局矛盾暴露出来 ⇒ 布局改为 flag 独占 `[0,8)`、ts 进 payload。**教训:与 flag 复用字段的布局,自检必须含"元数据字段值本身"的断言,只测主数据往返不够。**
+
+#### ③ 工具闭环(expert_profile.py)
+`--read-bin` reader + **全局 (layer,expert) LRU 时序模拟**(P1 主判据,QA #166):合成 Zipf 流上 cap≥distinct 时命中 = 手工频率覆盖 98.2% 吻合、容量单调 ✓。ids 为层内专家号(引擎对象自带层身份)⇒ 缓存键必须带层维。
+
+#### ④ 状态
+P0 三件套(画像工具/ SPEC / 钩子)全部就绪;**P1 等一次攒批复用窗口**(须用户当次许可):带 XIAOTU_ROUTING_DUMP 起生产 + quick 负载 + 顺路带层级探针与既有待重启项。

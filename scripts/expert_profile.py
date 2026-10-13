@@ -65,9 +65,9 @@ def read_bin(path, decode_only=True):
     产出 (tag, qlen, k, ts, ids) 序列;tag(引擎指针) ⇒ 层身份(首见序 → 层号)。"""
     import struct, glob as _glob
     files = sorted(_glob.glob(path)) if any(c in path for c in "*?[") else [path]
-    lay = {}
     recs = []
     for fp in files:
+        lay = {}  # ⚠️ 层身份映射**每文件独立**:engine 指针跨进程不同,但注册首见序一致 ⇒ 首见序=层号
         with open(fp, "rb") as f:
             buf = f.read()
         off = 0

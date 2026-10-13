@@ -86,7 +86,7 @@ def read_bin(path, decode_only=True):
     return recs, len(lay)
 
 
-def lru_sweep(recs, caps, slot_gib=0.0177, base_frac=0.0):
+def lru_sweep(recs, caps, slot_gib=0.01752, base_frac=0.0):  # 18.81MB/槽=0.01752GiB(SPEC §3 定稿口径)
     """全局 (layer,expert) 槽的 LRU 时序模拟 ⇒ 会话级命中率主判据(QA #166)。
     ids 是层内专家号(引擎对象本身带层身份)⇒ 缓存键必须带层维。
     base_frac>0 = **Strata 形状**:按全局频率取 cap×base_frac 个槽做受保护常驻(永不逐出),

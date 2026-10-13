@@ -13885,3 +13885,21 @@ qfn 数据不可外推 ds41f(纪律),本轮全部数字只用于**校准工具**
 
 #### ④ 状态
 P0 三件套(画像工具/ SPEC / 钩子)全部就绪;**P1 等一次攒批复用窗口**(须用户当次许可):带 XIAOTU_ROUTING_DUMP 起生产 + quick 负载 + 顺路带层级探针与既有待重启项。
+---
+
+### B396(2026-10-13)钩子真码验证:xtu_rd 全链路过;合成小引擎双臂 abort=环境伪影,与钩子无关 【离线】
+
+#### ① 验证法(零服务)
+scratch 独立编译 binding.cpp(`-DXIAOTU_MOE_MODULE_NAME=_xtu_rdtest_C`,生产同 flag+`-lcudart -l:libcuda.so.1`)
+→ 合成小引擎(E=32 H=512 I=512)走 `cpu_prefill` 纯 CPU 路径喂 120 次。
+
+#### ② 结果
+* `[xtu-rdump] active` ✓、捕获→环→writer→**168B 记录逐字段正确** ✓、`--read-bin` reader 往返 ✓(格式与 SPEC §2 一致);
+* 合成引擎**第 2 次 forward 双臂 abort**(env 开/关都炸,rc=134,指纹同 WATCHDOG abandoned=8/node4-7 pulled=0)
+  ⇒ **差分证明与钩子无关**:炸点在合成小 cfg 的 NUMA 池回退路径(真实配置/真实权重下 bench_cpu_engine 长期无恙);
+  **生产钩子路径的运行时验证移交 P1 窗口天然发生**(带 env 起一次即可,不为伪影加时)。
+* 覆盖面补全:`cpu_prefill` 离线接口也挂上 capture(decode 两路径 hostfunc/async 本已过 `run_moe_and_ep` 单点)。
+* 教训重申(第 N 次):**`cmd | tail` 吞掉 Aborted** 让第一轮误判"完成"——本轮所有远端跑改 `>log; echo RC=$?`。
+
+#### ③ 池显存纪律(QA #168 三连令已条款化)
+池 = MBT 预算表科目(torch 树内,KV profiling 前占位,参数传**槽数语义**);fb 读数只作写后复查校验源。

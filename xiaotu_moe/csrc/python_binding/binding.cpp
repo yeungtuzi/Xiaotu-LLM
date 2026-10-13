@@ -1137,6 +1137,8 @@ static void bind_moe_class(py::module& m, const char* name) {
                               int qlen, int top_k,
                               py::object expert_ids, py::object weights,
                               py::object input, py::object output) {
+            xtu_rd::capture(reinterpret_cast<uintptr_t>(&self), qlen, top_k,
+                            as_u32(expert_ids));  // 离线 bench 路径也要能出 dump(P1 覆盖面补全)
             self.forward_many(qlen, top_k,
                               as_u32(expert_ids),
                               as_f32(weights),

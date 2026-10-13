@@ -13681,3 +13681,34 @@ conversation parking 当 LMCache 替代 / `POST /v1/vram` 可回升 / 层切分�
 * ⚠️ **轨迹混沌**:同一 prompt 两次 greedy 可走不同轨迹(FP8 × 前缀缓存状态)⇒ 小样本单次结论不可靠,
   必须池化;本次每档 8~16 条。
 * 测量工件与全部日志:`/home/user/tmp/c4rerun_20261012/`(client `clean_bench.py`,非仓库脚本)。
+---
+
+### B389(2026-10-13)⭐ **解码计划阶段 0 批处理窗口:基线复现一致、三处"既有能力"意外、eager×host-func 死路钉死** 【实测】
+
+#### ① 背景
+`PLAN_DECODE_2_2026-10-12` 获批(①②④ 准许、INT4 留评审、全资源授权)。单次批处理窗口(用户授权停生产)验 W1 基线+探针、W2 采集(eager+行级 dump)。
+
+#### ② W1 基线复现(真实转录,1024 上限,与 B388 同日不同 boot)
+| 档 | 每请求 | 聚合 | AL | vs B388 |
+|---:|---:|---:|---:|---|
+| C1 | **48.68** | 48.7 | 4.04 | **±0.0%(完全复现)** ✓ |
+| C2 | 39.2 | 78.4 | 3.98 | +11%(混沌带内)|
+| C4 | 21.7 | 86.8 | 3.76 | −9%(混沌带内)|
+⇒ 再次确认 **B388 的"轨迹混沌"判定**:C1 稳如钟、C≥2 受 prefix-cache 轨迹影响 ±10%、接受长度 3.76–4.47 波动 ✓
+
+#### ③ 三处"既有能力"意外(计划据此修正)
+1. **B1(NUMA)基本已做**:引擎默认 **node 分片 + mbind**(§519:RANK_SPLIT=1 ⇒ node,node≧socket 4.7×@qlen=1);launcher 的 `numactl --interleave=all` 只作用于 python 堆页,权重区已被 mbind 覆盖 ⇒ B1 降格为"默认确认",KT 的 +63% 我们**早有等价物** ✓
+2. **内核行共享已验证**(代码审计):`moe_v2_packed4_base.inc:1458/940` —— 同专家各行一次 GEMM、权重行解码一次(4-row + 2/3-row 块,ktransformers 模式)⇒ SpecMoEOff 红线"禁逐行重读"通过 ✓;注释顺带给出 **ρ 线索:"6 tokens land on ~12 distinct experts"**(局部性比生日模型高得多 ⇒ E2 必测)
+3. **探针在生产配置下不触发**:GPU 预填旁路(gpu_prefill_fp8 不过 mixed_experts 钩子)+ 解码 FULL_DECODE_ONLY 图(python 不执行)⇒ **E3 曲线在现架构拿不到**,改由离线 harness 拿(见 ⑤)
+
+#### ④ ⛔ 死路钉死:EAGER=1 × host-func ⇒ 引擎立崩
+`enforce-eager` 禁 torch.compile/CUDAGraphs 后,host-func dispatcher 报 `torch_call_dispatcher("aten::new_empty",...)` RuntimeError → EngineDead(03:12:54,与 NOTES §406 的 host-func 捕获限制互补:那边是"探针别进捕获期",这边是"**host-func 路径根本不能 eager**")⇒ **EAGER 通道保留(默认 0 不变),但不得用于 ds41f 生产线** ✓
+
+#### ⑤ 采集(E2)路线改道
+行级 dump 代码已就绪(`route_probe` DUMP 通道,commit `已入库`);生产架构下 decode 行拿不到 ⇒ **E2 改用离线引擎 harness**(engine 微基准管线直调 forward_many,天然无图)——阶段 1 原型期做。
+
+#### ⑥ 运维教训(泛化)
+- **nohup 不等于会话脱钩**:ssh 会话回收会把 bringup 起的服务器 SIGTERM(logind session stop,W2c 实证)⇒ **一切远端长驻启动一律 `setsid env ... bash script </dev/null &`** ✓
+- 生产 bringup 配置块是**纯 shell 赋值**,加透传通道用 `VAR=${VAR:-default}`,**绝不能用 `export VAR=`**(会被当命令名)✓
+- MAXSEQS=4 固化为默认(commit ef3e0ab + serve_v41 兜底;崩溃形态风险注释就地保留)✓
+

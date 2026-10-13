@@ -13781,3 +13781,30 @@ DeepseekV41IndexerBackend attention backend does not support`(adaptive_verificat
 #### ⑥ 窗口
 E2 采集 = 1 次重启(本会话第 8 次),恢复 boot 并行进行(第 9 次)。恢复后按铁律冒烟。
 
+---
+
+### B392(2026-10-13)⭐ **延迟链立项首批:CPU MoE 只占 C1 步时 31%(652µs/层),draft 是"一次并行"不是"5 次串行"【勘正】;GPU 侧 69% 成为头号攻击面** 【实测】
+
+#### ① 机制勘正(读码)
+`dspark/speculator.py` docstring:"drafts a block **in one parallel pass**"——
+draft = backbone **一次并行前向**(锚+N-1 噪声查询)+ 5 步轻量 Markov 头循环(图内小算子)。
+**"5×draft 串行前向"的旧猜测作废 ✗**(PLAN_DECODE_2 推导曾引用)⇒ draft 成本 ≈ 3 层 GPU 前向 + 微循环。
+
+#### ② NS-PROF 引擎内账(生产 boot + `XIAOTU_MOE_PROFILE=1`,真实 quick 负载,双 rank 一致)
+| 桶 | = 什么 | per-call(µs) | na(层均) |
+|---|---|---|---|
+| M3-8 | **C1 verify(6 行)** | setup 11 · A(gate+up) **397** · B(down) 215 · C 27 · **TOTAL 652** | **11.9** |
+| M>8 | C4 verify + 预填 chunk **混桶**(na 均值失真,单列不可用) | 7567(混合)| 91.6(混合)|
+⇒ **CPU MoE = 40×652µs = 26.1ms/步 = C1 步时的 31%**;GPU+同步+draft = 57ms = **69% ⇒ 头号攻击面**
+- 引擎内部流式效率:(A+B)/na = 612µs/11.9 专家 ≈ **349 GB/s = 峰值 47%** —— 中游,暂非主要矛盾
+- **na=11.9 < E2 预填窗口的 17.9** ⇒ draft 路由(带 markov bias)比真实相邻 token 更聚焦 ✓(利好,字节更少)
+- M≤2 桶从未出现 = **draft 不碰 CPU 专家路径**(与代码推断一致)✓
+
+#### ③ 工具面勘正
+- nsys 2023.1 **无 attach**;legacy api_server **未接** profile 端点(`--profiler-config` 存在但端点 404)
+- ⇒ 立 **GPU0 离线剖析通道**:`scripts/offline_profile_run.py`(in-process 引擎 + `LLM(profiler_config=torch)` +
+  GPU0/TP=1/48 核/nice19/oom800,无任何进程管理逻辑)——GPU 内核账本在 B393
+
+#### ④ 窗口
+本窗口 = 1 次重启(纯 env `XIAOTU_MOE_PROFILE`,会话第 11 次)+ GPU0 离线实例(不动生产)。
+

@@ -13842,3 +13842,29 @@ draft = backbone **一次并行前向**(锚+N-1 噪声查询)+ 5 步轻量 Marko
 ③ **离线 `LLM()` 通道死**:run4-7 + duty×2,失败谱 = node4 CONSTRAINT OOM(与生产共存)/`cudaErrorStreamCaptureInvalidated`(破招史:profiler 归因✗→breakable=0 ✗→jit_warmup=True ✗→GPU-prefill 禁用 ✗——四板斧全部无效,崩溃点在 vLLM `cudagraph_utils.py:491` 的 decode graph capture,gpu_prefill.py 帧只是插件 capture 计数器 wrapper 的过路帧)
 ④ **serve 起 TP=1 也死同型崩溃**(PREFILL 禁用配方同死)⇒ E2 当年 TP=1 调试实例能跑的唯一已知配方未复现(疑 maxlen/实例代际差异)——**TP=1"无 allreduce 对照组"改判:待修好调试通道再补**,spin 归因暂用趋势证据(C1 38%→C4 50%:负载↑sm↑ = 等待占比随真实工作增大而稀释,与"spin=等待"一致,非决定性)
 ⑤ 生产保持停止(用户裁决"没人在用");本轮生产停止累计 ≈ 2.5h。重启口令:`bash scripts/bringup_prod_8070.sh`(默认参数,~6min)
+---
+
+### B394(2026-10-13)⭐ 热度画像工具校准成功:qfn 留一 h@128 层均 **64.6%**,正面命中 Strata 公布的 h_expert=0.6447 —— PLAN_EXPERT_RESIDENT 的测量地基成立 【离线】
+
+#### ① 工具与口径
+`scripts/expert_profile.py`:输入 dump jsonl(每行 = 一次某层 dump,8192 token × top-6),
+产出 in-sample 覆盖(**上界,禁用于决策**)与**十折留一 h@N**(决策口径)。
+数据 = e2.jsonl(1094 dumps / 86 keys / **去重 65 层**;是 **qfn 线 prefill** 流量 ⇒ 双重保守界)。
+
+#### ② 分层留一覆盖率(qfn,E=384/层)
+| 每层槽位 | 层均 h@N | 中位 | 最差 3 层 | Strata 对照 |
+|---:|---:|---:|---|---|
+| 32/层 (8%) | 48.2% | 59.9% | 4/4/5% | |
+| 64/层 (17%) | 55.9% | 70.6% | 6/6/6% | |
+| **128/层 (33%)** | **64.6%** | 77.5% | 7/7/8% | **h_expert 0.6447 ✓ 命中** |
+| 192/层 (50%) | 73.1% | 84.3% | 8/23/23% | |
+- **自欺差**(in-sample − 留一)= +10~20pp ⇒ 留一口径纪律确证(in-sample 会虚报一整成);
+- **分布极宽**:存在 4-8% 的平铺冷层(钉了也白钉)⇒ **槽位必须按层水填(water-filling)**,均分是浪费 —— Strata 的全局 (layer,expert) 降序表隐式做了这件事,设计被再次交叉验证;
+- keys 成对现象(86→65)= 同层双地址 dump,已在工具内按流量签名去重。
+
+#### ③ 对闸门(P1)的预账
+每卡可钉 ≈ 6.3GB(fb 自由 7.8 − 留白 1.5)÷ 半专家 8.85MB ≈ **710 槽/卡**;对 ds41f(40 MoE 层)= ~18 槽/层(14% 槽位)。
+qfn prefill 口径在 14% 槽位处约 40-50%,**闸门线 ≥55% 属悬而未决** ⇒ P1 的 ds41f decode 流(更陡分布)是真判决,工具不许提前宣布胜利。
+
+#### ④ 过程
+qfn 数据不可外推 ds41f(纪律),本轮全部数字只用于**校准工具**;崩溃谱两个小 bug(chain 展平/层 dumps<folds)已修在工具内。

@@ -13835,3 +13835,10 @@ draft = backbone **一次并行前向**(锚+N-1 噪声查询)+ 5 步轻量 Marko
 - 我的"6 行 decode 的 GPU util 会是 6-10%"预期 **✗ 错**(实际 38%)——错因:把"kernel 工作量小"等价成"SM 占用低",忽略了同步等待也以 kernel-spin 形式计入 SM%。
 - SIGUSR2 worker 栈采样本窗口未抓到输出(tag log 计数=0),留待查证 dump 落点后再用(numa_pool 注册在 worker 进程,信号也确实发了)。
 - 本窗口重启计数:生产停了 ~55 分钟(离线尝试),**已恢复并冒烟 ✓**;quick 负载 = warm2+正式轮,dmon/采样不碰生产外服务。
+
+#### B393 追记 ①-⑤(同日,TP=1 对照组猎杀:**通道判死**,7 次发射全灭)
+① **TP=2 复验通过**:全新全规格实例(8071,GPU1,2)平台 sm=**39%/mem=4%**,与生产数字逐位吻合 ⇒ 占空比测量手段已标定 ✓
+② **bringup 吞参数(缺陷)**:外层 `GPUS=0 TP=1` 被 bringup 的 VLLM_ENV 块硬编码覆盖 ⇒ 以为在跑 TP=1,实际起了第二个 TP=2 全规格实例。**教训:调试实例必须核验落点(`ss -ltnp`→pid→environ CVD),参数静默回退是真实事故形状**
+③ **离线 `LLM()` 通道死**:run4-7 + duty×2,失败谱 = node4 CONSTRAINT OOM(与生产共存)/`cudaErrorStreamCaptureInvalidated`(破招史:profiler 归因✗→breakable=0 ✗→jit_warmup=True ✗→GPU-prefill 禁用 ✗——四板斧全部无效,崩溃点在 vLLM `cudagraph_utils.py:491` 的 decode graph capture,gpu_prefill.py 帧只是插件 capture 计数器 wrapper 的过路帧)
+④ **serve 起 TP=1 也死同型崩溃**(PREFILL 禁用配方同死)⇒ E2 当年 TP=1 调试实例能跑的唯一已知配方未复现(疑 maxlen/实例代际差异)——**TP=1"无 allreduce 对照组"改判:待修好调试通道再补**,spin 归因暂用趋势证据(C1 38%→C4 50%:负载↑sm↑ = 等待占比随真实工作增大而稀释,与"spin=等待"一致,非决定性)
+⑤ 生产保持停止(用户裁决"没人在用");本轮生产停止累计 ≈ 2.5h。重启口令:`bash scripts/bringup_prod_8070.sh`(默认参数,~6min)

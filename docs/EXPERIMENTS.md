@@ -13808,3 +13808,30 @@ draft = backbone **一次并行前向**(锚+N-1 噪声查询)+ 5 步轻量 Marko
 #### ④ 窗口
 本窗口 = 1 次重启(纯 env `XIAOTU_MOE_PROFILE`,会话第 11 次)+ GPU0 离线实例(不动生产)。
 
+---
+
+### B393(2026-10-13)⭐⭐ **占空比采样定罪:decode 期间 GPU SM "忙" 38% 但带宽只吃 4% —— 57ms 黑箱的主体不是 GPU 工作,是跨 socket/跨 CPU-GPU 的等待结构;nsys 路线终结(B86 复证),工具链待换代** 【实测】
+
+#### ① 零重启占空比采样(当前干净 boot + quick 负载 + dmon 1s 采样)
+| 相位 | SM%(p50/平台) | 显存吞吐%(p50) | 判读 |
+|---|---|---|---|
+| **C1 decode 平台**(r20/r32,双卡一致) | **37–42%** | **4%** | SM 忙但几乎不动数据 ⇒ **spin/等待主导** |
+| C4 rep2 | 49–52% | 7% | 同构,略多真实工作 |
+| prefill 段(对照) | 87–98% | 20%+ | 真 GPU 工作的形状 ✓ 标定有效 |
+⇒ **GPU 侧有效工作 ≈ 4%×83.2 ≈ 3.3ms/步**(与"attention+indexer µs 级/层"推算吻合);
+⇒ 57ms 黑箱 = GPU 有效 3.3 + **spin-wait ≈ 30+** + 纯空隙;spin 是**症状**,病根 = GPU↔CPU↔跨 rank 三段串行 ping-pong 把每段延迟都裸露成 wall time。
+
+#### ② 账本更新(PLAN_LATENCY §2 已同步)
+`T_step 83.2 = CPU MoE 26.1(实测,B392)+ GPU 有效 3.3(新)+ 等待/序列化 ≈ 50(新口径)+ draft 小项(计入前项)`
+⇒ **Top 攻击点重排**:~~"砍 GPU 内核"~~ ⇒ **① 破串行结构(CPU MoE 与 GPU attention 层间流水/双缓冲;TP 两 rank 的重叠度)** ② 引擎内流效 47%→65%。
+
+#### ③ 工具链判决(本项目的 nsys 时代终结,除非换代)
+- **B86 复证**(2023.1.2 vs driver 580.178,今天重跑真实 GEMM 作业):rep 生成、退出码 0、**KERNEL 表空** ⇒ nsys GPU 内核账本不可用,历史结论仍有效 ✓
+- torch profiler × CUDA graph:**capture 期共存 assert 炸**(run5 实证),运行期理论可行但 breakable-graph 与 FULL 图路径混杂,暂不追
+- nsys 窗口脚本双人全档审计 **FAIL**(阻断×3:tag 抓错文件〔warmup tag 在 dsv41_prod.log,不在 v41 tag log — 教训泛化:就绪 tag 的落点必须实测确认〕/launch 目标 daemon 化后消失/空 rep 无断言),已按 R38 改名 `.audit-failed` ✗
+- 若将来要 GPU 内核级账本:**先升级 Nsight Systems 套件**(2024.x+ 独立 tarball),旧套件上的一切 GPU timeline 方案都会静默产出空账本(B86 型陷阱)。
+
+#### ④ 过程勘正
+- 我的"6 行 decode 的 GPU util 会是 6-10%"预期 **✗ 错**(实际 38%)——错因:把"kernel 工作量小"等价成"SM 占用低",忽略了同步等待也以 kernel-spin 形式计入 SM%。
+- SIGUSR2 worker 栈采样本窗口未抓到输出(tag log 计数=0),留待查证 dump 落点后再用(numa_pool 注册在 worker 进程,信号也确实发了)。
+- 本窗口重启计数:生产停了 ~55 分钟(离线尝试),**已恢复并冒烟 ✓**;quick 负载 = warm2+正式轮,dmon/采样不碰生产外服务。

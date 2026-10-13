@@ -69,6 +69,22 @@ def observe(self, routed, layer=None) -> None:
         if ids is None or not isinstance(ids, torch.Tensor) or not ids.numel():
             return
         key = getattr(self, "layer_name", None) or ("mod%d" % id(self))
+
+        # ⭐ E2(PLAN_DECODE_2):行级 dump —— 每行(=每 verify token)的 topk 专家 id 落盘,
+        #   离线算 相邻行专家集重叠 ρ 与"树扩 k 的 unique 增量"。
+        #   ⚠️ 每次 observe 一次同步 D2H ⇒ **只在不计速的采集运行开启** ✓(失败静默且自关)
+        _dp = _S.get("dump")
+        if _dp is None:
+            _dp = _S["dump"] = os.environ.get("XIAOTU_ROUTE_PROBE_DUMP") or False
+            _S["dn"] = 0
+        if _dp and int(_S["dn"]) < int(os.environ.get("XIAOTU_ROUTE_PROBE_DUMP_MAX", "8000")):
+            try:
+                import json as _json
+                with open(_dp, "a", encoding="utf-8") as _fh:
+                    _fh.write(_json.dumps({"k": str(key), "ids": ids.tolist()}) + "\n")
+                _S["dn"] = int(_S["dn"]) + 1
+            except Exception:  # noqa: BLE001
+                _S["dump"] = False      # 落盘失败 ⇒ 只关 dump,不伤计数路径 ✓
         flat = ids.reshape(-1).to(torch.int64)
         mx = int(flat.max()) + 1
         cnt = _COUNTS.get(key)

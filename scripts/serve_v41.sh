@@ -432,7 +432,7 @@ fi
   OMP_NUM_THREADS=1 \
   $JIT_ENV \
   $EXTRA_ENV \
-  numactl --interleave=all "$PY" -m vllm.entrypoints.openai.api_server \
+  ${NUMA_CMD-numactl --interleave=all} "$PY" -m vllm.entrypoints.openai.api_server \
     --model "$CKPT" --served-model-name DeepSeek-V4.1-Flash \
     --load-format "$LOAD" \
     --max-model-len "$MAXLEN" --tensor-parallel-size "$TP" --max-num-seqs "${MAXSEQS:-4}" \

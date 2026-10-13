@@ -5,6 +5,10 @@
 warm 若干步后 start_profile → 生成 256 tok → stop_profile,trace 落盘。"""
 import json, os, sys, time
 
+os.environ["CUDA_VISIBLE_DEVICES"] = "0"   # 脚本内钉死:只用 GPU0(实验卡),不信外层环境
+os.environ.setdefault("XIAOTU_OOT_OVERRIDE", "0")
+os.environ.setdefault("VLLM_EXPERTS_LOAD_DEVICE", "cpu")
+
 os.kill_pid = None
 try:
     with open(f"/proc/{os.getpid()}/oom_score_adj", "w") as f:
@@ -25,6 +29,9 @@ for line in open(DATA):
         break
 assert prompt, "no prompt found"
 
+import torch as _tc
+print("[chk] visible cuda devices:", _tc.cuda.device_count(), flush=True)
+assert _tc.cuda.device_count() == 1, "必须恰好 1 张可见卡(=GPU0)"
 from vllm import LLM, SamplingParams
 from vllm.config import ProfilerConfig
 

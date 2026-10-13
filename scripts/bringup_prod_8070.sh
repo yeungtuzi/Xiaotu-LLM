@@ -87,7 +87,7 @@ VLLM_ENV=(
   TP=2
   GPU_UTIL=0.90
   COMPILE=1
-  export EAGER="${EAGER:-0}"   # 采集/实验通道:显式 EAGER=1 才偏离默认(2026-10-13,PLAN_DECODE_2 E2)
+  EAGER=${EAGER:-0}   # 采集/实验通道:显式 EAGER=1 才偏离默认(2026-10-13,PLAN_DECODE_2 E2)
   SPEC=1   # ⭐ 2026-10-05 用户指示:生产【开启】投机解码(DSpark k=5)
             #   理由:投机收益太大(实测 mean acceptance ≈3.59 ⇒ decode 约 2–3×)
             #   ⇒ 本配置用于明天验证【输出退化】是否仍出现

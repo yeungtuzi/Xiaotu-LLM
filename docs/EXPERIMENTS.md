@@ -13712,3 +13712,33 @@ conversation parking 当 LMCache 替代 / `POST /v1/vram` 可回升 / 层切分�
 - 生产 bringup 配置块是**纯 shell 赋值**,加透传通道用 `VAR=${VAR:-default}`,**绝不能用 `export VAR=`**(会被当命令名)✓
 - MAXSEQS=4 固化为默认(commit ef3e0ab + serve_v41 兜底;崩溃形态风险注释就地保留)✓
 
+---
+
+### B390(2026-10-13)⭐ **A1 裁决:主线自适应验证与 sparse-indexer 后端架构互斥;扩 k 模拟器定稿(线性 k>5 ≈ ±0~6%,ρ 依赖)** 【实测+离线】
+
+#### ① 逐位存活率(真实 boot 级流量,per_pos 计数器,3791 drafts)
+p(pos0..4) = **.864 / .708 / .550 / .411 / .304** ⇒ AL = 1+Σ = **3.84**(与同期实测 AL 自洽 ✓)。
+注:逐位比值本身即存活率(勿再取乘积——B389 期间模拟器曾犯此错,已修)。
+
+#### ② k 决策模拟器(calibrated)
+锚定 C1 T0=83.2ms/步、EB=1.016ms/unique 专家(40 层×17.93 MiB÷740 GB/s):k=5 预测 46.1 vs 实测 48.7(偏差 +5.6% = 未建模草稿开销)✓
+| 假设 | k=6 | k=7~8 | 判定 |
+|---|---:|---:|---|
+| ρ=0(生日模型, U6≈35) | −1% | −4~−7% | 不做 |
+| ρ=0.4 | +1% | 0/−1% | 不值一枪 |
+| ρ=0.8(内核注释"6tok≈12unique") | +4% | +6% | 等 E2 实测再议 |
+⇒ **静态扩 k 期望收益 ±5% 量级,E2 的 U 曲线之前不动生产**(计划书"扩 k"决策点据此降级)。
+
+#### ③ ⛔ enable_adaptive_verification 在生产线不可用(实测钉死)
+dspark 路径**代码完备**(confidence head ⇒ `use_acceptance_estimator=False`,与论文机制一致),
+但启动即拒:`Adaptive verification trims verification requests on device, which the
+DeepseekV41IndexerBackend attention backend does not support`(adaptive_verification.py:472)
+⇒ A1 剩余路线 = 给 indexer 后端做变长 decode 图适配(阶段 2+,重),或等上游。
+**诚实声明:adaptive 的 A/B 数值一个都没有**——第一臂因数组吞变量实为 OFF,第二臂直接崩(见 ④)。
+
+#### ④ 工程教训(两条,泛化)
+- **bringup 的 VLLM_ENV=(…) 数组会吞外部变量**:不在数组内的 env 到不了 serve(首次 ON 臂因此静默变 OFF);
+  透传通道必须做成数组元素 `VAR=${VAR:-}`(空元素 `VAR=` 对 env 安全)。已加 `SPEC_CONFIG` 元素(commit 本次)。
+- **"跨 boot C4 漂移"是 warm 轮数混淆**:formal warm=2 轮、quick warm=1 轮,差 ~9%;
+  **A/B 必须同 warm 策略**(quick.sh 已对齐 2 轮)✓ C1 对 warm 不敏感(n=3 boot 48.7/48.7/47.3 稳定)。
+

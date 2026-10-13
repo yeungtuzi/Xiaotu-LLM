@@ -86,26 +86,38 @@ def read_bin(path, decode_only=True):
     return recs, len(lay)
 
 
-def lru_sweep(recs, caps, slot_gib=0.0177):
+def lru_sweep(recs, caps, slot_gib=0.0177, base_frac=0.0):
     """全局 (layer,expert) 槽的 LRU 时序模拟 ⇒ 会话级命中率主判据(QA #166)。
-    ids 是层内专家号(引擎对象本身带层身份)⇒ 缓存键必须带层维。"""
+    ids 是层内专家号(引擎对象本身带层身份)⇒ 缓存键必须带层维。
+    base_frac>0 = **Strata 形状**:按全局频率取 cap×base_frac 个槽做受保护常驻(永不逐出),
+    LRU 只在剩余槽活动;0 = 纯 LRU(会话局部性的下界探针)。
+    ⚠️ in-sample 陷阱:base 表必须来自**独立 trace**(留一),同流自算会复刻 +10~20pp 自欺差(B394)。"""
     import collections
+    cnt = collections.Counter()
+    if base_frac > 0:
+        cnt = collections.Counter((l, e) for l, _, ids in recs for e in ids)
     for cap in caps:
+        base_keys = {k for k, _ in cnt.most_common(int(cap * base_frac))} if base_frac else set()
         cache = collections.OrderedDict()  # 末端=MRU,popitem(last=False) 逐出最久未用
         hits = tot = 0
         for (l, _, ids) in recs:
             for e in ids:
                 key = (l, e)
-                if key in cache:
+                if key in base_keys:
+                    hits += 1
+                elif key in cache:
                     cache.move_to_end(key)
                     hits += 1
                 else:
                     tot += 1
-                    if len(cache) >= cap:
+                    if cap - len(base_keys) <= 0:
+                        continue  # 全部槽被保护段占用 ⇒ 非 base 只计 miss,不入缓存
+                    if len(cache) >= cap - len(base_keys):
                         cache.popitem(last=False)
                     cache[key] = None
         rate = hits / (hits + tot) if hits + tot else float("nan")
-        print(f"  cap={cap:6d} 槽(≈{cap*slot_gib:5.2f} GiB): LRU 命中={rate*100:5.1f}%")
+        tag = f"base={base_frac*100:.0f}%" if base_frac else "纯LRU"
+        print(f"  [{tag:8s}] cap={cap:6d} 槽(≈{cap*slot_gib:5.2f} GiB): 命中={rate*100:5.1f}%")
 
 
 def main():
@@ -113,6 +125,7 @@ def main():
     ap.add_argument("jsonl", nargs="?")
     ap.add_argument("--read-bin", default=None, help="XTU-RDUMP 二进制文件")
     ap.add_argument("--lru", default="200,400,700,1200,2400,5120")
+    ap.add_argument("--base", default="0,0.25,0.5", help="受保护常驻占比扫描(Strata 形状 vs 纯LRU)")
     ap.add_argument("--all-prefill", action="store_true", help="read-bin 时不排除 prefill 记录")
     ap.add_argument("--slots", default="64,128,192,256")
     ap.add_argument("--folds", type=int, default=10)
@@ -120,7 +133,9 @@ def main():
     if a.read_bin:
         recs, n_layers = read_bin(a.read_bin, decode_only=not a.all_prefill)
         print(f"records={len(recs)} 层数={n_layers}(首见序)")
-        lru_sweep(recs, [int(x) for x in a.lru.split(",")])
+        caps = [int(x) for x in a.lru.split(",")]
+        for bf in [float(x) for x in a.base.split(",")]:
+            lru_sweep(recs, caps, base_frac=bf)
         return
     if not a.jsonl:
         ap.error("需要 jsonl 或 --read-bin")

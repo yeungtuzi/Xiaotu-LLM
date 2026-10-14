@@ -2243,8 +2243,14 @@ class _XiaotuExpertsMixin:
                 part_ids = torch.where(
                     _res, (_sl - _E).to(torch.int32),
                     torch.full_like(ids_i32, -1))
+                if getattr(self, "_pin_stats", True):
+                    self._pin_stats = False
+                    _hitn = int(_res.sum())
+                    print(f"[xtu-pin][hit] {layer.layer_name.split('.')[-4]}: "
+                          f"hits={_hitn}/{_res.numel()} slots={int(_pinp.planes[0].shape[0])} "
+                          f"E={_E}", flush=True)
                 _partial = _gp_mod.gpu_moe_layer(
-                    h_bf16, part_ids, wts_f32,
+                    h_bf16, part_ids, torch.where(_res, wts_f32, _zw),
                     *_pinp.planes, int(hidden_size), int(self._I_eng),
                     int(part_ids.size(1)),
                     device=h_bf16.device, slot=_pinp.as_slot())

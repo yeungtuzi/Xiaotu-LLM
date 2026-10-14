@@ -14113,6 +14113,6 @@ layer3labs.io/guides/deepseek-v4-benchmarks);相对线 A/B 双臂一致。错题
   停顿,era0 干净;boot args 逐项对毕唯一差 = **inductor cache_dir 哈希**
   (era efbaea00/e900218d 全热 vs 合并码 5cdba8c3 全新)⇒ 冷编译缓存,凡首见新
   verify-token 形状(流早退致 24→18/12/6…宽度)付一次 inductor recompile。
-  修复 = 预热阶段用早退短合成 prompt 扫中间形状(v5j warm_shapes),编译税全
-  进预热;协议 v5j = 形状预热 + c1×14/c2×7/c4×5。**聚合主口径改 Σtok/Σ解码窗口
+  ~~修复 = 预热扫形状~~ **证伪**(v5j 预热全形状后 4.51/6.45 依旧,5 样本 4 中)⇒
+  悬案 STALL-1:码相关(era 无/合并码两臂皆有)+幅度确定+decode 步内;协议 v5j = 形状预热 + c1×14/c2×7/c4×5。**聚合主口径改 Σtok/Σ解码窗口
   (用户裁定:总产出/总时间,与 C 无关;×C 降为交叉列)**。

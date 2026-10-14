@@ -14114,5 +14114,9 @@ layer3labs.io/guides/deepseek-v4-benchmarks);相对线 A/B 双臂一致。错题
   (era efbaea00/e900218d 全热 vs 合并码 5cdba8c3 全新)⇒ 冷编译缓存,凡首见新
   verify-token 形状(流早退致 24→18/12/6…宽度)付一次 inductor recompile。
   ~~修复 = 预热扫形状~~ **证伪**(v5j 预热全形状后 4.51/6.45 依旧,5 样本 4 中)⇒
-  悬案 STALL-1:码相关(era 无/合并码两臂皆有)+幅度确定+decode 步内;协议 v5j = 形状预热 + c1×14/c2×7/c4×5。**聚合主口径改 Σtok/Σ解码窗口
+  悬案 STALL-1:码相关(era 无/合并码两臂皆有)+幅度确定+decode 步内;
+- **STALL-1 现行犯锁定(探针)**:`xtu-pf-progress` 心跳探针(合并码引入,**默认开**,
+  era 日志零行)在 5.3s 静默区把 layer21 cpu_decode call 号 131→132 冻住;
+  机理性嫌疑 = print 与引擎日志流交错锁/GIL(print 阻塞式写管道)。
+  判决实验 NOPF:XIAOTU_PF_PROGRESS=0 重启复测 c4×5 ⇒ 若 gap 绝迹即结案并改默认关。协议 v5j = 形状预热 + c1×14/c2×7/c4×5。**聚合主口径改 Σtok/Σ解码窗口
   (用户裁定:总产出/总时间,与 C 无关;×C 降为交叉列)**。

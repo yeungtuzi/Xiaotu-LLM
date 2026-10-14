@@ -68,6 +68,22 @@ def _xtu_load_env_file() -> int:
     except OSError:
         if explicit:
             print(f"[vllm-xtu-moe/env] ⚠️ XIAOTU_ENV_FILE={path} 读不到", flush=True)
+    # 【devtree-only】个人实验桥:主桥之后仍缺的键用 ~/.xiaotu_env.local 兜底(setdefault)
+    _p_home = _os.path.expanduser("~/.xiaotu_env.local")
+    try:
+        with open(_p_home) as fh:
+            for raw in fh:
+                line = raw.strip()
+                if not line or line.startswith("#") or "=" not in line:
+                    continue
+                _k, _v = line.split("=", 1)
+                _k, _v = _k.strip(), _v.strip()
+                if _k and _k not in _os.environ:
+                    _os.environ[_k] = _v
+                    print(f"[vllm-xtu-moe/env] {_k}={_v}  (个人桥 {_p_home})", flush=True)
+                    n += 1
+    except OSError:
+        pass
     return n
 
 

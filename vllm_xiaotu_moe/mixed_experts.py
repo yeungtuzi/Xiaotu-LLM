@@ -2256,8 +2256,7 @@ class _XiaotuExpertsMixin:
                           f"E={_E}", flush=True)
                 _skipgpu = os.environ.get("XIAOTU_PIN_SKIPGPU") == "1"
                 _side_on = (os.environ.get("XIAOTU_PIN_SIDE") == "1"
-                            and not _skipgpu
-                            and not torch.cuda.is_current_stream_capturing())
+                            and not _skipgpu)
                 _ev_done = None
                 if _side_on:
                     # 结构修复:partial 挪边流,与 cpu_decode 的 CPU 计算窗口并行

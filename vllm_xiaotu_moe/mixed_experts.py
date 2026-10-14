@@ -2228,8 +2228,8 @@ class _XiaotuExpertsMixin:
                     _m = _re.search(r"layers\.(\d+)", getattr(layer, "layer_name", ""))
                     if _m:
                         _pinp = _xp.build_layer_pool(
-                            engine, h_bf16.device, hidden_size, _I,
-                            int(self._group_k), self._E_eng,
+                            engine, h_bf16.device, hidden_size,
+                            int(self._I_eng), int(self._group_k), self._E_eng,
                             int(_m.group(1)), expert_map)
                 self._pin_pool = _pinp if _pinp is not None else False
             if _pinp and _gp_mod is not None:

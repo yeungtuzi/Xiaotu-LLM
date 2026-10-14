@@ -2213,6 +2213,13 @@ class _XiaotuExpertsMixin:
                     pass
             # ---- XIAOTU_PIN 分流(缩水版,SPEC v1 §8;默认关)----
             _pinp = getattr(self, "_pin_pool", False)
+            if _pinp is False and not getattr(self, "_pin_probed", False):
+                self._pin_probed = True
+                import os as _os
+                from vllm_xiaotu_moe import expert_pool as _xq
+                print(f"[xtu-pin][probe] enabled={_xq.pin_enabled()} "
+                      f"env={_os.environ.get('XIAOTU_PIN')!r} table={_os.environ.get('XIAOTU_PIN_TABLE')!r} "
+                      f"resident={_resident} gpu_pf={_gpu_pf}", flush=True)
             if _pinp is False and not torch.cuda.is_current_stream_capturing():
                 from vllm_xiaotu_moe import expert_pool as _xp
                 _pinp = None
@@ -2221,7 +2228,8 @@ class _XiaotuExpertsMixin:
                     _m = _re.search(r"layers\.(\d+)", getattr(layer, "layer_name", ""))
                     if _m:
                         _pinp = _xp.build_layer_pool(
-                            engine, h_bf16.device, self.moe_config,
+                            engine, h_bf16.device, hidden_size, _I,
+                            int(self._group_k), self._E_eng,
                             int(_m.group(1)), expert_map)
                 self._pin_pool = _pinp if _pinp is not None else False
             if _pinp and _gp_mod is not None:

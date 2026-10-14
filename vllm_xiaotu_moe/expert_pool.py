@@ -92,7 +92,8 @@ class LayerPool:
         # 纪律:prefill staging 突发段(staging_active flag)内不得触发(QA #167 支路③)
 
 
-def build_layer_pool(engine, device, cfg, layer_idx: int, em_global_to_local: torch.Tensor):
+def build_layer_pool(engine, device, hidden: int, inter: int, group_k: int,
+                     e_local: int, layer_idx: int, em_global_to_local, topk: int = 0):
     """env 门 + 表命中才建;返回 LayerPool 或 None。"""
     if not pin_enabled():
         return None
@@ -106,15 +107,14 @@ def build_layer_pool(engine, device, cfg, layer_idx: int, em_global_to_local: to
     if not g_list:
         return None
     if em_global_to_local is None:  # 无 EP(TP=1):全局==本地
-        pinned_local = sorted({int(g) for g in g_list if 0 <= int(g) < int(cfg.expert_num)})
+        pinned_local = sorted({int(g) for g in g_list if 0 <= int(g) < int(e_local)})
     else:
         em = em_global_to_local.to(torch.long)
-        pinned_local = sorted({int(em[g]) for g in g_list if 0 <= int(em[g]) < int(cfg.expert_num)})
+        pinned_local = sorted({int(em[g]) for g in g_list if 0 <= int(em[g]) < int(e_local)})
     if not pinned_local:
         return None
-    return LayerPool(engine, device, cfg.hidden_size, cfg.intermediate_size,
-                     int(getattr(cfg, "groupK", 32) or 32), int(cfg.expert_num),
-                     pinned_local, layer_idx)
+    return LayerPool(engine, device, int(hidden), int(inter), int(group_k),
+                     int(e_local), pinned_local, layer_idx)
 
 
 build_layer_pool._table = None  # 进程级缓存(懒)

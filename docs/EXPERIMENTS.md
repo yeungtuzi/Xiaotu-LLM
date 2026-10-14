@@ -14089,3 +14089,23 @@ layer3labs.io/guides/deepseek-v4-benchmarks);相对线 A/B 双臂一致。错题
      合成 sweep 只能证伪不能证成(与 #179 同族);B403 的 +15~26% 定性降级为
      "prompt-repetitive 合成流量上界" ✗✗。
   3. 生产现状:pin0 boot(=默认),fp32 修复已在生产树,gsm 语义门结论(B404)不受影响。
+
+### B406 · PIN=1 冷协议正式表:预热/APC 排除/era 对照全链(2026-10-14)
+- **协议演进(用户两条硬指令驱动)**:"测之前充分预热+排除 prefix-cache" ⇒
+  * v2(随机盐+cached==0 自证+预热2发):发现盐头**不能可靠打穿块哈希**
+    (cached=9344 违例 ⇒ 自证剔除机制必要);6.5s 停顿 = 并发档首次 verify 形状 JIT,
+    预热扩为 c1/c2/c4×2 四发(v3)。
+  * v5(用户方案,终版):**PREFIX_CACHE=0** 引擎(`--no-enable-prefix-caching`,
+    serve_v41.sh 原生支持)+ **原文无盐**逐字节同 prompt + cached==0 作开关生效自证。
+    比随机盐干净:内容与 era 逐字节一致,方差回落到批序+编译带。
+  * 池位扩至 c1×14/c2×7/c4×5(EOS 刀刃损耗 ~45% 下仍保 ≥8 有效/档)。
+  * 客户端三门:cached==0、finish=length、max_gap≤1.5s、8-gram deg 门(新增)。
+- **era 代码对照判决(关键负结果)**:era(0ac2478)代码 + PIN=0 + APC=0 冷协议:
+  EOS@1 率 c1 4/8、c2 3/8、c4 6/12 ≈ **与当前码冷路同级** ⇒ EOS@1 **非合并回归**;
+  era README 0-EOS 是因为 era 全轮走 **warm 路(APC 命中)**,era warm 工件安全,
+  当前码 warm 路 EOS≈100% 属编译工件骰子(唯一已知配置差=inductor cache hash
+  f03026a548-e900218d→5cdba8c3)。**冷路 EOS 是两码固有的批序/形状刀刃**。
+  推论:冷协议下测双臂是公平口径;EOS@1 率作为独立健康指标报出。
+- era0 冷基线(era 码,PIN=0):c1 55.8(n=4,含 61/68 高值样本,未经 deg 门,存疑上界)
+  / c2 agg 76.5(n=3)/ c4 156.5(n=2,半并发伪高作废)。当前码冷 PIN=0 参考:50.5(n=4)。
+- **正式双臂(v5h,HEAD 码,APC=0)**:pin1/pin0 依序,pool 14/7/5,待完成回填。

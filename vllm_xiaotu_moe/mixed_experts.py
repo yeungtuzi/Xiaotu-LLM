@@ -2234,33 +2234,38 @@ class _XiaotuExpertsMixin:
                 self._pin_pool = _pinp if _pinp is not None else False
             if _pinp and _gp_mod is not None:
                 _E = self._E_eng
-                _sl = _pinp.slotmap[ids_i32.long()]
-                _res = _sl >= _E
                 _zids = torch.zeros_like(ids_i32)
                 _zw = torch.zeros_like(wts_f32)
-                if os.environ.get("XIAOTU_PIN_NUM") == "cpu":
-                    # 对照臂 D:架构全走(建池/分发/partial 核都跑),但 CPU 算全量
-                    # 且 partial 置零 ⇒ 数值应逐位=基线 ⇒ 区分"架构 bug"与"数值差"。
-                    cpu_ids, cpu_w = ids_i32, wts_f32
-                else:
-                    cpu_ids = torch.where(_res, _zids, ids_i32)
-                    cpu_w = torch.where(_res, _zw, wts_f32)
-                part_ids = torch.where(
-                    _res, (_sl - _E).to(torch.int32),
-                    torch.full_like(ids_i32, -1))
-                if getattr(self, "_pin_stats", True):
-                    self._pin_stats = False
-                    _hitn = int(_res.sum())
-                    print(f"[xtu-pin][hit] {layer.layer_name.split('.')[-4]}: "
-                          f"hits={_hitn}/{_res.numel()} slots={int(_pinp.planes[0].shape[0])} "
-                          f"E={_E}", flush=True)
                 _skipgpu = os.environ.get("XIAOTU_PIN_SKIPGPU") == "1"
+                _numcpu = os.environ.get("XIAOTU_PIN_NUM") == "cpu"
                 _side_on = (os.environ.get("XIAOTU_PIN_SIDE") == "1"
-                            and not _skipgpu)
+                            and not _skipgpu and not _numcpu)
+                _partial = None
                 _ev_done = None
+                _ev_mask = None
+                if not _side_on:
+                    _sl = _pinp.slotmap[ids_i32.long()]
+                    _res = _sl >= _E
+                    if _numcpu:
+                        cpu_ids, cpu_w = ids_i32, wts_f32
+                    else:
+                        cpu_ids = torch.where(_res, _zids, ids_i32)
+                        cpu_w = torch.where(_res, _zw, wts_f32)
+                    part_ids = torch.where(
+                        _res, (_sl - _E).to(torch.int32),
+                        torch.full_like(ids_i32, -1))
+                    if getattr(self, "_pin_stats", True):
+                        self._pin_stats = False
+                        print(f"[xtu-pin][hit] "
+                              f"{layer.layer_name.split('.')[-4]}: "
+                              f"hits={int(_res.sum())}/{_res.numel()} "
+                              f"slots={int(_pinp.planes[0].shape[0])} "
+                              f"E={_E}", flush=True)
                 if _side_on:
-                    # 结构修复:partial 挪边流,与 cpu_decode 的 CPU 计算窗口并行
-                    # (命中=纯收益,miss=0 收益)。捕获期退回串行(保守)。
+                    # 折叠版:mask/gather 链也挪边流(原先 ~6 小核×61 层钉在主流)。
+                    # 主流只剩 wait(ev_mask)→cpu_decode→wait(ev_done)→add_。
+                    # 顺序:side 先产 cpu_ids/cpu_w 并记 ev_mask(engine 的 D2H
+                    # 依赖它),partial 核在其后继续与 CPU 计算并行。
                     _side = getattr(self, "_pin_side", None)
                     if _side is None:
                         _side = torch.cuda.Stream()
@@ -2270,6 +2275,15 @@ class _XiaotuExpertsMixin:
                     _partial = torch.empty_like(out)
                     with torch.cuda.stream(_side):
                         _side.wait_event(_ev0)
+                        _sl = _pinp.slotmap[ids_i32.long()]
+                        _res = _sl >= _E
+                        cpu_ids = torch.where(_res, _zids, ids_i32)
+                        cpu_w = torch.where(_res, _zw, wts_f32)
+                        _ev_mask = torch.cuda.Event()
+                        _ev_mask.record(_side)
+                        part_ids = torch.where(
+                            _res, (_sl - _E).to(torch.int32),
+                            torch.full_like(ids_i32, -1))
                         _p = _gp_mod.gpu_moe_layer(
                             h_bf16, part_ids, torch.where(_res, wts_f32, _zw),
                             *_pinp.planes, int(hidden_size), int(self._I_eng),
@@ -2278,6 +2292,7 @@ class _XiaotuExpertsMixin:
                         _partial.copy_(_p.to(out.dtype))
                         _ev_done = torch.cuda.Event()
                         _ev_done.record(_side)
+                    torch.cuda.current_stream().wait_event(_ev_mask)
                 if not _side_on:
                     _partial = (out if _skipgpu else _gp_mod.gpu_moe_layer(
                         h_bf16, part_ids, torch.where(_res, wts_f32, _zw),
@@ -2289,8 +2304,7 @@ class _XiaotuExpertsMixin:
                     h_bf16.data_ptr(), cpu_ids.data_ptr(), cpu_w.data_ptr(),
                     out.data_ptr(),
                 )
-                if os.environ.get("XIAOTU_PIN_NUM") != "cpu" \
-                        and not _skipgpu:
+                if not _numcpu and not _skipgpu:
                     if _ev_done is not None:
                         torch.cuda.current_stream().wait_event(_ev_done)
                     out.add_(_partial.to(out.dtype))

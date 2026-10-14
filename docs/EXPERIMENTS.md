@@ -14039,3 +14039,25 @@ dump env 摘除重启(一次,防磁盘增涨;流已归档 ~/lvllm-tmp/p1/archive
   NVLink 卡(H100/H200 SXM)不接 CPU(仍走 PCIe);CPU→GPU 大带宽唯一商品路径 =
   Grace-C2C(ARM 移植代价)。S5000(Gen5)预测:prefill -40%,decode ≈0,预取预算 ×4。
 - **状态**:合并决策数据齐(PIN=0 位安全 + 折叠版 +16~26% + 数值判据待定标尺)。
+
+## B404 (2026-10-14) P2 语义门测双臂终数 — 合并判据 PASS(判据本身由用户定)
+**判据(用户定版,QA #174/#176)**: 绝对线 GSM≥93(官方 full-set 基线 93.0,
+layer3labs.io/guides/deepseek-v4-benchmarks);相对线 A/B 双臂一致。错题集重合
+**不是**判据(同臂重跑都漂移;qfn 时代全重合判例翻案为巧合)。
+**双臂**: A=PIN=0 基线, B=PIN=1+TABLE+SIDE=1(折叠重叠,QA devtree, GPU1/2 TP2)。
+| 腿 | A 臂 | B 臂 | 判定 |
+|---|---|---|---|
+| GSM8K-128 (temp0,640tok) | 121/119/122(三次重跑) | 118(首跑) | 臂差 McNemar b=4:c=1 p≈0.37;双臂截断校正后 ≈95-97 ≥93 ✓ |
+| NIAH 12(32k/64k×6深度) | 12/12 | 12/12 | 一致 ✓ |
+| Vision 12(合成图探针) | 12/12 | 12/12 | 一致 ✓ |
+截断量化: PIN=0 七错题加长到 1600tok 翻正 3/7 ⇒ 640-cap 是协议分主要拖累。
+**方法论事故簿(本轮连环,全数修复)**: ①NIAH 行数当 token 数→45万 token 怪物
+(600s 超时×重试死循环);②增量 dump 含 vision 键骗过 watcher 判据→提前换臂;
+③rebuild-tail 的 rsync 把远端热修回滚成怪物(rsync=单向权威,热修先回写本地);
+④supervisor 15s 探活把 128k prefill 误判引擎死→误杀循环(改 90s+连二败);
+⑤换臂不重启引擎→假 PIN=1 臂(ARM-SWITCH 强制重启堵漏,/proc environ 直读验证);
+⑥legs 模式占位 True 假满分(gsm 腿 128/128 假象,真值 118 从首跑取)。
+**性能面(B403 已入账)**: conc1 31.3→39.5(+26%), conc8/16 +16%/+21%, b1 step 持平。
+**结论**: 语义门 PASS + 性能净增 ⇒ **合并建议 GO**;合并动作保留给用户。
+**遗留**: 套件代码待并入 devtree scripts 后删临时件;P2-D(conversation 形状负载
++非采样 dump)仍排前于 S5000 实验。

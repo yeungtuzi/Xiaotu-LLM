@@ -2224,7 +2224,7 @@ class _XiaotuExpertsMixin:
                             engine, h_bf16.device, self.moe_config,
                             int(_m.group(1)), expert_map)
                 self._pin_pool = _pinp if _pinp is not None else False
-            if _pinp:
+            if _pinp and _gp_mod is not None:
                 _E = self._E_eng
                 _sl = _pinp.slotmap[ids_i32.long()]
                 _res = _sl >= _E

@@ -2260,6 +2260,21 @@ class _XiaotuExpertsMixin:
                     out.data_ptr(),
                 )
                 out.add_(_partial.to(out.dtype))
+                if os.environ.get("XIAOTU_PIN_AUDIT") == "1" and qlen <= 16 \
+                        and not torch.cuda.is_current_stream_capturing() \
+                        and getattr(self, "_pin_audit_n", 0) < 8:
+                    self._pin_audit_n = getattr(self, "_pin_audit_n", 0) + 1
+                    _oref = torch.empty_like(out)
+                    engine.cpu_decode(
+                        stream.cuda_stream, qlen,
+                        self.moe_config.experts_per_token,
+                        h_bf16.data_ptr(), ids_i32.data_ptr(),
+                        wts_f32.data_ptr(), _oref.data_ptr())
+                    _d = (out.float() - _oref.float()).abs()
+                    _r = _oref.float().abs().amax().clamp(min=1e-6)
+                    print(f"[xtu-pin][audit] {layer.layer_name}: "
+                          f"maxabs={float(_d.max()):.3e} rel={float(_d.max()/_r):.3e} "
+                          f"hits={int(_res.sum())}/{_res.numel()}", flush=True)
             else:
                 engine.cpu_decode(
                     stream.cuda_stream, qlen, self.moe_config.experts_per_token,

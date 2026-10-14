@@ -80,6 +80,12 @@ class LayerPool:
                 dst=dst, e0=e, e1=e + 1)
         torch.cuda.synchronize()
 
+    def as_slot(self):
+        # 喂给 gpu_moe_layer 的 slot-like:bufs=planes,ready=构建期已完成事件
+        ev = torch.cuda.Event()
+        ev.record()   # 前面 _load_all 已 synchronize,这里只是保序凭证
+        return _ReadySlot(self.planes, ev)
+
     # ---- Phase B 预留:LRU 换入只走这两个入口(step 间 event 窗口内调用) ----
     def swap_in(self, gp, old_slot_expert: int, new_expert: int) -> None:
         raise NotImplementedError  # P2-B:plane[s] 重写 + slotmap 原子改值 + 表更新
@@ -112,3 +118,12 @@ def build_layer_pool(engine, device, cfg, layer_idx: int, em_global_to_local: to
 
 
 build_layer_pool._table = None  # 进程级缓存(懒)
+
+
+class _ReadySlot:
+    __slots__ = ("bufs", "busy", "ready")
+
+    def __init__(self, bufs, ready):
+        self.bufs = bufs
+        self.busy = None
+        self.ready = ready

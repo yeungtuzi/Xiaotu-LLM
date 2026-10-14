@@ -2211,11 +2211,48 @@ class _XiaotuExpertsMixin:
                               flush=True)
                 except Exception:  # noqa: BLE001  心跳绝不影响主流程 ✓
                     pass
-            engine.cpu_decode(
-                stream.cuda_stream, qlen, self.moe_config.experts_per_token,
-                h_bf16.data_ptr(), ids_i32.data_ptr(), wts_f32.data_ptr(),
-                out.data_ptr(),
-            )
+            # ---- XIAOTU_PIN 分流(缩水版,SPEC v1 §8;默认关)----
+            _pinp = getattr(self, "_pin_pool", False)
+            if _pinp is False and not torch.cuda.is_current_stream_capturing():
+                from vllm_xiaotu_moe import expert_pool as _xp
+                _pinp = None
+                if _xp.pin_enabled():
+                    import re as _re
+                    _m = _re.search(r"layers\.(\d+)", getattr(layer, "layer_name", ""))
+                    if _m:
+                        _pinp = _xp.build_layer_pool(
+                            engine, h_bf16.device, self.moe_config,
+                            int(_m.group(1)), expert_map)
+                self._pin_pool = _pinp if _pinp is not None else False
+            if _pinp:
+                _E = self._E_eng
+                _sl = _pinp.slotmap[ids_i32.long()]
+                _res = _sl >= _E
+                _zids = torch.zeros_like(ids_i32)
+                _zw = torch.zeros_like(wts_f32)
+                cpu_ids = torch.where(_res, _zids, ids_i32)
+                cpu_w = torch.where(_res, _zw, wts_f32)
+                part_ids = torch.where(
+                    _res, (_sl - _E).to(torch.int32),
+                    torch.full_like(ids_i32, -1))
+                _partial = _gp_mod.gpu_moe_layer(
+                    h_bf16, part_ids, wts_f32,
+                    *_pinp.planes, self.moe_config.hidden_size,
+                    self.moe_config.intermediate_size,
+                    self.moe_config.experts_per_token,
+                    device=h_bf16.device, slot=_pinp.as_slot())
+                engine.cpu_decode(
+                    stream.cuda_stream, qlen, self.moe_config.experts_per_token,
+                    h_bf16.data_ptr(), cpu_ids.data_ptr(), cpu_w.data_ptr(),
+                    out.data_ptr(),
+                )
+                out.add_(_partial.to(out.dtype))
+            else:
+                engine.cpu_decode(
+                    stream.cuda_stream, qlen, self.moe_config.experts_per_token,
+                    h_bf16.data_ptr(), ids_i32.data_ptr(), wts_f32.data_ptr(),
+                    out.data_ptr(),
+                )
         _lt_t2 = time.perf_counter() if _LT_ON else 0.0
         if _sync == "post":
             torch.cuda.synchronize()

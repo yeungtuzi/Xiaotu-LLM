@@ -2245,9 +2245,8 @@ class _XiaotuExpertsMixin:
                     torch.full_like(ids_i32, -1))
                 _partial = _gp_mod.gpu_moe_layer(
                     h_bf16, part_ids, wts_f32,
-                    *_pinp.planes, self.moe_config.hidden_size,
-                    self.moe_config.intermediate_size,
-                    self.moe_config.experts_per_token,
+                    *_pinp.planes, int(hidden_size), int(self._I_eng),
+                    int(part_ids.size(1)),
                     device=h_bf16.device, slot=_pinp.as_slot())
                 engine.cpu_decode(
                     stream.cuda_stream, qlen, self.moe_config.experts_per_token,

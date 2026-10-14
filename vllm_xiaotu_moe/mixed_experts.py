@@ -2254,18 +2254,49 @@ class _XiaotuExpertsMixin:
                     print(f"[xtu-pin][hit] {layer.layer_name.split('.')[-4]}: "
                           f"hits={_hitn}/{_res.numel()} slots={int(_pinp.planes[0].shape[0])} "
                           f"E={_E}", flush=True)
-                _partial = _gp_mod.gpu_moe_layer(
-                    h_bf16, part_ids, torch.where(_res, wts_f32, _zw),
-                    *_pinp.planes, int(hidden_size), int(self._I_eng),
-                    int(part_ids.size(1)),
-                    device=h_bf16.device, slot=_pinp.as_slot())
+                _skipgpu = os.environ.get("XIAOTU_PIN_SKIPGPU") == "1"
+                _side_on = (os.environ.get("XIAOTU_PIN_SIDE") == "1"
+                            and not _skipgpu
+                            and not torch.cuda.is_current_stream_capturing())
+                _ev_done = None
+                if _side_on:
+                    # 结构修复:partial 挪边流,与 cpu_decode 的 CPU 计算窗口并行
+                    # (命中=纯收益,miss=0 收益)。捕获期退回串行(保守)。
+                    _side = getattr(self, "_pin_side", None)
+                    if _side is None:
+                        _side = torch.cuda.Stream()
+                        self._pin_side = _side
+                    _ev0 = torch.cuda.Event()
+                    _ev0.record()
+                    _partial = torch.empty_like(out)
+                    with torch.cuda.stream(_side):
+                        _side.wait_event(_ev0)
+                        _p = _gp_mod.gpu_moe_layer(
+                            h_bf16, part_ids, torch.where(_res, wts_f32, _zw),
+                            *_pinp.planes, int(hidden_size), int(self._I_eng),
+                            int(part_ids.size(1)),
+                            device=h_bf16.device, slot=_pinp.as_slot())
+                        _partial.copy_(_p.to(out.dtype))
+                        _ev_done = torch.cuda.Event()
+                        _ev_done.record(_side)
+                if not _side_on:
+                    _partial = (out if _skipgpu else _gp_mod.gpu_moe_layer(
+                        h_bf16, part_ids, torch.where(_res, wts_f32, _zw),
+                        *_pinp.planes, int(hidden_size), int(self._I_eng),
+                        int(part_ids.size(1)),
+                        device=h_bf16.device, slot=_pinp.as_slot()))
                 engine.cpu_decode(
                     stream.cuda_stream, qlen, self.moe_config.experts_per_token,
                     h_bf16.data_ptr(), cpu_ids.data_ptr(), cpu_w.data_ptr(),
                     out.data_ptr(),
                 )
-                if os.environ.get("XIAOTU_PIN_NUM") != "cpu":
-                    out.add_(_partial.to(out.dtype))
+                if os.environ.get("XIAOTU_PIN_NUM") != "cpu" \
+                        and not _skipgpu:
+                    if _ev_done is not None:
+                        torch.cuda.current_stream().wait_event(_ev_done)
+                        partial_ = None  # noqa: F841
+                    else:
+                        out.add_(_partial.to(out.dtype))
                 if os.environ.get("XIAOTU_PIN_AUDIT") == "1" and qlen <= 16 \
                         and not torch.cuda.is_current_stream_capturing() \
                         and getattr(self, "_pin_audit_n", 0) < 8:

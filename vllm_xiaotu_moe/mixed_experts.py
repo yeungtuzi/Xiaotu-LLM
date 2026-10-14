@@ -2238,8 +2238,13 @@ class _XiaotuExpertsMixin:
                 _res = _sl >= _E
                 _zids = torch.zeros_like(ids_i32)
                 _zw = torch.zeros_like(wts_f32)
-                cpu_ids = torch.where(_res, _zids, ids_i32)
-                cpu_w = torch.where(_res, _zw, wts_f32)
+                if os.environ.get("XIAOTU_PIN_NUM") == "cpu":
+                    # 对照臂 D:架构全走(建池/分发/partial 核都跑),但 CPU 算全量
+                    # 且 partial 置零 ⇒ 数值应逐位=基线 ⇒ 区分"架构 bug"与"数值差"。
+                    cpu_ids, cpu_w = ids_i32, wts_f32
+                else:
+                    cpu_ids = torch.where(_res, _zids, ids_i32)
+                    cpu_w = torch.where(_res, _zw, wts_f32)
                 part_ids = torch.where(
                     _res, (_sl - _E).to(torch.int32),
                     torch.full_like(ids_i32, -1))
@@ -2259,7 +2264,8 @@ class _XiaotuExpertsMixin:
                     h_bf16.data_ptr(), cpu_ids.data_ptr(), cpu_w.data_ptr(),
                     out.data_ptr(),
                 )
-                out.add_(_partial.to(out.dtype))
+                if os.environ.get("XIAOTU_PIN_NUM") != "cpu":
+                    out.add_(_partial.to(out.dtype))
                 if os.environ.get("XIAOTU_PIN_AUDIT") == "1" and qlen <= 16 \
                         and not torch.cuda.is_current_stream_capturing() \
                         and getattr(self, "_pin_audit_n", 0) < 8:

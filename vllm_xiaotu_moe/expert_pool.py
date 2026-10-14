@@ -26,14 +26,21 @@ def pin_enabled() -> bool:
 
 
 def load_pin_table(path: str) -> dict[int, list[int]]:
-    """XTUP v0:header<magic4,ver,n_layers,E,n_entries> + entries(layer u16, expert u16 频率降序)。"""
+    """XTUP v0:header<magic4,ver,n_layers,E,n_entries> + entries(layer u16, expert u16 频率降序)。
+
+    ⚠️ 头长 = `struct.calcsize("<4sIIII")` = **20** 字节(不是 16)。原先按 16 偏移读条目 ⇒
+    每条读到的是**上一条**(最后一条丢失),且第 0 条读到的是头部尾部 4 字节的**垃圾键**
+    (它的 layer 值恰等于 n_entries,永不匹配任何真实层)⇒ 净效果 = 表少最后 1 条 + 1 条垃圾。
+    量级无害(实测 342→341 真条目,命中率 23.5%→23.4%),但属真 bug,2026-10-14 修正。
+    """
     with open(path, "rb") as f:
         buf = f.read()
     magic, ver, n_layers, e_max, n_ent = struct.unpack_from("<4sIIII", buf, 0)
     assert magic == b"XTUP" and ver == 1, f"bad pin table {magic!r} v{ver}"
+    hdr = struct.calcsize("<4sIIII")
     out: dict[int, list[int]] = {}
     for i in range(n_ent):
-        l, e = struct.unpack_from("<HH", buf, 16 + 4 * i)
+        l, e = struct.unpack_from("<HH", buf, hdr + 4 * i)
         out.setdefault(int(l), []).append(int(e))
     return out
 

@@ -2244,6 +2244,16 @@ class _XiaotuExpertsMixin:
                     _side.wait_event(_ev0)
                     _sl = _pinp.slotmap[ids_i32.long()]
                     _res = _sl >= _E
+                    # env 门的一次性命中率取证(默认关 ⇒ 逐字零行为变化)。
+                    # 来由(2026-10-14):臂差为负时必须能区分"表太稀 ⇒ 命中率低"与
+                    # "命中率够但 fork/join 固定开销吃掉收益",否则只能靠猜。
+                    if os.environ.get("XIAOTU_PIN_HITSTAT") == "1" \
+                            and not getattr(self, "_pin_hitstat_done", False):
+                        self._pin_hitstat_done = True
+                        print("[xtu-pin][hit] %s: hits=%d/%d slots=%d E=%d qlen=%d" % (
+                            getattr(layer, "layer_name", "?").split(".")[-4],
+                            int(_res.sum()), int(_res.numel()),
+                            int(_pinp.planes[0].shape[0]), int(_E), int(qlen)), flush=True)
                     cpu_ids = torch.where(_res, _zids, ids_i32)
                     cpu_w = torch.where(_res, _zw, wts_f32)
                     _ev_mask = torch.cuda.Event()

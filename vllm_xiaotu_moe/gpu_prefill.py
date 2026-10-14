@@ -1815,8 +1815,12 @@ def gpu_moe_layer(
     # 曾经按 T 行分配 ⇒ 越界写,cudaErrorIllegalAddress(第 19 轮实测)。
     # 想省这块分配只能改成"排序后行数=有效项数"或持久缓冲,不能再动行数语义。
     # 【§598】复用:见 `_reuse_moe` 的注释。`XIAOTU_GPF_REUSE=0` 可回退到每层新分配。
-    if os.environ.get("XIAOTU_GPF_REUSE", "1") == "1":
+    if os.environ.get("XIAOTU_GPF_REUSE", "1") == "1" and slot is None:
         inter = _reuse_moe("inter", (A, 2 * I), torch.bfloat16, device)
+    elif slot is not None:
+        # PIN 分流(slot):垃圾桶(-1)行 kernel 不写 ⇒ 环/empty 残留(inf/nan)
+        # 会以 0×inf=NaN 进入 partial ⇒ slot 路径专属 zeros 并禁用复用环。
+        inter = torch.zeros((A, 2 * I), dtype=torch.bfloat16, device=device)
     else:
         inter = torch.empty((A, 2 * I), dtype=torch.bfloat16, device=device)
     if os.environ.get("XIAOTU_GPF_STAGE") == "1":

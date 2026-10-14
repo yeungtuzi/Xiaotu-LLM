@@ -2211,11 +2211,69 @@ class _XiaotuExpertsMixin:
                               flush=True)
                 except Exception:  # noqa: BLE001  心跳绝不影响主流程 ✓
                     pass
-            engine.cpu_decode(
-                stream.cuda_stream, qlen, self.moe_config.experts_per_token,
-                h_bf16.data_ptr(), ids_i32.data_ptr(), wts_f32.data_ptr(),
-                out.data_ptr(),
-            )
+            # ---- XIAOTU_PIN 分流(缩水版,SPEC v1 §8;默认关)----
+            _pinp = getattr(self, "_pin_pool", False)
+            if _pinp is False and not torch.cuda.is_current_stream_capturing():
+                from vllm_xiaotu_moe import expert_pool as _xp
+                _pinp = None
+                if _xp.pin_enabled():
+                    import re as _re
+                    _m = _re.search(r"layers\.(\d+)", getattr(layer, "layer_name", ""))
+                    if _m:
+                        _pinp = _xp.build_layer_pool(
+                            engine, h_bf16.device, hidden_size,
+                            int(self._I_eng), int(self._group_k), self._E_eng,
+                            int(_m.group(1)), expert_map)
+                self._pin_pool = _pinp if _pinp is not None else False
+            if _pinp and _gp_mod is not None:
+                # 专家常驻分流(CPU 算非常驻 + GPU slot 常驻部分):
+                # mask/gather/partial 核全部挂边流,与 cpu_decode 重叠;
+                # 主流只剩 wait(ev_mask)->cpu_decode->wait(ev_done)->add_。
+                # event fork/join 可被 CUDA graph 捕获(B402/B403)。
+                _E = self._E_eng
+                _zids = torch.zeros_like(ids_i32)
+                _zw = torch.zeros_like(wts_f32)
+                _side = getattr(self, "_pin_side", None)
+                if _side is None:
+                    _side = torch.cuda.Stream()
+                    self._pin_side = _side
+                _ev0 = torch.cuda.Event()
+                _ev0.record()
+                _partial = torch.empty_like(out)
+                with torch.cuda.stream(_side):
+                    _side.wait_event(_ev0)
+                    _sl = _pinp.slotmap[ids_i32.long()]
+                    _res = _sl >= _E
+                    cpu_ids = torch.where(_res, _zids, ids_i32)
+                    cpu_w = torch.where(_res, _zw, wts_f32)
+                    _ev_mask = torch.cuda.Event()
+                    _ev_mask.record(_side)
+                    part_ids = torch.where(
+                        _res, (_sl - _E).to(torch.int32),
+                        torch.full_like(ids_i32, -1))
+                    _p = _gp_mod.gpu_moe_layer(
+                        h_bf16, part_ids, torch.where(_res, wts_f32, _zw),
+                        *_pinp.planes, int(hidden_size), int(self._I_eng),
+                        int(part_ids.size(1)),
+                        device=h_bf16.device, slot=_pinp.as_slot())
+                    _partial.copy_(_p.to(out.dtype))
+                    _ev_done = torch.cuda.Event()
+                    _ev_done.record(_side)
+                torch.cuda.current_stream().wait_event(_ev_mask)
+                engine.cpu_decode(
+                    stream.cuda_stream, qlen,
+                    self.moe_config.experts_per_token,
+                    h_bf16.data_ptr(), cpu_ids.data_ptr(), cpu_w.data_ptr(),
+                    out.data_ptr(),
+                )
+                torch.cuda.current_stream().wait_event(_ev_done)
+                out.add_(_partial.to(out.dtype))
+            else:
+                engine.cpu_decode(
+                    stream.cuda_stream, qlen, self.moe_config.experts_per_token,
+                    h_bf16.data_ptr(), ids_i32.data_ptr(), wts_f32.data_ptr(),
+                    out.data_ptr(),
+                )
         _lt_t2 = time.perf_counter() if _LT_ON else 0.0
         if _sync == "post":
             torch.cuda.synchronize()

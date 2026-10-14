@@ -60,6 +60,9 @@ command -v numactl >/dev/null 2>&1 && NCTL=(numactl --interleave=all) || NCTL=()
   echo "VLLM_XIAOTU_GPU_PREFILL_MIN_TOKENS=$GPU_PREFILL_MIN"
   echo "XIAOTU_PLE_CPU=$PLE_CPU"
   echo "XIAOTU_RELEASE_SOURCE=${XIAOTU_RELEASE_SOURCE:-1}"
+  # 实验变量透传(未设=不写行,set -e 安全):XIAOTU_PIN 分流实验用
+  if [ -n "${XIAOTU_PIN:-}" ]; then echo "XIAOTU_PIN=$XIAOTU_PIN"; fi
+  if [ -n "${XIAOTU_PIN_TABLE:-}" ]; then echo "XIAOTU_PIN_TABLE=$XIAOTU_PIN_TABLE"; fi
 } > "$XTU_ENV_FILE"
 export XIAOTU_ENV_FILE
 

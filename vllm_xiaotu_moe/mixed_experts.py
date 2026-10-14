@@ -2294,9 +2294,7 @@ class _XiaotuExpertsMixin:
                         and not _skipgpu:
                     if _ev_done is not None:
                         torch.cuda.current_stream().wait_event(_ev_done)
-                        partial_ = None  # noqa: F841
-                    else:
-                        out.add_(_partial.to(out.dtype))
+                    out.add_(_partial.to(out.dtype))
                 if os.environ.get("XIAOTU_PIN_AUDIT") == "1" and qlen <= 16 \
                         and not torch.cuda.is_current_stream_capturing() \
                         and getattr(self, "_pin_audit_n", 0) < 8:

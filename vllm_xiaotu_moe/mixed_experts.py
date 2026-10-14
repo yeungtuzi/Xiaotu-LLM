@@ -2255,7 +2255,8 @@ class _XiaotuExpertsMixin:
                         h_bf16, part_ids, torch.where(_res, wts_f32, _zw),
                         *_pinp.planes, int(hidden_size), int(self._I_eng),
                         int(part_ids.size(1)),
-                        device=h_bf16.device, slot=_pinp.as_slot())
+                        device=h_bf16.device, slot=_pinp.as_slot(),
+                        out_dtype=torch.float32)
                     _partial.copy_(_p.to(out.dtype))
                     _ev_done = torch.cuda.Event()
                     _ev_done.record(_side)

@@ -1769,6 +1769,7 @@ def gpu_moe_layer(
     *,
     device: torch.device,
     slot: "PrefetchSlot | None" = None,
+    out_dtype=None,
 ):
     """One layer's routed MoE on GPU (K-major raw bytes, in-kernel fp4 dequant).
 
@@ -1805,7 +1806,7 @@ def gpu_moe_layer(
 
     tok, wts, seg_start, A = _build_segmentation(topk_ids, topk_weights, E, device)
     _t1 = time.perf_counter() if _GP_TIMING else 0.0
-    out = torch.zeros((T, H), dtype=torch.bfloat16, device=device)
+    out = torch.zeros((T, H), dtype=out_dtype or torch.bfloat16, device=device)
     if T == 0 or K == 0:
         # 形状判空(不是数据判空):A 现在是固定的 T*K,空批之外不会为 0。
         # 全部 id 无效时它们都落进垃圾桶段,每个专家的段为空 ⇒ 内核不写 out。

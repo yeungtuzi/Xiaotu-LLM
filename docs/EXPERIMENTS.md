@@ -13965,3 +13965,40 @@ dump env 摘除重启(一次,防磁盘增涨;流已归档 ~/lvllm-tmp/p1/archive
 * **诚实 Strata 形状**(底表=前半流 top-342,后半场从空 LRU):**48.1%**(≥in-sample 47.8)⇒ 48% 稳健,
   缩水版定价上修:26.1×0.48 ≈ **12.5ms/step**(C1 83.2→~71ms,-15%),下行风险≈0 不变。
 * ⇒ 决策包 §6 数字定格:做 = 12.5ms;不做 = 缓议+三条翻案案(①改判强,②下调,③仍开放)。
+
+### B401 · P2 缩水版实装 + TP=2 双臂验收:**架构成立,价值线证伪**(2026-10-14)
+
+- **实装**(分支 p2/expert-resident-shrink @ dev worktree vllm-xiaotu-moe-expertres):
+  expert_pool(池=KV-profiling 前分配,槽=kmajor noraw e0/e1 逐槽加载)+ 静态 pin 表
+  (expert_pin_v0.bin 342 槽,真实解码流 top-50%)+ CPU 分支分流(hit→GPU partial/
+  miss→CPU 引擎,零内核改动)+ C 阶段 merge(add_ 单点)。**XIAOTU_PIN=0 逐位回退**
+  在 TP=2 实机证实(臂 B=B2=100% 全等,基线自复现干净)。
+- **运行时静默器七连**(逐个钉死,全部记账):PYTHONPATH 只含 mainline(插件经 pip -e
+  解析,devtree 必须 XTU_TREE 前置)/ EngineCore 环境被 vllm 重建(**文件桥是唯一通道**,
+  个人桥 ~/.xiaotu_env.local 兜底,devtree-only 不并入)/ serve 脚本重写 envfile /
+  FusedMoEConfig ≠ 引擎 cfg(两处属性崩)/ 局部 _I 未绑定 / heredoc 不传远端参数 /
+  **垃圾桶(-1 pair)行 kernel 不写 ⇒ 复用环/empty 残留 inf×0=NaN**(slot 路径专属
+  zeros+禁环,B401.5 教训:**为分流注入的 id 会踩 prefill 时代不存在的垃圾路径**)。
+- **验收矩阵**(ds41f TP=2 GPU1,2 greedy 12 prompt×64,基线=同脚本 bringup 起的生产树):
+  | 臂 | 语义 | vs 基线 |
+  |---|---|---|
+  | B/B2 | PIN=0 回退(两次独立重启) | **100%/100%** ✓ |
+  | D | 架构全走+数值=CPU | 95.9%(prompt11 分叉)|
+  | A | 真分流 hit→GPU | 3.6%(全发散)|
+  **D≠B 定罪链**:审计(hit 层 rel=5e-4 正常;hits=0 层曾 nan=垃圾桶案已修)+ B2=B 排除
+  噪声 ⇒ D 的唯一扰动=**池的 6GiB 分配改变显存布局→GEMM 算法选择→1ULP→prompt11
+  蝴蝶**。**结论:token 位一致验收在"hit→GPU"语义下不可能达成**,≥99.9% 判据需按
+  B399/B401 证据重定义为"采样温度下分布等价"(temp=0.6 对照待用户定标尺)。
+- **性能判据(同机同配置对照 sweep)**:
+  | conc | A tok/s | B tok/s |
+  |---|---|---|
+  | 1 | 25.2 | **31.3** |
+  | 8/16/32 | 55.0/56.0/54.8 | 54.4/54.3/55.5(平台) |
+  C1 步时探针:A=73.8ms vs B=65.5ms(**−12% 负增益**)。**平台段 CPU 不是瓶颈**
+  (55 封顶与 MoE 卸载无关)+ greedy 小样本 pair 命中率实测仅 1/6(≪48% 的流量级预测,
+  pin 表密度 342/21504=1.6% 每步只盖住少数路由对)⇒ **缩水版定价 12.5ms 的假设
+  "CPU MoE 31% 且被卸载"在端到端不成立,NO-GO**。
+- **翻案路径**(若仍要 P2):① 全量版 LRU swap-in 环把命中率推到 85%+(miss 归 CPU 的
+  对价),② dispatch 定成本(≈8-13ms/step 小算子链)必须先用图内融合压到 <3ms,
+  ③ 或直接转向 PLAN_LATENCY 别的腿(MoE 内核算法/线程配比)。**当前建议:缓合并,
+  devtree 保留作 swap 版基座;生产恢复 XTU_TREE 默认(生产树代码)运行,PIN 全关。**

@@ -72,7 +72,9 @@ GPU_UTIL="${GPU_UTIL:-0.90}"
 #   要 512K 就必须把 `MBT` 压到 4096 —— 激活工作区 ∝ MBT,而 KV 池与之争同一份显存。
 #   代价是 prefill 变慢(256K 下实测 MBT 4096 比 12288 慢 34%,见 TUNING_GUIDE §8),
 #   换来的是"512K 一定起得来"。要速度优先的格子再显式传 `MBT=12288 MAXLEN=262144`。
-MAXLEN="${MAXLEN:-524288}"
+# ⭐【2026-10-15 用户定案】默认上下文 512K → **256K**:512K 下 KV 池连一路都装不满
+#   (实测池 416,228 token < 524,288 ⇒ 0.79x);256K 下同一池有 1.59x,再叠加其它显存优化后目标是 **3 路 256K**(SEQS 仍 4)✓
+MAXLEN="${MAXLEN:-262144}"
 MBT="${MBT:-4096}"
 # Admission limit. 256K context x 2 concurrent sequences = 524,288 tokens, and the
 # KV pool at this maxlen is 919,520 tokens (measured, util 0.88) => two full-length

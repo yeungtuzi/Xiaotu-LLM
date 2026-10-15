@@ -14650,3 +14650,32 @@ AL 的 run-to-run 方差**必须用统计手段处理,不能用除法抹掉**:�
 3. ⭐ **两个都报,且绑定在一起**:
    `聚合输出吞吐(含预填)` + `聚合解码吞吐(仅解码,×C)` + **TPOT 中位** + **`deg` 健康列**,
    并注明"**绝对 tok/s 含轨迹运气;引擎速度看 TPOT/步时**"。
+### B419 (2026-10-15) ⭐ **NVFP4 在本引擎上的预期收益/损失(源码级修正 B8)** —— 用户问 `RadixArk/GLM-5.3-Flash-NVFP4`
+* **触发(用户提问)**:「这个模型对比官方的,在本引擎上有什么预期收益和损失?」
+
+#### ① 收益(按确定性排序)
+| # | 收益 | 依据 / 确定性 |
+|---|---|---|
+| ⭐1 | **字节数 / 长 prefill 的 H2D:专家集合 304.4 GB(FP8)→ 171.2 GB = 1.78×** | **B8 实测**(该 checkpoint 的 routed experts 确为 NVFP4:group 16 + E4M3 block scale + FP32 per-tensor global;磁盘 204.44 GB)。而 **B12/B13 已证 H2D 已在锁页线速下限 ⇒ 唯一杠杆就是减少字节数**,那条 H2D 占 prefill 关键路径 ~26% ⇒ 理论降到 ~15% |
+| ⚠️2 | **GPU 侧 GEMM** | ⭐ **本轮源码级修正**:SM80 上 vLLM 走 **`W4A16_NVFP4 → W4A16: FP4 Marlin GEMM with bf16/fp16 activations`**(`vllm/model_executor/layers/quantization/modelopt.py:738`),**即 4-bit 权重 + bf16 激活,不是 W4A4**;`ModelOptNvFp4Config.get_min_capability()=75` ⇒ **A100 上走得通**。⇒ **GEMM 权重流量减半,收益可信**(与我先前的"可能为负"判断相反,予以更正) |
+| ✅3 | **投机解码不受影响** | B8 核实**第 45 层 MTP 整层 BF16** ⇒ 草稿质量不变 ⇒ 不影响 AL 口径 |
+
+#### ② 损失 / 风险
+1. ⛔⭐ **我们的 CPU 专家内核不认它的缩放布局**:`mixed_experts.py:13-17` 的格式表只有 `bf16 / mxfp4(groupK=32, **e8m0**) / fp8(128×128, e4m3+fp32) / int4(WNA16)`,**没有 nvfp4**;
+   而 NVFP4 是 **group 16 + E4M3 + per-tensor FP32** ⇒ 要么**新写一条解码路径**(含 `gpu_prefill_fp8.py` 的姊妹实现),要么**离线重量化成 MXFP4/INT4**。
+   ⚠️ **不做这步,引擎根本不会用它走 CPU 专家路径**(格式不在支持列表 ⇒ 退回 vLLM 自己的 GPU 路径 ⇒ **等于放弃"CPU 专家 + staging"整套设计**,比"慢一点"严重得多)。
+   * ⭐ 另有一条**反向的线索**:`gpu_prefill.py:9` 明确记着「**Why raw MXFP4 and not Marlin**:`marlin_utils_fp4` **只支持 NVFP4**」
+     ⇒ 我们当初**正因为选了 MXFP4 才自研 kernel、用不了 Marlin**;换成 NVFP4 反而**打开了 Marlin 这条路** ——
+     但那是 **GPU 路径**,与"专家常驻宿主 + CPU 计算"的设计前提冲突 ⇒ **不是免费的替换,P2 级设计决策**。
+2. ⚠️ **精度**:该 checkpoint 是 **W4A4** 量化(B8 实测),比我们 v0.2.6 做的「INT8 激活 × FP4 权重」更激进 ⇒ 必须重过语义门 / 层内数值门禁 / 投机接受长度。
+3. ⚠️ **第三方量化**:RadixArk 是第三方(且 B8 记其 model card 措辞有误:写 shared experts、实为 routed)⇒ 按黑话纪律**不能外推到官方 glm 线**。
+4. ⚠️ **模型身份待核**:B8 调研的是 **`nvidia/GLM-5.3-Flash-NVFP4`**,用户给的是 **`RadixArk/GLM-5.3-Flash-NVFP4`** ⇒ **同名不等于同张量**;
+   复用"171.2 GB / 第 45 层 BF16"这些数之前,必须先核对 scale 布局 / 层数 / 专家数 / 第 45 层精度。
+5. 📌 **发布前该看的一处 README 措辞**:README 第 3 条现写「支持 **NVFP4** / MXFP4 量化权重;硬件不支持时,权重会**反量化后按最优路径计算**」
+   —— 该句在当前实现下**只对 vLLM 的反量化/Marlin 路径成立**,**我们的 CPU 专家路径并不支持 NVFP4**。
+   ⇒ 若 0.2.8 要保留这句,建议加限定(如"*专家权重走 CPU 时支持 MXFP4/INT4/FP8*"),否则读者会以为 NVFP4 专家也能走我们的 CPU 引擎。
+
+#### ③ 一句话
+⇒ **收益确定在"字节数 ⇒ 长 prefill 的 H2D"这一块**(恰是本仓已证的"唯一杠杆",直接治 agent 首次灌入的卡顿),
+**GPU 侧 GEMM 收益在 Marlin W4A16 路径下也成立**,**但都必须先给 CPU 专家侧补上 NVFP4 解码**(否则引擎不会用它),
+且精度与第三方身份都需另行过关。

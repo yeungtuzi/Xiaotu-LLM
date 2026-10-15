@@ -14926,3 +14926,35 @@ c4 时 CPU MoE 占步时 **62%**(B413),静态表覆盖 **32%** ⇒ 实测 **−1
 #### ⑥ 顺带落定的两件事
 * **GLM 3 路 256K 达成**(零内核改动):`XIAOTU_GPF_RAW2_SHARE=1`(**代码早已实现,默认关**;让 raw2 复用 raw13 存储 −1.12 GiB/rank)+ `MAXLEN` 512K→**256K** ⇒ **KV 池 416,228 → 962,935 token(2.31×)= 256K 下 3.67×** ✓(`MAXSEQS` 保持 4);512K 下同一池只有 **0.79×**(连一路都装不下)⇒ 256K 是正确默认。
 * **远端信息保全/清理完成**:dev-docs 逐文件 md5 比对(9,745 vs 9,690)⇒ 远端独有 **69 个**(67 引擎日志 + 2 台账),**全部取回**;两份台账**本地均为超集**(QA 多 #170–#190;IRON_RULES 多 4 行永久撤销注记);同名但内容不同的 69 个日志以**远端完整版**覆盖本地截断版。共抢救 **748 MB**(dev-docs 12M / pin表+41MB 路由轨迹 80M / process_data 438M / lvllm-tmp 其余 219M / 测量产物 300K)。远端现只留 `process_data/data`(39M,测试)+ `ref`(2.0G,编译),仓库在 main 且 **0 改动**。
+
+### B426 (2026-10-15) ⭐⭐ **FP8 tile 环移植可行性:零内核改动(三前提全部满足)+ 一条必须遵守的落地顺序**
+* **起因**:用户 GO「把 v0.2.7 的 tile 环移植到 FP8 路径」。
+
+#### ① 可行性判定:**内核侧无需改动**(逐条核对,非推测)
+MXFP4 的 `_moe_tile_launch`(`gpu_prefill.py:1888`)之所以能"只传视图、内核零改动",依赖三个约定;FP8 的两个内核(`gpu_prefill_fp8.py` `gate_up_kernel_fp8`/`down_kernel_fp8`)**逐条满足**:
+
+| 约定 | MXFP4 | **FP8** |
+|---|---|---|
+| 专家只经 `seg_ptr` + 专家 stride 寻址 | ✅ | ✅ `pid_e = program_id(0)`;`base/end = load(seg_ptr+pid_e[+1])`;`w_off = pid_e * W13_E` |
+| `tok/wts/inter` 按**全局排序行号** `g_rows` 索引(⇒ tile 内行连续,切视图 + `seg` 平移到 0 起点即可) | ✅ | ✅ `g_rows = base + mt*BM + arange`;`inter` 亦按 `g_rows` 写 |
+| `out` 用 `tl.atomic_add`(⇒ 逐 tile 多次发射自然累加) | ✅ :330/:404 | ✅ **`gpu_prefill_fp8.py:178`** |
+⇒ **移植 = 在 `gpu_prefill_fp8.py` 里镜像 MXFP4 的 `staging_tile_experts` / `stage_tiles` / `_moe_tile_launch` / `gpu_moe_layer_from_engine_tiled`**,FP8 侧只需带上它特有的 `e4m3` block-128 缩放与 `row_stride/inter_ld` 参数。
+
+#### ② 设计:**纯增量,默认行为一字不变**(风险可控的关键)
+* 记账与分配**共用同一个** `staging_tile_experts`(直接复用 `gpu_prefill` 的那个,满足 §600/§601 的"唯一真源"要求);
+* `XIAOTU_GPF_STAGE_TILE_E` 未设 / `0` / `>=E` ⇒ **走现有整层路径,逐字节不变**(与 MXFP4 的既有语义一致);
+* 只有显式设 `tile ∈ (0,E)` 才走新的 tiled 路径 ⇒ **对现有生产零影响**,且**可即时回滚**(删环境变量)。
+* 记账公式按 MXFP4 同型缩放:槽项与 DMA 暂存项乘 `tile/E`,标量/缩放项不动。
+
+#### ③ ⭐⭐ **落地顺序(重要):①必须在④之前** —— 否则刚拿到的 3 路 256K 会丢
+`profile 期占位`(缺口 4)一旦修好,vLLM 就会**如实扣减** FP8 的 staging:
+| 顺序 | staging 记账 | KV 池(现 962,935 token) | 256K 并发 |
+|---|---|---|---|
+| **先修 ④、后做 ①** | **7.59 GiB** | **≈ 473k token(−49%)** | **1.8× ⇒ 3 路丢失** ✗ |
+| ⭐ **先做 ①、再修 ④** | **~2.5 GiB** | **≈ 800k token(−17%)** | **≈3.05× ⇒ 3 路保住** ✓ |
+⇒ **①(tile 环)是 ④(正确记账)的前置条件**;两者都做完,才是"既正确又保住并发"的状态。
+
+#### ④ 验收判据(§600/§601 的可跑判据,必须过)
+1. `GPU prefill ACTIVE ... preflight: staging ~X GiB` 与 `fp8_staging_bytes` 返回值**同值**;
+2. GLM 数值门禁(层内 + GSM8K + 长针)**不退化**;
+3. `tile=0`(默认)时的输出/日志与改动前**逐字一致**(回退无害性)。

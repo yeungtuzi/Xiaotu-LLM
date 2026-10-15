@@ -47,7 +47,8 @@ SGLang / TensorRT-LLM / LMDeploy 的 bench 同样固定 input/output 长度,并�
    |---|---|---|
    | **聚合输出吞吐** | `Σcompletion_tokens ÷ 墙钟`(**含预填**) | = vLLM `Output token throughput`,**行业口径** |
    | **聚合解码吞吐** | `Σ(token−1) ÷ Σ(t_last − t_first)`(**仅解码段**) | 与旧 README 的 decode 列**同口径**,可直接逐格对比;并给 **×C 外推** |
-   | ⭐ **TPOT 中位** | `median((t_last−t_first)/(token−1))` | ⭐ **轨迹无关判据** ⇒ **"引擎是否更快"以它为准**(见 §4.1) |
+   | **TPOT 中位** | `median((t_last−t_first)/(token−1))` = **步时 ÷ AL** | 用户感知的每 token 延迟;⚠️ **含 AL** ⇒ 跨臂比会被文本差异污染 |
+   | ⭐ **步时中位** | `median((t_last−t_first)/(chunks−1))`,`chunks` = **SSE delta 数 ≈ 解码步数** | ⭐ **本口径里最接近"引擎速度"的量**(见 §4.1 的精确说明) |
 5. **载荷**:`process_data/data/dsh_assembled_bench.jsonl`(**真实 DSH 会话载荷**,预装配 `<|im_start|>` 模板,= 真实 HTTP 形状)。
    轮内**不重复**载荷(⇒ 无 prefix-cache 命中,冷热不影响本口径)。
 6. **N 取值**:同时给 **N=256** 与 **N=1024** 两档。
@@ -76,7 +77,13 @@ SGLang / TensorRT-LLM / LMDeploy 的 bench 同样固定 input/output 长度,并�
    ⇒ **分子(下游 token 数)固定了,功(上游步数)没固定**。
    * 实测(ds41f,PIN=1 vs PIN=0):C=4 时 PIN=1 高 **+24.7%** 而它 `deg=0.72`;C=1 时 PIN=0 高而它 `deg=0.84`
      ⇒ ⭐ **两个方向都由"谁这一轮落进复制循环"决定 ⇒ 绝对 tok/s 追的是 `deg`,不是引擎速度**。
-   * ⇒ **纪律**:报绝对 tok/s **必须**同附 `deg`;**跨臂/跨版本判断"引擎是否更快"必须用 TPOT/步时**(轨迹无关)。
+   * ⚠️ **精确说明(2026-10-15 自我更正)**:恒等式是 `tok/s = AL ÷ 步时`,而 **`TPOT = 步时 ÷ AL`** ⇒
+     **TPOT 同样含 AL**,并**不是**轨迹无关的。本口径里最接近"引擎速度"的量是
+     **步时 = `(t_last−t_first) ÷ (chunks−1)`**(用 SSE delta 数当步数)——
+     它仍受"路由多样性随文本变化"的残余影响(CPU MoE 步成本 ∝ 当步触及的**不同专家数**),
+     但**不含 AL 这个大头**。
+   * ⇒ **纪律**:报绝对 tok/s **必须**同附 `deg`;**跨臂/跨版本判断"引擎是否更快"以步时为主、TPOT 为辅**,
+     并优先用**配对**设计(同批载荷、多轮交错)与**分层标准化**(`scripts/bench_standardize.py`)。
    * ✅ 若必须在 tok/s 上比,用 **`scripts/bench_standardize.py`**(按 `deg` 档 × 长度桶**分层直接标准化**),不是除法。
 2. **固定长度会落进复制循环**:实测真实 DSH 载荷**自然跑**时 `deg>0.30` 已 **5/8**;
    强制长度会更高 ⇒ **§2 的绝对数偏乐观**,`deg` 与 `AL` 就是它的标注。

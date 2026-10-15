@@ -14741,3 +14741,42 @@ c4 时 CPU 有 122 ms,**藏得住** ⇒ 重叠效率 10% → 71%。⇒ **收益�
 ⇒ 池**在 KV 剖析之前于树内分配**(日志自证:`[xtu-pin] layerNN: slots=NN pool=X GiB (树内分配,KV profiling 前)`)
 ⇒ vLLM 定 KV 尺寸时已扣掉它,没有"绕过记账"。
 ⇒ ⭐ 池大小可调(`--emit-slots`):**按部署的上下文需求取点**;agent 实际负载(数万 token 上下文)下 1.94× 完全够用。
+
+### B421 (2026-10-15) ⭐ **"把 prompt 对齐到 MBT 边界"能抬高 prefill 读数,但正确修法是调 MBT**(用户提问)
+* **触发(用户想法)**:「如果你构造的 prompt 不是 9.4K 而是 16K,是否能完美吃到 MBT=8192,导致 prefill 成绩更好看?」
+
+#### ① 日志证据(必须先把机制钉死)
+```
+GPU prefill ACTIVE: first 8188 tokens >= threshold 2560;
+  weights from engine shards; preflight: staging ~1.89 GiB, required >= 5.08 GiB free, had 12.32 GiB (slack +7.24 GiB)
+Chunked prefill is enabled with max_num_batched_tokens=8192
+```
+⇒ **有效 chunk = 8,188 token**(MBT=8192 中真正可用 8188)· **GPU 预填门槛 = 2560** · **slack +7.24 GiB(未被显存卡住)**。
+
+#### ② 用户的想法**机械上成立**
+9.4k prompt ⇒ **2 个 chunk(8188 + ~1190)**,每多一个 chunk 就多一遍"逐层权重 DMA + 调度往返";
+若 prompt ≈ **16,376(2×8188)** ⇒ 两整块、无残块 ⇒ **prefill tok/s 会更好看** ✓
+
+#### ③ ⛔ 但**不该用改 prompt 的方式拿**(三条)
+1. **"照着指标做基准"**:真实 harness 会话长度任意,不可能对齐 MBT;
+2. **用户本轮已定**:不生成新数据、各模型用**同一组** prompt;
+3. README ‡ 的负载定义就是"4 条真实 DSH 转录 各 ≈9,340",改它 = **改负载定义** ⇒ 与 0.2.7、与其它模型**全部失可比**。
+
+#### ④ ⭐ 正确修法:**调 MBT(同一负载下)**
+| MBT | 9.4k prompt 的 chunk 数 | 预期 |
+|---|---|---|
+| 8192(现值) | **2**(8188 + ~1190) | 有残块开销 |
+| **12288 / 16384** | **1** | 无残块/无边界开销 ⇒ prefill 直接受益 |
+* 本仓先例:*"8000-token prompt 2 chunk → 1 chunk,prefill **51.7s → 34.7s(−33%)**"*(`docs/MODEL_GUIDES.md`);
+* 代价:MBT ↑ ⇒ 激活 ↑,与 KV 池争预算(GLM 在 `MAXLEN 131072` 下 MBT 16384/32768 **OOM**);
+* ⭐ 关键优势:**同一份负载上的配置改动 ⇒ 与 0.2.7 及其它模型仍可比** ✓
+
+#### ⑤ ⚠️ **待验证的怀疑(不得当结论用)**:尾块可能落到 CPU 预填
+9.4k prompt 的**尾块 ≈1190 token < 门槛 2560** ⇒ 怀疑它走 **CPU 预填**(首块 8188 走 GPU)。
+* 间接证据:`[xtu-pf-progress]` 里 `device=cpu` **48 条**、`device=gpu` **0 条** —— 但这些行的语义尚未钉死(**B406 曾修过它的早退 bug**)⇒ 标"待验证"。
+* 若成立:每条第 8188 之后的部分都在 CPU 上补 ⇒ **当前生产配置的一处真实低效**;
+  修法:① 降门槛(权衡见 STRATA_ANALYSIS R5 的 512–2560 中间区间);② 抬 MBT 让整条进一块(= §④)。
+
+#### ⑥ 建议的下一步(廉价且完全可比)
+在同一组 9.4k 载荷上做 **MBT 扫描(8192 → 12288 → 16384)** 量 prefill,顺带验证 §⑤
+(每次改 MBT = 一次 boot,约 3 次)。

@@ -873,7 +873,7 @@ python scripts/test_engine_determinism.py 11     # 11 次运行 10/10 逐位相�
    vLLM 用 KV 池把显存**填到 util 为止**,所以启动后净空 ≈ `(1−util)×39.49 GiB`
    (util=0.90 ⇒ **3.95 GiB**;util=0.55 ⇒ 17.8 GiB)。而预填充 preflight 要 8.4 GiB
    ⇒ **util ≥ 0.8 时 GPU 预填充必然逐层被拒、静默退回 CPU(且混合模式比纯 CPU 更慢)**。
-   解法见 §5.8:**显式给 `--kv-cache-memory` 把 KV 池封顶**。
+   解法见 §5.8:**显式给 `--kv-cache-memory` 把 KV 池封顶**。⛔**【2026-10-15 已过时:见 §5.8;GLM 与 ds41f 现均交由 vLLM profile 统一管理】**(注:`--kv-cache-memory` 只能"把我们自己的 staging 余量手动留出来";在插件已把 staging 于 `profile_run` 期如实占位之后,该余量由 vLLM 自己算。)
 6b. **kill 服务后必须确认 GPU 显存真的释放**:vLLM 的 worker 常变成**僵尸**(`Zl`, ppid=1)
    并**继续占着显存**(实测两个 worker 各占 37.9 GiB)⇒ 下一个服务会在启动时 OOM。
    做法:`nvidia-smi --query-compute-apps=pid,used_memory` 查到 pid 后**反复 `kill -9`** 并等待,
@@ -892,9 +892,22 @@ python scripts/test_engine_determinism.py 11     # 11 次运行 10/10 逐位相�
   `追加 V4.1 eligible 19 层` ✓。
 * **尚未取得验收数据**(§570 式三门禁 + 生成等价性 + 预填充提速)。**未验证前不要开**。
 
-### 5.8 ⭐ 让 GPU 预填充真的拿到显存(必读)
+### 5.8 ⛔【已过时 · 2026-10-15】原:让 GPU 预填充真的拿到显存(必读)
 
-**规则:只要开了 GPU 预填充(`VLLM_XIAOTU_GPU_PREFILL_MIN_TOKENS>0`),
+> **本条已于 2026-10-15 由用户明令标记为【已过时】,不再构成规则;下文保留为历史记录(不改写)。**
+> **用户原话**:「**这个铁律在 vLLM 统一管理显存的时候不存在了,标记为"已过时"并注明原因**」。
+>
+> **过时原因(三条,缺一不可)**:
+> 1. **原规则的前提是"vLLM 看不见我们的 staging/投机/长 prefill 激活"** —— 所以只能靠我们**手动把 KV 池压小**、把余量留出来。前提若为假,规则自然消失。
+> 2. **vLLM 其实会算 `transient_peak_headroom`**(`gpu_worker.py:697`),但它**只在跑真实 `profile_run` 时才算**;而我们以前**显式传 `--kv-cache-memory` 恰好把这次剖析跳过了** ✗
+>    (本仓 `dev-docs/HANDOFF_DEGEN_AND_MBT_2026-10-06.md:50` 已自证;`dev-docs/SPEC_mbt_budget.md` 改动① 因此把 **ds41f** 的这条传参**整条删除**)⇒ **不是 vLLM 管不了,是我们没让它管**。
+> 3. **v0.2.7 又把预填 staging 由「2×整层」缩成「N×子层块环」:7.56 → 1.89 GiB/rank**(TP=2 共省 11 GB)⇒ 瞬时峰更小,vLLM 的留白吸收得下。
+>
+> **现行做法**:不传 `--kv-cache-memory`,**由 vLLM profile 统一管理**(ds41f 早已如此;GLM 于 2026-10-15 同步为默认 `KV_AUTO=1`)。
+> 逃生门:显式 `KV_CACHE_BYTES=<字节>` 仍可封顶;`KV_AUTO=0` 回退旧的"按 maxlen 自动推算"。
+> ⚠️ **仍然有效的警戒**(与本条无关):`MAXLEN × SEQS × 1.10` 那类写法会一次性索要 ~23 GiB,**无论谁管显存都会 OOM** —— 那是算术错误。
+
+**规则(已失效,仅存档):只要开了 GPU 预填充(`VLLM_XIAOTU_GPU_PREFILL_MIN_TOKENS>0`),
 就一定要显式传 `--kv-cache-memory`,不要把 KV 池交给 `--gpu-memory-utilization` 去填。**
 
 ```bash
@@ -1010,7 +1023,7 @@ curl -s localhost:8700/v1/chat/completions -H 'Content-Type: application/json' \
 |---|---|---|
 | `TP=2` | 2 | R-VRAM 默认;**GPU 预填充要求 TP≥2**(TP=1 staging 不摊薄 6.72→13.45 GiB,§592(e)) |
 | `MAXLEN` | 1048576 | R-VRAM 优先级 1,**不可降级** |
-| `KV_CACHE_BYTES` | **12 GiB** | 复现 §570 验收过的 KV 容量(**6,724,586 token = 1M 并发 6.41×**);同时**刻意留出 ~13 GiB 空闲**做长序列工作区(§513c 的 32K OOM 根因就是这里被 KV 吃光)。**必须显式给**,理由见 §5.8 |
+| `KV_CACHE_BYTES` | **12 GiB** | 复现 §570 验收过的 KV 容量(**6,724,586 token = 1M 并发 6.41×**);同时**刻意留出 ~13 GiB 空闲**做长序列工作区(§513c 的 32K OOM 根因就是这里被 KV 吃光)。**必须显式给**,理由见 §5.8 ⛔**【2026-10-15 已过时:见 §5.8;GLM 与 ds41f 现均交由 vLLM profile 统一管理】** |
 | `SPEC=1` | DSpark | 实测 **16.64 vs 13.85 t/s**(+20%),TPOT 36.75 vs 42.86 ms;greedy 5/5 逐字节一致。<br>⚠️**TPOT 必须连上下文一起读**:同一服务的受控实测(只换 prompt 集)是 **33.5 / 39.8 / 53.5 ms** 对应 17 / 165 / 438 token 的 prompt(README「TPOT 不是常数」)。上表那两个值取自**短 prompt** 口径,不要拿它跟长 prompt 的数字比 |
 | **`GPU_PREFILL_MIN_TOKENS=0`** | **关** | §592/§593/§594:MBT=8192 以下 GPU 预填充的**每 chunk 固定成本 ~11.6 s**(80% 是 staging),默认 chunk(~2048)下只有 **155 tok/s vs CPU 258 tok/s**;要赢需 chunk ≥3000 且先修 §594 的 4 条。**先保证稳定** |
 | `SEQS=8` | 8 | 挂 harness 要并发;KV 12 GiB 足够(短 prompt 下容量以 Mtoken 计) |
@@ -1035,7 +1048,7 @@ curl -s localhost:8700/v1/chat/completions -H 'Content-Type: application/json' \
 | 数值/确定性 | `OK=7 BAD=1 max_rel=1.873e-02`;greedy ×2 逐字节 5/5 | §570 |
 
 **⭐ GPU 预填充(§594-§602 修完后,推荐开启)**:`VLLM_XIAOTU_GPU_PREFILL_MIN_TOKENS=4096`
-+ **必须**按 §5.8 封顶 KV 池 + `MBT=8192`(见下表的显存账)。
++ **必须**按 §5.8 封顶 KV 池 + `MBT=8192`(见下表的显存账)。⛔**【2026-10-15 已过时:见 §5.8;GLM 与 ds41f 现均交由 vLLM profile 统一管理】**
 
 | 项 | 值 | 依据 |
 |---|---|---|
@@ -1053,7 +1066,7 @@ curl -s localhost:8700/v1/chat/completions -H 'Content-Type: application/json' \
 `vram_policy --emit-env` 现在输出 **4096**(可用 `XIAOTU_GPU_PREFILL_SWITCH_TOKENS` 覆盖)。
 
 **判定"是否真的走了 GPU"**:日志应出现 `GPU prefill ACTIVE`(每个模块一次,40 层×rank 数);
-若出现 `GPU prefill DISABLED ... only N GiB is free` ⇒ 按 §5.8 封顶 KV 或降 MBT。
+若出现 `GPU prefill DISABLED ... only N GiB is free` ⇒ 按 §5.8 封顶 KV 或降 MBT;若在**新默认(不封顶)**下出现同类告警 ⇒ 回退 `KV_AUTO=0`。⛔**【2026-10-15 已过时:见 §5.8;GLM 与 ds41f 现均交由 vLLM profile 统一管理】**
 
 **最终性能验收口径(v0.2 起)**:所有问题收口后用 **官方 `vllm bench serve`**(非自研探针),
 `TP=2` + 充分预热,覆盖超短~32K prompt × C=1/2/4/8;详见内部《未来规划》。
@@ -1267,5 +1280,5 @@ cd /tmp/vllm-up && git cherry-pick <我们的 10 个提交>   # 解那 4-5 个�
   ⇒ "够不够"只能在运行中崩给我们看 ✗(见 `docs/STRATA_ANALYSIS.md` R2)。
 * ⭐ 现行:插件的 staging 在 profile 期**如实分配**、进入 vLLM 的 `total_consumed`,
   由 vLLM 给 KV 定容;参数不满足 ⇒ **启动即失败**(不做优雅回退)。
-* ⚠️ 本文件其余章节里"必须显式传 `KV_CACHE_BYTES`"的措辞**只对 GLM / qwen38 仍适用**;⛔ 对"目标是 `serve_v41.sh` 的 bench"**已不适用**(见上一行)✗,
+* ⛔**【2026-10-15 更正】原句「其余章节里"必须显式传 `KV_CACHE_BYTES`"的措辞只对 GLM / qwen38 仍适用」**已不成立** —— GLM 亦于 2026-10-15 改为不传(见 §5.8 过时标注)。原句存档:「本文件其余章节里"必须显式传 `KV_CACHE_BYTES`"的措辞**只对 GLM / qwen38 仍适用**」;⛔ 对"目标是 `serve_v41.sh` 的 bench"**已不适用**(见上一行)✗,
   但**不适用于 v41 生产** —— 引用前先看本节 ✓

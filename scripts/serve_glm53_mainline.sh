@@ -37,12 +37,25 @@ TP="${TP:-2}"
 # 现在也把这份激活预留算进去,腾不出来就**优雅退回 CPU 预填充**而不是崩服务。
 # 代价:KV 池 988,081 → ~814,000 token(2 路 256K 仍占 64%,3.1x 并发)。
 # 要换回更大的 KV 池,先量 `GPU prefill ACTIVE ... slack` 那行的余量再动。
-# 【2026-09-20 新默认:util 高 + 显式封顶 KV】
-# 原则:留给 staging+激活的空间 = util×VRAM − 非专家 − KV池
-#   ⇒ **util 尽量高**(把总预算做大)、**KV 池按需最小**(用 KV_CACHE_BYTES 封顶)。
-#   ⚠️ 只提 util 不封顶 ⇒ 池会填满预算、staging 被逐层拒(比不开 GPU 预填充还慢),
-#      长 prompt 激活也会 OOM(0.2.3 的 0.85 回归就是这么来的)。
-#   ⇒ **顺序:先定 cap,再提 util。**
+# ⛔⛔ 【2026-10-15:以下 2026-09-20 的"util 高 + 必须显式封顶 KV"原则**已过时**(与 §5.8 同因)】
+#   原文保留存档 ⇒ **原则:留给 staging+激活的空间 = util×VRAM − 非专家 − KV池**
+#     ⇒ util 尽量高、KV 池按需最小(用 KV_CACHE_BYTES 封顶);
+#     ⚠️ 只提 util 不封顶 ⇒ 池会填满预算、staging 被逐层拒、长 prompt 激活 OOM;
+#     ⇒ 顺序:先定 cap,再提 util。
+#   **机制(⚠️ 本仓证据;vLLM 侧待启动日志核实 —— 审计员指出:vLLM 源码在本机为坏挂载,无法直接验证)**:该原则的前提是"vLLM 定 KV 尺寸时**看不见**我们的 staging/激活"。
+#   而插件**已经在 `profile_run` 期把 staging 如实占位**,于是 vLLM 的账本(`total_consumed` /
+#   `transient_peak_headroom`)里**含**它,并据此给 KV 定容 —— 证据在本仓:
+#     * `vllm_xiaotu_moe/gpu_prefill.py:753`「而 **profile_run 期必须放行**(只有真分配 staging,
+#       vLLM 的账本才含它)」;`:886-902` 用 shim 包住 `GPUModelRunner.profile_run` 并在其中
+#       `_reserve_staging_from_model(self)`;`:815-820` profile 结束即释放;
+#     * `vllm_xiaotu_moe/mainline_shims.py:1930` 已装载 `_install_gpu_prefill_profile_guard`。
+#   ⇒ 所以"先定 cap 再提 util"不再是唯一安全路径:**不封顶(vLLM 统一管理)时,池不会再"填满预算"**,
+#     因为预算里已经扣掉了 staging。`GPU_UTIL` 默认仍是 0.90,保持不变。
+#   ⚠️ **首次以新默认启动时必须核对日志判据**(见 `dev-docs/report/tuning/vllm_vram_experiment_2026-10-09.md`
+#      H1/H2):须出现 ①`profile 期占位` ②`profile 结束 ⇒ 释放 staging 占位` ③vLLM 自己的
+#      `Available KV cache memory: …`;若这三类行缺失、或"起来之后才 OOM" ⇒ 前提不成立 ⇒ 回退 `KV_AUTO=0`。
+#   ⚠️ 仍然有效的一半(与本原则无关):`util` 不能高到"非专家 + 池 + staging"都放不下 —— 那种情形
+#      **应当启动即失败**(vLLM 会自己拒绝),而不是运行中崩。
 GPU_UTIL="${GPU_UTIL:-0.90}"
 # Context length. The 4096 this script used to default to was a *test* setting, not a
 # hardware limit: measured on 2xA100-40GB at util 0.88 (bf16 KV, TP=2), the KV pool and
@@ -160,22 +173,63 @@ ARGS=(
 [ -n "$REASONING_PARSER" ] && ARGS+=(--reasoning-parser "$REASONING_PARSER")
 # 让客户端能读到前缀缓存命中数(usage.prompt_tokens_details.cached_tokens)
 [ "$PROMPT_TOKENS_DETAILS" = "1" ] && ARGS+=(--enable-prompt-tokens-details)
-# 【RUNBOOK §5.8 铁律】开 GPU 预填充时**必须**显式封顶 KV 池,否则 vLLM 会把 util 填满、
-# 让 staging/投机/长 prefill 激活没地方放 ⇒ 长 prompt 直接 CUDA OOM。
-# 用法:KV_CACHE_BYTES=6442450944(6 GiB) bash scripts/serve_glm53_mainline.sh
-# cap 未显式给定时,**按 maxlen 自动推算**(**不乘 SEQS、不留乘性余量**)。
-# 标尺:GLM 实测 6 GiB ↔ 293,651 token ⇒ **48,942 token/GiB**(分毫不差)。
-# 例:MAXLEN=262144 ⇒ 262,144 tok ⇒ 5.36 GiB;MAXLEN=524288 ⇒ 10.71 GiB。
-#   ⚠️ 【2026-09-21 实测踩到】原公式是 `MAXLEN × SEQS × 1.10`。512K + SEQS=2 时它给出
-#   **23.56 GiB**,引擎在装配期**一次性**要这么多 ⇒ 直接 CUDA OOM(只剩 22.94 GiB 空闲)。
-#   池**不需要**同时装下 SEQS 条满长序列 —— vLLM 按池容量自行准入,装不下就排队。
-#   要"SEQS 条满长"就显式传 `KV_CACHE_BYTES`,别改默认。
-if [ -z "${KV_CACHE_BYTES:-}" ]; then
-  KV_CACHE_BYTES=$(( MAXLEN * 1073741824 / 48942 ))
-  echo "[glm53] KV 池自动封顶: ${KV_CACHE_BYTES} bytes(~$(( KV_CACHE_BYTES / 1073741824 )) GiB) "\
-       "for maxlen=${MAXLEN}(不乘 seqs=${SEQS};要更多并发请显式传 KV_CACHE_BYTES)"
+# ⛔⛔ 【已过时 · 2026-10-15 用户明令】原 RUNBOOK §5.8「开 GPU 预填充时**必须**显式封顶 KV 池」
+#   —— 用户原话:「**这个铁律在 vLLM 统一管理显存的时候不存在了,标记为"已过时"并注明原因**」。
+#   **过时原因(三条,缺一不可)**:
+#     ① 原铁律的前提是"**vLLM 看不见我们的 staging / 投机 / 长 prefill 激活**" ⇒ 它才只能靠我们把
+#        KV 池手动压小、把余量留出来。⇒ 前提错在"看不见"这件事本身,而不是"余量不该留"。
+#     ② vLLM 自己会算 **`transient_peak_headroom`**(`gpu_worker.py:697`),但它**只在跑真实
+#        `profile_run` 时才算**;而我们以前**显式传 `--kv-cache-memory` 正好把这次剖析跳过了** ✗
+#        (本仓 `dev-docs/HANDOFF_DEGEN_AND_MBT_2026-10-06.md:50` 已自证此点;
+#          `dev-docs/SPEC_mbt_budget.md` 改动① 因此把 ds41f 的这条传参**整条删除**)。
+#        ⇒ **不是 vLLM 管不了,是我们以前没让它管。**
+#     ③ v0.2.7 又把预填 staging 由「2×整层」缩成「N×子层块环」:**7.56 → 1.89 GiB/rank**
+#        (TP=2 共省 11 GB)⇒ 即便有瞬时峰,vLLM 的留白也吸收得下。
+#   ⇒ **新默认**:不传 `--kv-cache-memory`,**由 vLLM 统一管理**(与 ds41f 现行做法一致)。
+#     逃生门两条:显式 `KV_CACHE_BYTES=<字节>` 仍会封顶;`KV_AUTO=0` 可回退旧的"按 maxlen 自动推算"。
+#   ⚠️ 保留的**唯一有效警戒**(与原铁律无关):`MAXLEN × SEQS × 1.10` 那种写法会一次性要 23 GiB,
+#      无论谁管显存都会 OOM —— 那是**算术错误**,不是"该不该封顶"的问题。
+# 历史默认值标尺(仅在 KV_AUTO=0 回退时使用):6 GiB ↔ 293,651 token ⇒ **48,942 token/GiB**。
+# ⛔⛔ 【M1 修 · R38 复审(独立审计员)查出】**输入校验必须先做**:下面 `:181/:189` 用
+#   `$(( … / 1073741824 ))` 打印 GiB;若 `KV_CACHE_BYTES` 是**非纯整数**(如 `12G`),该算术会报错
+#   ⇒ **整块 if 被中止** ⇒ `ARGS+=(…)` 被跳过 ⇒ **脚本照常启动且根本没封顶** ✗
+#   (改前的旧代码把 `ARGS+=(…)` 放在 if **之外**、无条件执行 ⇒ 会把 `12G` 交给 vLLM ⇒ argparse 报错 ⇒ fail-closed)。
+#   ⇒ 即"以为封顶了、其实没封"的**静默误解**(与 `serve_v41.sh:125` 的既有教训同型,且违反 R38 ⑦「缺省拒绝」)。
+#   ⇒ 故此处**显式拒非法值**:非纯数字 ⇒ 直接 exit 2(宁可不启动,不静默放行)。
+if [ -n "${KV_CACHE_BYTES:-}" ]; then
+  # ⛔【M1-residual 第三轮修 · 独立审计员】两处加固,互相兜底:
+  #   ① 守卫用**显式字符集** `[!0123456789]`,**不用范围** `[!0-9]` ——
+  #      范围在非 C locale(本机 `LANG=en_HK.UTF-8`)下会把**全角/阿拉伯-印度数字**当"数字"放行,
+  #      于是 `KV_CACHE_BYTES=０８` 通过守卫、`10#０８` 却报 `invalid integer constant` ⇒ 整块被中止
+  #      ⇒ **rc=0 且完全不封顶地启动** ✗(CJK 输入法下敲全角数字就能触发,比 `08` 更现实)。
+  #      ⚠️ 字符集不受 collation 加宽,实测对 `０８`/`٠٨` 一律 REJECT ✓
+  #   ② `ARGS+=(…)` 提到**所有算术之前**(argv 保留原始字符串;ASCII 数字 vLLM 按十进制解析 ⇒ 安全),
+  #      这样**任何**算术(归一化或显示)再出问题都不可能造成"静默不封顶"。
+  case "$KV_CACHE_BYTES" in
+    ''|*[!0123456789]*)
+      echo "⛔ KV_CACHE_BYTES 必须是**纯 ASCII 十进制整数(字节)**,收到 '${KV_CACHE_BYTES}'" >&2
+      echo "   ⇒ 拒绝启动(R38 ⑦:缺省拒绝,不做静默放行;例如 6 GiB 请写 6442450944)" >&2
+      exit 2 ;;
+  esac
+  ARGS+=(--kv-cache-memory "$KV_CACHE_BYTES")
+  KV_CACHE_BYTES=$(( 10#$KV_CACHE_BYTES ))   # 仅用于下面显示(消灭前导零/八进制陷阱)
+  echo "[glm53] 显式封顶:--kv-cache-memory ${KV_CACHE_BYTES} bytes(~$(( KV_CACHE_BYTES / 1073741824 )) GiB)"
+elif [ "${KV_AUTO:-1}" = "1" ]; then
+  echo "[glm53] ⭐ 不传 --kv-cache-memory ⇒ **显存交由 vLLM profile 统一管理**"\
+       "(会算出 transient_peak_headroom;原 RUNBOOK §5.8 铁律已于 2026-10-15 标记过时)"
+else
+  # ⛔【同型】回退分支的算术吃 MAXLEN ⇒ 同样用显式字符集守卫,并**显式**处理算术失败(fail-closed)。
+  case "${MAXLEN:-}" in
+    ''|*[!0123456789]*)
+      echo "⛔ KV_AUTO=0 回退分支要求 MAXLEN 为**纯 ASCII 十进制整数**(token 数);收到 '${MAXLEN:-}' ⇒ 拒绝启动" >&2
+      exit 2 ;;
+  esac
+  KV_CACHE_BYTES=$(( 10#$MAXLEN * 1073741824 / 48942 )) \
+    || { echo "⛔ 计算 KV 上限失败(MAXLEN='${MAXLEN}')⇒ 拒绝启动,不做静默放行" >&2; exit 2; }
+  ARGS+=(--kv-cache-memory "$KV_CACHE_BYTES")
+  echo "[glm53] KV_AUTO=0 ⇒ 回退旧行为:按 maxlen 自动封顶 ${KV_CACHE_BYTES} bytes"\
+       "(~$(( KV_CACHE_BYTES / 1073741824 )) GiB;不乘 seqs=${SEQS})"
 fi
-ARGS+=(--kv-cache-memory "$KV_CACHE_BYTES")
 if [ -n "${SPEC_CONFIG:-}" ]; then
   # Escape hatch: any other vLLM speculative method (ngram / eagle / medusa /
   # draft_model / suffix), passed through verbatim as JSON. Overrides SPEC_K.

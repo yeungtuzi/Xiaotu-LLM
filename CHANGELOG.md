@@ -13,6 +13,52 @@
 
 ---
 
+## [0.2.8] - 2026-10-15
+
+### 主题
+
+**引入 GPU 常驻热专家:GPU 与 CPU 共同解码**。
+
+### Added
+
+* ⭐ **PIN(热专家常驻显存 + CPU/GPU 分工解码)** —— 按真实路由轨迹把**热专家**常驻显存,
+  CPU 侧内核按 `weights[ai] != 0` **真跳过**它们 ⇒ 同一步里 GPU 与 CPU **并行**算专家,
+  解码步时由"CPU 一侧的权重流量"决定,而它变小了。
+  * **开关(默认关,回退零成本)**:`XIAOTU_PIN=1` + `XIAOTU_PIN_TABLE=<expert_pin_*.bin>`;
+    表由 `scripts/expert_profile.py --read-bin <路由轨迹> --emit-table … --emit-slots N` 生成。
+  * **实测(同口径 A/B,16 请求/格,真实 DSH 载荷)**:解码步时 **C=1 −1.9% · C=2 −4.4% · C=4 −14.1%**
+    (三级 CI 排除 0);**C=4 同时**"步时"与"解码吞吐 **+20.5% [+8.1,+34.6]**"双重显著。
+  * **收益随并发单调增大**是机制必然:CPU MoE 占步时 48%(C=1)→62%(C=4),GPU 那份工作越到高并发越藏得住。
+  * **代价(如实报)**:池 **6.14 GiB/rank**(TP=2 共 12.3 GiB)⇒ **KV 池 8.95 → 2.56 GiB/rank**,
+    512K 满长并发 **6.77× → 1.94×**(池在 KV 剖析前于树内分配,**记账无绕过**);条目数可按部署需求调。
+* ⭐ **`docs/BENCH_PROTOCOL.md`(性能口径唯一权威定义)+ 校验脚本** ——
+  decode 改为**行业标准固定长度口径**:`max_tokens=min_tokens=N` + `ignore_eos`、**满 C 连续灌入**、
+  `Σ输出token ÷ Σ(解码段)` ×C,并**必须同报** `deg` 与**步时**。
+  工具:`scripts/bench_agent_throughput.py`(测量)、`bench_protocol_check.py`(口径校验)、
+  `bench_final_table.py`(出表 + 配对 bootstrap)、`bench_standardize.py`(分层标准化)。
+
+### Changed
+
+* **GLM-5.3-Flash 配置与负载更新**:`MTP k=1`(**开**,原"关")、`MBT 8192`(原 12288)、
+  `util 0.90`(原 0.85)、**GPU 预填保留**;**负载统一**为真实 DSH 载荷(≈8.9k token)——三个模型同一组 prompt。
+  实测(C=1/2/4):prefill **≈901** / decode **23.1 / 27.1 / 32.2**。
+* **口径变更**:README 的 decode 列由"每请求解码段 × C"改为上述固定长度口径;
+  **旧值已归档**到 `docs/BENCH_HISTORY.md` §1/§2,新值见 §6。
+
+### Fixed / 更正
+
+* ⛔ **`docs/RUNBOOK.md` §5.8 的"已过时"标记被修正为"只对 ds41f 过时"**:
+  按预先定好的日志判据实测,**GLM 的 FP8 预填 staging 并没有被 vLLM 的 profile 期占位捕获**
+  (`扫到 0 个可问 staging 的模块, max need = 0.00 GiB`)⇒ 对 GLM **仍须显式封顶 KV**。
+* ⛔ **口径文档的一处错误自我更正**:"TPOT 轨迹无关"是**错的**(`TPOT = 步时 ÷ AL`,仍含 AL);
+  应以 **步时 = `(t_last−t_first)/(SSE 步数−1)`** 为主判据。
+
+### 已知限制
+
+* PIN 改变专家计算顺序 ⇒ logits 微差 ⇒ **长输出与 PIN=0 不保证逐 token 一致**(要逐位复现请 `XIAOTU_PIN=0`)。
+* 本特性**仅 DeepSeek-V4.1-Flash**:GLM / MiMo 的 CPU 专家路径不含该分流实现。
+* 绝对 tok/s 含"两组文本分岔"引入的轨迹运气 ⇒ **判引擎快慢请看步时**。
+
 ## [0.2.7] - 2026-10-09
 
 ### 主题

@@ -14,8 +14,8 @@
 
 [中文](README.md) · English (default)
 
-> **📌 Current release: v0.2.7** (2026-10-09) — Optimized engine: CPU→GPU DMA buffers cut, 11 GB of VRAM saved in total, no performance loss
-> [Release notes](RELEASE_NOTES_v0.2.7.md) · [Work report](docs/WORK_REPORT_2026-10-09.md)
+> **📌 Current release: v0.2.8** (2026-10-15) — Hot experts resident on the GPU: the GPU and the CPU decode together
+> [Release notes](RELEASE_NOTES_v0.2.8.md) · [Benchmark protocol](docs/BENCH_PROTOCOL.md)
 
 ---
 
@@ -43,22 +43,23 @@ Every performance number below was taken on this machine:
 ## Performance
 
 * The **DeepSeek-V4.1-Flash row is the 2026-10-12 measurement on the current production config** (the authoritative numbers in this table); **GLM-5.3 and MiMo-V2.6 rows are legacy** v0.2.4-v0.2.6 numbers (random dataset, aggregate metric), pending re-measurement.
-* Metrics: **prefill** = `sum(prefill tokens) / (last decode start)`, measured **cold** (cache-missed); **decode** = **per-request decode window** `(own tokens - 1) / (own last - first token)` -- overlap-independent, directly comparable across concurrency; **aggregate decode = per-request x C**. Ground rules: "measurement ground rules" in `docs/EXPERIMENTS.md` and **B388** (under speculation, SSE chunks are not tokens; always count from server `usage`).
+* Metrics (**changed in v0.2.8; the authoritative definition is [`docs/BENCH_PROTOCOL.md`](docs/BENCH_PROTOCOL.md)**): **prefill** = `sum(prefill tokens) / (last decode start)`, measured **cold** (always count from server `usage`); **decode** = the **`sum(output tokens) / sum(decode windows)`** measured under a **fixed output length** (`max_tokens=min_tokens` + `ignore_eos`, every request emits exactly N tokens) with **C requests kept in flight**, then **x C** for the aggregate. Fixing the output length removes the acceptance-length sampling noise (+-10%) that plagued the old metric (**B416/B418**); verifier: `scripts/bench_protocol_check.py`. **`deg` (8-gram copy rate) is a mandatory health column** for these numbers.
 * Config details, criteria and the `MBT` trade-off: `docs/TUNING_GUIDE.md` section 8 and `docs/MODEL_GUIDES.md` section 0.1.
 
 | Model (optimal config) | load | actual tokens | conc. | prefill (tok/s) | decode (tok/s) |
 |---|---|---|---|---|---|
-| **GLM-5.3-Flash**<br>TP=2 · util 0.85 · **MAXLEN 262144**<br>MBT 12288 · MTP off | short (random) | 140 | 1 | **115.2** | **22.0** |
-| | short (random) | 140 | 2 | **140.8** | **27.8** |
-| **DeepSeek-V4.1-Flash**<br>TP=2 · util 0.90 · **MAXLEN 524288**<br>**MBT 8192** · **seqs 4** · **DSpark k=5** (v0.2.7 production config) | genuine DSH transcript‡ | ≈9,340 | 1 | **1,041** | **48.7** |
-| | genuine DSH transcript‡ | ≈9,340 | 2 | **1,045** | **70.4** |
-| | genuine DSH transcript‡ | ≈9,340 | 4 | **1,156** | **95.2** |
+| **GLM-5.3-Flash**<br>TP=2 · util 0.90 · **MAXLEN 262144**<br>MBT 8192 · **MTP k=1** · **GPU prefill on** (v0.2.8 config) | genuine DSH payload‡ | ≈8,900 | 1 | **901** | **23.1** |
+| | genuine DSH payload‡ | ≈8,900 | 2 | **≈901**§ | **27.1** |
+| | genuine DSH payload‡ | ≈8,900 | 4 | **≈901**§ | **32.2** |
+| **DeepSeek-V4.1-Flash**<br>TP=2 · util 0.90 · **MAXLEN 524288**<br>**MBT 8192** · **seqs 4** · **DSpark k=5** · **PIN hot-expert residency** (v0.2.8 config) | genuine DSH payload‡ | ≈9,340 | 1 | **1,041** | **47.5** |
+| | genuine DSH payload‡ | ≈9,340 | 2 | **1,045** | **81.5** |
+| | genuine DSH payload‡ | ≈9,340 | 4 | **1,156** | **101.7** |
 | **MiMo-V2.6-Flash-RL**<br>TP=2 · util 0.85 · **MAXLEN 131072**<br>MBT 8192 · **seqs 4** · **MTP k=1** · **GPU prefill on (threshold 4096)** | short (random) | 128 | 1 | **232.0** | **30.5** |
 | | short (random) | 128 | 2 | **367.5** | **40.7** |
 | | long (random) | 16,384 | 1 | **811.3** | **27.3** |
 | | long (random) | 16,384 | 2 | **1455.3** | **39.6** |
 
-‡ Load = **4 genuine DSH session transcripts** (each ≈9,340 tokens, distinct, natural long output). **The decode column is aggregate throughput** (= per-request x C): **48.7 / 70.4 / 95.2** at C=1/2/4, i.e. per-request 48.7 / 35.2 / 23.8. Method: greedy, `max_tokens=1024` is a **cap only** -- beyond ~1K tokens these transcripts provably loop into format regurgitation (degeneracy check: 8-gram copy rate >70%), so the cap sits inside the non-degenerate window (**B388**); >=8 pooled requests per level; all self-checks pass (tokens/chunk ≈ acceptance length 3.9-4.5); gain over non-speculative **≈2.9x / 2.1x / 1.7x** (the old 2.4x/2.4x/1.8x set was inflated by `min_tokens`-forced continuation and is retired). **Prefill**: the same transcripts with a random-salt head forcing a cache miss (`cached_tokens=0` self-check); prefills run **serially** at C>=2, so aggregate prefill barely rises and decode starts stagger (the per-request decode metric is unaffected). Full data: [v0.2.7 release notes](RELEASE_NOTES_v0.2.7.md).
+‡ Load = **genuine DSH session payloads** (pre-assembled `<|im_start|>` template, i.e. the real HTTP shape; distinct, naturally long output). **The decode column is aggregate throughput** (per-request decode window x C). Method: greedy, **fixed output length 1024** (`max_tokens=min_tokens` + `ignore_eos`; a natural stop would make the output-token count a random variable and inject +-10% noise), **C requests kept in flight** (measured slot utilisation 0.99), 16 (DS41F) / 8 (GLM) requests per level. **`deg` (8-gram copy rate) is a mandatory health column**: forced long output drifts into copy loops which inflate tok/s (measured median `deg` 0.37-0.72) -- to judge whether the *engine* got faster, read the **step time** in the release notes. **Prefill**: measured cold (see `docs/BENCH_PROTOCOL.md`); § prefills run serially at C>=2, so aggregate prefill stays close to C=1. Gain over non-speculative **≈2.9x / 2.1x / 1.7x** (the old set was inflated by forced continuation and is retired). The old metric (per-request x C = 48.7/70.4/95.2; GLM short load 115.2/22.0) is archived in [`docs/BENCH_HISTORY.md`](docs/BENCH_HISTORY.md). Full data: [v0.2.8 release notes](RELEASE_NOTES_v0.2.8.md).
 
 ## Quick start
 
@@ -87,6 +88,7 @@ Per-model recipes, memory budgeting, self-checks and troubleshooting →
 
 | Version | Theme |
 |---|---|
+| **v0.2.8** (2026-10-15) | **Hot experts resident on the GPU: the GPU and the CPU decode together** — hot experts (from a real routing trace) are pinned in VRAM and skipped by the CPU kernels, so one step computes part of the experts on the GPU and the rest on the CPU **in parallel**: decode step time is **-1.9% / -4.4% / -14.1% at C=1/2/4** (all three CIs exclude zero; at C=4 both step time and decode throughput, **+20.5%**, are significant); switch `XIAOTU_PIN` (off by default, zero-cost rollback). Same release: the benchmark protocol moves to the **industry-standard fixed-length** metric ([BENCH_PROTOCOL](docs/BENCH_PROTOCOL.md)), and GLM enables MTP on a unified load — see [release notes](RELEASE_NOTES_v0.2.8.md) |
 | **v0.2.7** (2026-10-09) | **Engine optimisation: CPU→GPU DMA buffers cut** — per-prefill weight residency goes from **2 × whole layer** to an **N × sub-layer block ring**: **7.56 → 1.89 GiB/rank** (**11 GB** saved in total at TP=2), no performance loss; switch `XIAOTU_GPF_STAGE_TILE_E` (`0` = old behaviour, instantly revertible) — see [release notes](RELEASE_NOTES_v0.2.7.md) |
 | **v0.2.6** | **Bootstrapped development: INT8 activation x FP4 expert weights** — MXFP4 experts gain an **INT8 activation** path (the fp4 code set fits int8 exactly, so the **weight side is free**): kernel level **24.9 -> 15.1-15.7 ms/layer (1.54-1.62x)**; end to end (qfn, MXFP4-FP8) GSM8K **193/200 on both arms**, 194/200 per-question (net 0), 256K four-pin 4/4 + `stop` on both arms, Vision 23 agrees 18/23; **fallback-path regression fixed** (16-22% slower -> +1.49% instructions); **MTP on qfn (2.44x)**; qfn default threads **120 (5 cores/CCD)**; path off by default (`XIAOTU_MOE_INT8=1`) |
 | **v0.2.5** | **GPU prefill memory rework** — the GPU operator consumes NUMA-sharded experts directly, dropping one layer of weight staging (**6.33 GiB saved for DeepSeek-V4.1-Flash, 3.16 GiB per card at TP=2**; per-layer staging 10.73 → **7.56 GiB/rank**; byte-identical results); **1M context + GPU prefill** (CED: KV 5437 → 2106 B/token, so 1M needs ~2.2 GiB); **Engram pinned over-allocation fixed (−75 GiB host)**; rebasing onto upstream restores **CED** (16k prefill 527.8 → **982.4** tok/s); **TP=2 uses GPU1+GPU2**; service logs named by PID |

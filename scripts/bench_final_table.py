@@ -57,16 +57,36 @@ tpot = lambda r: (r["tlast"] - r["ttft"]) / (r["tok"] - 1) * 1000   # noqa: E731
 outr = lambda r: r["tok"] / r["dt"]                                  # noqa: E731 含预填的端到端速率
 
 
+def agg_dec(rows):
+    """⭐ 聚合解码吞吐 = Σ(tok−1) / Σ(解码段)—— 与客户端日志、README 口径**同一估计量**(比值),不是'速率的均值'。"""
+    n = len(rows)
+    dur = sum(r["tlast"] - r["ttft"] for r in rows)
+    return (sum(r["tok"] for r in rows) - n) / dur if dur else float("nan")
+
+
 def summary(rows, conc):
     tok = sum(r["tok"] for r in rows)
-    dur = sum(r["tlast"] - r["ttft"] for r in rows)
     wall = sum(r["dt"] for r in rows) / conc        # 连续灌入下的墙钟近似
-    d = st.mean(dec(r) for r in rows)
+    d = agg_dec(rows)
     return {"n": len(rows), "out": tok / wall, "dec": d, "decxC": d * conc,
             "tpot": st.median(tpot(r) for r in rows), "ttft": st.median(r["ttft"] * 1000 for r in rows),
             "deg": st.median(r["deg"] for r in rows),
-            "deg30": sum(1 for r in rows if r["deg"] > 0.30) / len(rows),
-            "decsum": (tok - len(rows)) / dur if dur else float("nan")}
+            "deg30": sum(1 for r in rows if r["deg"] > 0.30) / len(rows)}
+
+
+def boot_ratio_sums(ra, rb, B):
+    """Σ(tok−1)/Σ(解码段) 的 bootstrap 比值(两臂各自格内重采样)。"""
+    ds = []
+    for _ in range(B):
+        sa = [ra[random.randrange(len(ra))] for _ in range(len(ra))]
+        sb = [rb[random.randrange(len(rb))] for _ in range(len(rb))]
+        va, vb = agg_dec(sa), agg_dec(sb)
+        if va and va == va:
+            ds.append((vb / va - 1) * 100)
+    if not ds:
+        return (float("nan"), float("nan"))
+    ds.sort()
+    return (ds[int(0.025 * len(ds))], ds[int(0.975 * len(ds)) - 1])
 
 
 def boot_ratio(ra, rb, fn, B):
@@ -122,7 +142,7 @@ if len(arms) >= 2:
         print("| %d | %d | %+.1f%% | %+.1f%% [%+.1f,%+.1f] | **%+.1f%% [%+.1f,%+.1f]**%s | %+.1f%% [%+.1f,%+.1f] | %.2f / %.2f |" % (
             n, c,
             (st.mean(outr(r) for r in rb) / st.mean(outr(r) for r in ra) - 1) * 100,
-            (st.mean(dec(r) for r in rb) / st.mean(dec(r) for r in ra) - 1) * 100, b_dec[0], b_dec[1],
+            (agg_dec(rb) / agg_dec(ra) - 1) * 100, b_dec[0], b_dec[1],
             pt, b_tpot[0], b_tpot[1], mark,
             (st.mean((r["tlast"] - r["ttft"]) / max(1, r["chunks"] - 1) for r in rb) /
              st.mean((r["tlast"] - r["ttft"]) / max(1, r["chunks"] - 1) for r in ra) - 1) * 100,

@@ -14881,3 +14881,48 @@ c4 时 CPU MoE 占步时 **62%**(B413),静态表覆盖 **32%** ⇒ 实测 **−1
 * ⛔ **不能照搬 155×23**:那是按他们的模型/卡算的;同槽数在本机(9.0 MB/槽/rank)≈ **32 GiB/rank,放不下**;
 * ✅ 应量**边际曲线**(+1 GiB 池 ⇒ Δ步时 / −1 GiB KV ⇒ 并发损失)再按部署口径取点;
 * ⭐ 现成的抵消项:**FP8 tile 环移植可腾 ~5 GiB/rank**(用户已 GO)⇒ 该 5 GiB 给 KV 还是给池,**可直接测量**。
+
+### B425 (2026-10-15) ⭐⭐ **"所有计算路径都要微 ping/pong、所有解码路径都要 GPU 热专家常驻"的路径清单 + FP8 移植方案**
+* **触发(用户)**:「把 v0.2.7 的 tile 环移植到 FP8 路径 --- go;是不是还有别的路径需要改?**所有的计算路径都要改成微 ping/pong,以及所有的解码路径都要加入 gpu 热专家常驻**」
+
+#### ① 预填/流式(计算)路径 —— **只有 2 个模块**(`mixed_experts._GP_BACKENDS` 只注册两个)
+| 模块 | 服务格式 | 微 ping/pong |
+|---|---|---|
+| `gpu_prefill.py` | **MXFP4**(ds41f 专家) | ✅ 有:`staging_tile_experts`(:968)、记账 `staging_bytes`(:1023)、分配/发射 `stage_tiles`(:2051)+ `_moe_tile_launch`(:1888)+ `gpu_moe_layer_from_engine_tiled`(:2025)—— **记账与分配共用同一函数** ✓ |
+| `gpu_prefill_fp8.py` | **FP8**(GLM 专家) | ❌ **无**:`fp8_staging_bytes`(:208)固定整层公式,**不读 `XIAOTU_GPF_STAGE_TILE_E`**;`prealloc_fp8_buffers`(:189) 按 `(E,…)` 整层分配 ⇒ 实测 **7.59 GiB/rank**(ds41f 是 1.89) |
+* ⇒ 其它格式(BF16/WNA16)**没有 GPU 预填路径**(不在 `_GP_BACKENDS` 里)⇒ 无需 tile 环。
+
+#### ② 解码(CPU 专家)路径 —— "热专家跳过"按内核分布
+| 内核 | 格式 | `weights[ai] != 0` 跳过 |
+|---|---|---|
+| `moe_v2_packed4_base.inc` / `_w4a8.inc` | **MXFP4** | ✅ 有(各 2 处) |
+| `moe_v2.hpp` | 通用 / BF16 / **INT4(WNA16)** | ✅ 有(9 处) |
+| `amx_gemm.cpp` | AMX | ✅ 有 |
+| **`moe_v2_fp8.hpp`** | **FP8** | ❌ **没有** ⇒ **GLM 现在吃不到 PIN** |
+| `expert_pool.py` 池布局 | 通用(u8 平面) | ⚠️ 结构格式无关,但 `rb13/rb2`(行字节)与槽容量需按 **FP8=1 字节/权重** 另行推导 |
+
+#### ③ 缺口清单(共 4 项)
+| # | 缺口 | 内容 | 需重建扩展 |
+|---|---|---|---|
+| 1 | FP8 预填无 tile 环 | 镜像 MXFP4 的 `*_tiled` 三件套 | ❌ 纯 Python |
+| 2 | FP8 解码无跳过 | 给 `moe_v2_fp8.hpp` 加过滤 | ✅ |
+| 3 | PIN 池按 FP8 适配 | `rb13/rb2` + 槽容量 + `slotmap` 语义 | ✅ |
+| 4 | profile 期占位扫到 0 个模块 | 见 ④ | ❌ 纯 Python |
+
+#### ④ 缺口 4 的根因(读码定位)
+* 占位扫描 `gpu_prefill.py::_reserve_staging_from_model`(:822)在 **profile_run 的 dummy forward *之前*** 执行(由 `mainline_shims` 的 `_install_gpu_prefill_profile_guard` 包裹);
+* 而本插件的引擎是**首次 forward 懒建**(`mixed_experts.py:474 self._xiaotu_engine = None`;几何 `_E_eng/_H_eng/_I_eng` 在构建路径 :1266 才设)⇒ 扫描时 `_GP_LAYERS` **为空** ⇒ `staging_need_bytes` 问不到 ⇒ 打印 `扫到 0 个可问 staging 的模块, max need = 0.00 GiB` ⇒ **vLLM 定 KV 时看不见 staging** ✗
+* ✅ 修法(不与 fp8 移植耦合):**构造期**就把模块登记进一个独立注册表(不用等建引擎)+ 让 `staging_need_bytes()` 不再要求 `_xiaotu_engine`(它只为取 `engine.shard_geometry()["ns"]`,而该函数**本来就有 `except ⇒ ns=2` 的兜底**)。
+
+#### ⑤ ⛔ 移植的**硬纪律**:只能**整件**做,不许只改记账
+本仓自己的注释(`mixed_experts.py:191 layer_staging_need_bytes`)写着:
+> 「**为什么必须唯一(§600/§601 两次"预检说够、实际 OOM"事故的直接教训)**:①运行时预检/日志 ②profile 期 eager 占位 —— 两处必须用**同一个数**,否则"账实不符"会以最坏的方式暴露(跑一阵才崩)」
+
+⇒ 所以 FP8 的 **记账(`fp8_staging_bytes` 加 tile 缩放)+ 分配(`prealloc_fp8_buffers` 改 `(tile,…)` 形状)+ 装配/发射(按 `stage_tiles` 循环 + 逐 tile GEMM)** 必须**同一次提交**完成;
+   只改记账 ⇒ 少报 ⇒ **正好是那两次事故** ✗。
+🧭 **模板已在仓内**:直接镜像 MXFP4 侧的 `staging_tile_experts` / `stage_tiles` / `_moe_tile_launch`(其注释说明"按专家 tile 切分后,内核**零改动**——`pid_e` 只经 `seg_ptr` 与专家 stride 寻址,行号经视图平移" ⇒ 关键在于 FP8 的两个 Triton 内核(`gate_up_kernel_fp8`/`down_kernel_fp8`)是否同样按 `seg_ptr` 寻址)。
+🧪 **验收**:转换后必须过 GLM 数值门禁 + `GPU prefill ACTIVE ... preflight: staging ~X GiB` 行与 `fp8_staging_bytes` 同值(§600/§601 的可跑判据)。
+
+#### ⑥ 顺带落定的两件事
+* **GLM 3 路 256K 达成**(零内核改动):`XIAOTU_GPF_RAW2_SHARE=1`(**代码早已实现,默认关**;让 raw2 复用 raw13 存储 −1.12 GiB/rank)+ `MAXLEN` 512K→**256K** ⇒ **KV 池 416,228 → 962,935 token(2.31×)= 256K 下 3.67×** ✓(`MAXSEQS` 保持 4);512K 下同一池只有 **0.79×**(连一路都装不下)⇒ 256K 是正确默认。
+* **远端信息保全/清理完成**:dev-docs 逐文件 md5 比对(9,745 vs 9,690)⇒ 远端独有 **69 个**(67 引擎日志 + 2 台账),**全部取回**;两份台账**本地均为超集**(QA 多 #170–#190;IRON_RULES 多 4 行永久撤销注记);同名但内容不同的 69 个日志以**远端完整版**覆盖本地截断版。共抢救 **748 MB**(dev-docs 12M / pin表+41MB 路由轨迹 80M / process_data 438M / lvllm-tmp 其余 219M / 测量产物 300K)。远端现只留 `process_data/data`(39M,测试)+ `ref`(2.0G,编译),仓库在 main 且 **0 改动**。

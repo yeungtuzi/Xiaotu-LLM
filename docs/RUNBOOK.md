@@ -905,6 +905,21 @@ python scripts/test_engine_determinism.py 11     # 11 次运行 10/10 逐位相�
 >
 > **现行做法**:不传 `--kv-cache-memory`,**由 vLLM profile 统一管理**(ds41f 早已如此;GLM 于 2026-10-15 同步为默认 `KV_AUTO=1`)。
 > 逃生门:显式 `KV_CACHE_BYTES=<字节>` 仍可封顶;`KV_AUTO=0` 回退旧的"按 maxlen 自动推算"。
+>
+> ⛔⛔ **【2026-10-15 关键更正:本条只对 ds41f 过时,对 GLM 仍**未被证伪**】** —— 按预先定好的判据核对启动日志:
+>
+> | 判据 | ds41f | **GLM-5.3-Flash** |
+> |---|---|---|
+> | `profile 期占位` 行 | 出现且报出真实 need | ⛔ 出现,但内容是 **`扫到 0 个可问 staging 的模块, max need = 0.00 GiB`** |
+> | `profile 结束 ⇒ 释放 staging 占位` | 出现 | ❌ **未出现** |
+> | 起来之后 OOM | 无 | 实测无(9.4k prompt × C=4 × 8 请求) |
+>
+> ⇒ **GLM 的 FP8 预填模块(`gpu_prefill_fp8.py`)没有在 profile 期把 staging 报上去** ⇒
+> vLLM 给 KV 定容时**看不见它**;本次未 OOM 是因为池子留了余量(**416,228 token / 262K 下 1.59×**),
+> **不是**因为记账正确 ✗。
+> ⇒ ⭐ **对 GLM 的处置**:生产**保留显式 `KV_CACHE_BYTES` 封顶**(或保守 `GPU_UTIL`),
+> 直到 FP8 staging 也接上同一套 profile 期占位机制;**不得**因本条"已过时"而对 GLM 也去掉封顶。
+> (证据:`docs/EXPERIMENTS.md` **B420**/*v0.2.8 发行说明* §6.2;`AGENTS.md` 的 R38 审计亦预先把"三类日志行缺失即回退"写成了解除条件)
 > ⚠️ **仍然有效的警戒**(与本条无关):`MAXLEN × SEQS × 1.10` 那类写法会一次性索要 ~23 GiB,**无论谁管显存都会 OOM** —— 那是算术错误。
 
 **规则(已失效,仅存档):只要开了 GPU 预填充(`VLLM_XIAOTU_GPU_PREFILL_MIN_TOKENS>0`),

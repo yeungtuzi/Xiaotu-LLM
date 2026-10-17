@@ -49,6 +49,27 @@
 | 缩写 | 含义(**精度是定义的一部分,不可省** ✗) |
 |---|---|
 | ⭐ **qfn** | **官方量化**的 Qwen3.8-Flash-Next(**FP8**)—— 引擎优化实验用的替代模型 ✓
+
+⛔⛔ **【qfn / Qwen3.8 当前状态:不确定 —— 2026-10-17 用户明令记录】**
+
+> **用户原话(2026-10-17)**:之前关于 qfn 模型的修改**不成功**,所以把它**强制停掉了**,
+> 改为先搞定 GLM 再说,所以现在 **qwen 的状态是不确定的** ✓
+
+⭐ **含义(必须按这个前提工作)**
+1. ⛔ **不要假定 qfn 现在能跑** —— 那次接入尝试**未成功且被强制中止**,当前状态**未经验证** ✓
+2. ⛔ **不要把本轮提交的 QFN 相关产物当成"已验证可用"** —— 它们来自那次尝试,
+   仅作**存档基线**存在(见下),复用前必须自己重新验证 ✗
+3. ⭐ **当时工作重心已切回 GLM** —— GLM prefill 已达标(稳态 1,477/1,441/1,394 tok/s,
+   见 `dev-docs/HANDOFF_GLM_PREFILL_2026-10-17.md`),qfn 是**之后**才重启的方向 ✓
+4. ⭐ 重启 qfn 前:先确认**基线口径**;**务必预热**(同一实例连发 3 次丢弃第 1 次)——
+   GLM 那轮就是栽在冷启动上 ✓
+
+**涉及那次未成功尝试的产物(均已入库,状态未验证):**
+- commit `0e549aa`:`patches/xtu-series/0016-feat-QFN-MXFP4-CT-format-CPU-backend-and-scale-name-redirect.patch`
+  + `series` 追加该项 + `scripts/{preflight_qfn,gen_qfn_mxfp4_overrides,check_mxfp4_backend_branches,patch_vllm_qfn_recover,patch_vllm_utils_scale_alias}.py`
+- commit `48ec229`:`scripts/serve_qwen38.sh`(234 行改动)
+- ⚠️ 以上**均未经本次会话运行验证**;QFN 补丁能否干净应用、脚本能否跑,一律未知 ✗
+
 | ~~**qfn官方**~~ | ⛔ **已废弃的同义词**(**2026-10-15 用户明令:`qfn` 即官方版**);旧文里的 `qfn官方` 一律读作 `qfn` ✓ |
 | **ds41f** | **官方量化**的 DeepSeek-V4.1-Flash(**FP8 稠密 + FP4 专家** ✓)|
 | **glm** | **官方量化**的 GLM-5.3-Flash ✓ |

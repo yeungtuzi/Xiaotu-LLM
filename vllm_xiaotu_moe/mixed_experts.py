@@ -188,7 +188,8 @@ _LAYER_IDX_RE = __import__("re").compile(r"layers\.(\d+)\.")
 _GPF_INFO: dict = {}
 
 
-def layer_staging_need_bytes(gp_mod, engine, E: int, H: int, I: int, group_k: int) -> int:
+def layer_staging_need_bytes(gp_mod, engine, E: int, H: int, I: int, group_k: int,
+                             info: dict | None = None) -> int:
     """⭐ 单层 GPU 预填 staging 的**峰值显存需求** —— 【唯一真源】✓
 
     为什么必须唯一(§600/§601 两次"预检说够、实际 OOM"事故的直接教训):
@@ -202,6 +203,10 @@ def layer_staging_need_bytes(gp_mod, engine, E: int, H: int, I: int, group_k: in
         ns = int(engine.shard_geometry()["ns"]) or 2
     except Exception:  # noqa: BLE001
         ns = 2
+    if info is not None:
+        # ⭐ 让调用方看到"**实际用了哪个 ns**":ns 是**除数**,偏小 ⇒ 多算(抢 KV)、
+        #    偏大 ⇒ 少算(首次长请求 OOM)⇒ 它必须可见,而不是静默 ✗
+        info.update(ns=int(ns), E=int(E), H=int(H), I=int(I), group_k=int(group_k))
     need = int(gp_mod.staging_bytes(int(E), int(H), int(I), int(group_k), ns))
     if gp_prefetch_enabled():
         # The ping/pong prefetch holds a second K-major set; charge it too.
@@ -356,6 +361,16 @@ _GP_SLOT: dict = {}        # dev_key -> next slot to assemble into
 _GP_SLOT_FREE: dict = {}   # dev_key -> {slot: event after the GEMM that read it}
 _GP_BUF2: dict = {}        # dev_key -> {slot: (km13, km2)}
 _GP_LAYERS: dict = {}      # layer_index -> module (first registration wins)
+
+# ⭐⭐ 【item④】profile 期占位用的【构造期/加载期】注册表。
+# ⛔ 为什么必须与 `_GP_LAYERS` 分开:`_GP_LAYERS` 只在 `_ensure_engine()` 里填,
+#    而 `_ensure_engine` 由**第一次 forward** 触发 ⇒ `profile_run` **之前**那张表是空的
+#    ⇒ `gpu_prefill._reserve_staging_from_model` 扫到 0 个模块 ⇒ 占位 = 0
+#    ⇒ KV 池按"没有 staging"定容(handoff:池少 7.59 GiB ⇒ 3 路 256K 丢失)✗
+#    ✅ 本表在 `process_weights_after_loading()`(vLLM 权重加载期,**早于 profile**)登记 ⇒ 非空 ✓
+_GP_PROFILE_LAYERS: list = []
+# ⭐【B444】profile 期"真缓冲"分配的打印去重(几何相同 ⇒ 只报一次)✓
+_PROFILE_PREALLOC_DONE: set = set()
 _GP_BUF2_BYTES: dict = {}
 _GP_BUF2_DENIED: dict = {}  # dev_key -> sticky "no room"
 _GP_PF_WARNED: dict = {}
@@ -365,16 +380,25 @@ _PF_CALL: dict = {"n": 0}   # 全局调用计数 ⇒ 心跳里带上它可区分
 
 
 def gp_prefetch_enabled() -> bool:
-    """Ping/pong cross-layer prefetch switch (file first, then env; default OFF)."""
-    f = (os.environ.get("XIAOTU_GP_ASM_PREFETCH_FILE")
-         or os.environ.get("VLLM_XIAOTU_GP_ASM_PREFETCH_FILE"))
-    if f:
-        try:
-            with open(f) as fh:
-                return int(fh.read().strip()) != 0
-        except (OSError, ValueError):
-            pass
-    return os.environ.get("XIAOTU_GP_ASM_PREFETCH", "0") == "1"
+    """⛔ 已于 2026-10-16 **永久关闭**,恒返回 False。
+
+    ⭐ 来由(用户第 45 轮明令,逐字):
+        「**只要开了 gpu_prefill,就必须使用 tile 环(微 ping/pong),取消所有其他开关**」
+    ⭐ 本函数原为 **"按层缓冲"老路**的开关(`_GP_BUF2` / `_gp_slot_buffers`,
+      自述 "Ping/pong **cross-layer** prefetch"),其特点是**整层** K-major 双份:
+        * 每槽 `km13=(E,H,2I)` + `km2=(E,I,H)` ⇒ GLM 约 **3.38 GiB/rank**(代码注释实测)
+        * 而 ⭐ **tile 环**(`[gp-tile]`,GLM `tile=96 nslots=2`)合计仅 **2.25 GiB**
+      ⇒ 用户原话「**原来的按层缓冲太消耗显存**」⭐ 在数字上成立 ✓
+    ⭐ **实测证据(2026-10-16)**:⭐ 8 个 GLM 运行日志里
+      `grep -acE "ping/pong|extra VRAM|DISABLED"` ⭐ **全部 0 命中**(老路从未启用 ✓),
+      而 `grep -laE "gp-tile"` ⭐ **8/8 命中**(tile 环全程在用 ✓)
+      ⇒ ⭐ **老路既已不用,就不再保留任何开启入口**(⛔ 含 `…_FILE` 旁路 ✓)
+
+    ⛔ **行为**:恒 `False` ⇒ 4 个调用点(`:2003/:2152/:2205/:2286`)永不分配整层 K-major,
+      自动落在其自述的 "in-layer overlap" 路径上(该路径**不占额外显存** ✓)。
+    ⚠️ 若将来要恢复:必须**同时**给出"为什么 tile 环不够"的实测,不许只改这里 ✗。
+    """
+    return False
 
 
 def _gp_layer_index(prefix_or_name) -> "int | None":
@@ -383,7 +407,24 @@ def _gp_layer_index(prefix_or_name) -> "int | None":
 
 
 def _gp_slot_buffers(backend, dev, n_experts, hidden, inter, slot):
-    """The extra K-major set (lazily allocated once per device).
+    """⛔⛔ 【2026-10-17 · A 项第 1 条:**按层缓冲已废除**】
+
+    ⭐ 本函数是"按层缓冲"老路的**唯一分配入口**(整层 `raw13`/`raw2`/`km13`/`km2`)。
+    ⭐ 用户第 45 轮裁定 + A 项第 1 条要求 **废除按层缓冲**,tile 环(微 ping/pong)成为
+       **唯一**的 GPU 预填形态 ⇒ 本条把状态从"**不可达**"升级为"**不可用**" ✓
+
+    ⭐ 为什么是 `raise` 而不是删掉函数体:
+      * 它的 4 个调用点(`:2041 / :2190 / :2243 / :2324`)都在
+        `gp_prefetch_enabled()`(**硬编码恒 False**,见 `:382`)派生出的门后 ⇒ 现在**不可达** ✓
+      * ⭐ 但"不可达"是**脆弱的**:谁把 `gp_prefetch_enabled()` 改回 True,
+        就会**静默恢复按层缓冲**(每 rank 多吃 ~3.38 GiB)⇒ 这正是要防的退路 ✗
+      * ⇒ ⭐ **`raise` 让误启用【当场炸】而不是【静默吃显存】** ✓✓✓
+
+    ⚠️ 若将来真要用回按层缓冲(需用户重新裁定)⇒ **必须同时改回本 `raise` 与
+       `gp_prefetch_enabled()`**,并重新量显存账 ⇒ 这是**有意设计成两处都要动** ✓
+
+    以下为历史文档(保留,说明当年为何要"拒绝分配"):
+    The extra K-major set (lazily allocated once per device).
 
     REFUSES to allocate unless the free VRAM covers the slot AND a workspace
     reserve. Measured the hard way: at --gpu-memory-utilization 0.88 with the KV
@@ -394,6 +435,11 @@ def _gp_slot_buffers(backend, dev, n_experts, hidden, inter, slot):
     -- once, after which the denial is sticky and the path silently keeps the
     (VRAM-free) in-layer overlap.
     """
+    # ⛔ A 项第 1 条:按层缓冲已废除,tile 环是唯一形态 ⇒ 硬拒(见上方 docstring)
+    raise RuntimeError(
+        "按层缓冲(_gp_slot_buffers)已废除:tile 环(微 ping/pong)是唯一 GPU 预填形态。"
+        "若需恢复,须用户重新裁定,并同时改 gp_prefetch_enabled() 与本处。"
+    )
     k = _gp_dev_key(dev)
     if _GP_BUF2_DENIED.get(k):
         raise RuntimeError("prefetch denied: not enough free VRAM (cached)")
@@ -517,6 +563,10 @@ class _XiaotuExpertsMixin:
         """Do NOT AMX-prepack; remember the layer so the engine can use the raw
         CPU parameters (the checkpoint layout the engine consumes directly)."""
         self._layer_ref = layer
+        # ⭐ 【item④】此刻权重已在手、且**早于 profile_run** ⇒ 登记进 profile 期注册表 ✓
+        #    (放在这里而不是 __init__:此钩子保证"权重真的到了",否则占位会算错 ✗)
+        if self not in _GP_PROFILE_LAYERS:
+            _GP_PROFILE_LAYERS.append(self)
         for name in _ROUTING_ATTRS:
             if hasattr(layer, name):
                 setattr(self, name, getattr(layer, name))
@@ -546,6 +596,35 @@ class _XiaotuExpertsMixin:
         for name in _SWIGLU_ATTRS:
             if hasattr(layer, name):
                 setattr(self, name, getattr(layer, name))
+        # ⛔⛔【2026-10-17 B903 修复:GLM 的 swiglu_limit 被【整个引擎】忽略】✗
+        #   实测:`grep -rn swiglu_limit` 于 vLLM 树 ⇒ 只有三个模型配置实现它
+        #       transformers_utils/configs/{step3p5.py:45, minimax_m3.py:41, hy_v4.py:129}
+        #   ⛔ **GLM 的模型实现(`glm4_moe.py` / `glm4_moe_mtp.py` …)里一处都没有** ✗
+        #   ⇒ 上面那个 `hasattr(layer,"swiglu_limit")` 对 GLM **必为假** ⇒
+        #      `self.swiglu_limit` 停在 `:511` 的 `None` ⇒ `:1210 limit=0.0` ⇒
+        #      `:1215 cfg.swiglu_limit=0.0` ⇒ `:1213 clamped=False` ⇒ **引擎走 plain SiLU** ✗
+        #   ⭐ 但 GLM 的**官方配置里真值是 10.0**:
+        #       …/ZhipuAI--GLM-5.3-Flash/snapshots/master/config.json
+        #         top-level   swiglu_limit = None
+        #         text_config swiglu_limit = 10.0     ← ⭐ 真值在此 ✓
+        #   ⇒ ⇒ **参考实现夹取,我们不夹** ⇒ 每层 MoE 输出系统性偏离 ⇒
+        #      ⭐ 这正是 E 项「不是 MTP 技术差,是我们的 MTP 路径异常」的头号候选 ✓
+        #   修法:**只在前面的 layer 取不到时**回退到 config(含 text_config)✓
+        #   (⭐ 只填 `None` ⇒ 对已能取到的模型(step3p5/minimax/hy_v4)**零影响** ✓)
+        for _src in (
+            getattr(self, "moe_config", None),
+            getattr(getattr(self, "moe_config", None), "text_config", None),
+            getattr(getattr(self, "moe_config", None), "hf_config", None),
+            getattr(getattr(getattr(self, "moe_config", None), "hf_config", None),
+                    "text_config", None),
+        ):
+            if _src is None:
+                continue
+            for name in _SWIGLU_ATTRS:
+                if getattr(self, name, None) is None:
+                    _v = getattr(_src, name, None)
+                    if _v is not None:
+                        setattr(self, name, _v)
         self._router_extra = {
             name: getattr(layer, name)
             for name in _ROUTER_EXTRA_ATTRS
@@ -959,9 +1038,13 @@ class _XiaotuExpertsMixin:
         1. 用户显式列在 `XIAOTU_MOE_GPU_RESIDENT_LAYERS` 里的层(`0-4,10` 语法)。
         2. **投机起草层**(MTP/speculator):GLM-5.3-Flash 的 `layers.45` 就是这种
            —— 它在整个模型里只构造一次,所以 DSpark 那套"同一 prefix 第二次出现"
-           的判定认不出它;而实测 CPU draft 会让投机**净负**
+           的判定认不出它。⚠️ 旧文写「实测 CPU draft 会让投机**净负**」(7.11 vs 10.76 t/s)
+           ⭐ **已失效**(2026-10-16):同口径实测落 CPU 30.1 / 常驻 15.0 / 不开投机 18.3 tok/s
+           (EXPERIMENTS B840)⇒ **那时强制常驻 GPU;现在默认 = 落 CPU**(见下)。
            (7.11 vs 不开 10.76 t/s,NOTES §245)⇒ 默认强制常驻。
-           只有显式 `XIAOTU_MOE_RESIDENT_DRAFT=0` 才关(会告警)。
+           只有显式 `XIAOTU_MOE_RESIDENT_DRAFT=1` 才强制常驻;
+           **默认 = 落 CPU** ✓(2026-10-16 改:同口径实测落 CPU 30.1 vs 常驻 15.0 vs
+           不开投机 18.3 tok/s,见 EXPERIMENTS B840 —— 旧依据 7.11 vs 10.76 t/s 已失效)。
 
         ⚠️ 这条功能原先只存在于 `hybrid_model.py`(DeepSeek-**V4** 的 OOT 路径),
         V4.1/GLM 走的模块化路径**根本没有实现** —— 这正是 §414/§416 两轮排查的收敛点。
@@ -981,15 +1064,24 @@ class _XiaotuExpertsMixin:
                 return True
             if not is_spec_draft_layer_index(idx):
                 return False
-            if os.environ.get("XIAOTU_MOE_RESIDENT_DRAFT", "1") == "0":
+            # ⛔⛔ 2026-10-16 修【E 项根因】:默认值由 "1" 改为 "0" ✓
+            #    旧依据:"实测 CPU draft 会让投机净负(7.11 vs 不开 10.76 t/s,NOTES §245)"
+            #    ⛔ 该依据**已失效** —— 今天同口径(真 agent 载荷/k=4/MBT=8192/TP=2/outlen=256)实测:
+            #      * draft 落 CPU  = **30.1 tok/s / TPOT 33.2 ms** ✓(B840 A2)
+            #      * draft GPU 常驻 = **15.0 tok/s / TPOT 66.9 ms** ⛔(B840 A3)
+            #    ⭐ 且**连"完全不开投机"都有 18.3 tok/s** ⇒ 7.11/10.76 两数**都低于今天基线**
+            #      ⇒ 必然来自更早、更慢的配置 ⇒ 用它决定默认值会把系统锁在慢的一侧 ✗
+            #    ⇒ **默认落 CPU;只有显式 `=1` 才强制常驻** ✓
+            if os.environ.get("XIAOTU_MOE_RESIDENT_DRAFT", "0") != "1":
                 if not getattr(self, "_draft_cpu_warned", False):
                     self._draft_cpu_warned = True
                     print(
-                        f"[vllm-xtu-moe] WARNING: spec draft layer "
-                        f"{getattr(layer, 'layer_name', '?')} forced onto CPU by "
-                        f"XIAOTU_MOE_RESIDENT_DRAFT=0. Speculative decoding is "
-                        f"net-negative with a CPU draft (7.11 vs 10.76 t/s); drop "
-                        f"--speculative-config or unset that variable.",
+                        f"[vllm-xtu-moe] spec draft layer "
+                        f"{getattr(layer, 'layer_name', '?')} 落 CPU(默认)。"
+                        f"实测 GPU 常驻 draft 反而更慢(15.0 vs CPU draft 30.1 tok/s;"
+                        f"真 agent 载荷/k=4/MBT=8192/TP=2/outlen=256)⇒ 默认落 CPU。"
+                        f"旧依据 7.11 vs 10.76 t/s 已失效(今天'不开投机'基线就有 18.3 tok/s)。"
+                        f"要强制常驻请显式 XIAOTU_MOE_RESIDENT_DRAFT=1。",
                         flush=True,
                     )
                 return False
@@ -1279,19 +1371,123 @@ class _XiaotuExpertsMixin:
         """
         if getattr(self, "_gpu_resident", False):
             return 0                      # 常驻层不流式 ⇒ 无 staging
-        eng = getattr(self, "_xiaotu_engine", None)
-        if eng is None:
+        gp = _gpu_prefill_mod(getattr(self, "_engine_attr", ""))
+        if gp is None:
             return 0
+        # ⭐⭐⭐ 【item④ 修正】原先是 `eng = ...; if eng is None: return 0` ——
+        #   引擎**懒建**(第一次 forward 才建)⇒ profile 期必然 None ⇒ 本函数必然返回 0
+        #   ⇒ eager 占位**一个字节都不做** ⇒ KV 按"没有 staging"定容 ✗
+        #   ✅ 改为:引擎没建就**回落到权重形状**,并用与 `apply()` **完全同一个表达式**
+        #      ⇒ 与运行时预检**逐字节同数**(唯一真源 `layer_staging_need_bytes` 不变)✓
+        eng = getattr(self, "_xiaotu_engine", None)
         _E = getattr(self, "_E_eng", None)
         _H = getattr(self, "_H_eng", None)
         _I = getattr(self, "_I_eng", None)
         if _E is None or _H is None or _I is None:
-            return 0
+            _shp, _pack = self._live_w2_shape()
+            if _shp is None:
+                return 0          # 权重尚未到位(极早调用)⇒ 不猜,放弃本次占位 ✓
+            _E, _I = int(_shp[0]), _pack * int(_shp[2])
+            _H = int(_shp[1])
+        info: dict = {}
+        need = layer_staging_need_bytes(
+            gp, eng, int(_E), int(_H), int(_I), int(getattr(self, "_group_k", 32) or 32),
+            info=info)
+        # 供 `gpu_prefill._reserve_staging_from_model` 打印"实际用了哪个 ns"等 ✓
+        self._prof_info = dict(info, need=int(need), engine=bool(eng is not None))
+        return need
+
+    def prealloc_staging(self) -> bool:
+        """⭐【B512】在 profile 窗口内**真分配**持久 staging 缓冲(**不跑任何内核**)✓
+
+        为什么必须"真分配"而不是"替身占位"(用户纪律 2026-10-15「让 vLLM 管显存」):
+          ⛔ 替身(`reserve_staging_for_profile`)在 KV 定容测点之后**立刻被释放**
+             (`release_staging_reserve` ⇒ `_PROF_RESERVE.clear()`)⇒ 那块显存**随即被 KV 拿走**
+             ⇒ 运行期再分配同一批缓冲 ⇒ **必然 OOM**(实测:B510/B512)✗
+          ✅ 本方法分配的是**运行时复用的那批命名缓冲**(`prealloc_fp8_buffers` 按名字持久)⇒
+             ① vLLM 的 profile `after_profile.free_memory` 测得到 ⇒ KV **据实**定容 ✓
+             ② 运行期**缓存命中**,不再分配 ⇒ 不再 OOM ✓
+        ⛔ **只分配、不跑内核**:内核在 profile 期跑会污染 CUDA graph 捕获(2026-10-09 两次实测
+           `cuGraphLaunch` SIGSEGV)✗ —— 本方法一行内核都不启动 ✓
+        ⛔ 分配失败**必须说出来**,不许静默退化(那正是 B510 那次事故的形态)✗
+        返回 True = 真缓冲已就位(调用方**不得**再放替身)。
+        """
+        if getattr(self, "_gpu_resident", False):
+            return False                  # 常驻层不流式 ⇒ 无 staging(与 staging_need_bytes 一致)✓
         gp = _gpu_prefill_mod(getattr(self, "_engine_attr", ""))
         if gp is None:
-            return 0
-        return layer_staging_need_bytes(
-            gp, eng, int(_E), int(_H), int(_I), int(getattr(self, "_group_k", 32) or 32))
+            return False
+        _pf = getattr(gp, "prealloc_fp8_buffers", None)
+        if _pf is None:
+            return False                  # 该后端没有真分配接口(非 FP8)⇒ 让调用方回落替身
+        _info = dict(getattr(self, "_prof_info", None) or {})
+        if not (_info.get("E") and _info.get("H") and _info.get("I")):
+            # `_prof_info` 未填(调用方没先问过)⇒ 走与 `staging_need_bytes` **同一条**路径求几何 ✓
+            try:
+                self.staging_need_bytes()
+            except Exception:  # noqa: BLE001
+                return False
+            _info = dict(getattr(self, "_prof_info", None) or {})
+        _E, _H, _I = _info.get("E"), _info.get("H"), _info.get("I")
+        if not (_E and _H and _I):
+            return False                  # 权重还没到手 ⇒ 不猜(与 staging_need_bytes 同纪律)✓
+        # ⛔⛔【B519 修 · 设备 —— 真实事故】此前照抄 `w2_weight.device`,而本插件**故意**
+        #   要求专家权重在 CPU(`VLLM_EXPERTS_LOAD_DEVICE=cpu`,见本模块 docstring 与
+        #   `:655` 的门禁)⇒ `dev = torch.device('cpu')`(**不是 None** ⇒ 下面的 CUDA 兜底
+        #   **永不执行** ✗)⇒ `prealloc_fp8_buffers` 把 6.75 GiB 分配到**主机内存** ✗
+        #   实测后果(2026-10-15 `glm53_b513`):
+        #     `真缓冲已分配` 照样打印 ✓( **假成功** ✗ ),
+        #     consumed 涨 4.41 GiB(**那是懒分配的 dma,不是这批缓冲** ✗),
+        #     18-token 小请求侥幸通过 ⇒ ⛔**弱证据**,我据此错判"修法生效" ✗;
+        #     32K 长请求立刻暴露:首次 GPU 预填仍要 7.59 GiB **新**显存,`free = 5.56 GiB`
+        #     ⇒ `torch.OutOfMemoryError` ⇒ `EngineDeadError`(打死 EngineCore)✗
+        #   ⇒ 决定性反证:若真缓冲真在 GPU 上,首次预填**不可能**再要 7.59 GiB 新显存 ✓
+        #   ⇒ 正解:设备必须与**运行期**同源(`:1817 _dev = h_bf16.device`,即当前 CUDA 设备)✓
+        #     并且**断言 cuda**,否则 fail-closed(不许再出现"报成功却在 CPU 上分配")✗
+        dev = None
+        layer = getattr(self, "_layer_ref", None)
+        for _nm in ("w13_weight", "w2_weight"):
+            _w = getattr(layer, _nm, None)
+            _d = getattr(_w, "device", None) if _w is not None else None
+            if _d is not None and getattr(_d, "type", "") == "cuda":
+                dev = _d                      # 只有**真在 GPU 上**的权重才可作依据 ✓
+                break
+        if dev is None:
+            try:
+                dev = torch.device("cuda", torch.cuda.current_device())
+            except Exception as _e:  # noqa: BLE001
+                print(f"[vllm-xtu-moe] ⛔ profile 期 staging 记账:取不到 CUDA 设备"
+                      f"({type(_e).__name__}: {_e})⇒ 不猜、不分配 ✗", flush=True)
+                return False
+        if getattr(dev, "type", "") != "cuda":
+            print(f"[vllm-xtu-moe] ⛔ profile 期 staging 记账:算出设备 {dev!r} 不是 cuda"
+                  f" ⇒ **拒绝**分配(宁可回落出声,也不许假成功)✗", flush=True)
+            return False
+        try:
+            _pf(dev, int(_E), int(_H), int(_I))
+        except Exception as _e:  # noqa: BLE001
+            print(f"[vllm-xtu-moe] ⛔ profile 期**真缓冲**分配失败"
+                  f"(E={_E} H={_H} I={_I}): {type(_e).__name__}: {_e}"
+                  f" ⇒ 交由调用方决定(可能回落替身)✗", flush=True)
+            return False
+        return True
+
+    def _live_w2_shape(self):
+        """`(w2 形状, pack)` —— ⭐ 与 `apply()` 运行时预检**同一个表达式**的真源。
+
+        ⚠️ `pack` 必须按引擎类型判:FP8/BF16 的 w2 是 `[E,H,I]`,4-bit 是 `[E,H,I/2]`
+           —— 无条件 `*2` 曾让 FP8 报出 `2×I` 的假需求(源码里已有这条教训)✓
+        返回 `(None, 1)` = 权重还没到手。
+        """
+        layer = getattr(self, "_layer_ref", None)
+        w2 = getattr(self, "_engine_w2", None)
+        if w2 is None and layer is not None:
+            w2 = getattr(layer, "w2_weight", None)
+        if w2 is None:
+            return None, 1
+        pack = 2 if getattr(self, "_engine_attr", "") in (
+            "MOE_MXFP4", "MOE_WNA16") else 1
+        return tuple(w2.shape), pack
 
     # ---- optional in-process self-verification -------------------------
     def _verify_once(self, layer, hidden_states, topk_ids, topk_weights, out):
@@ -1593,7 +1789,8 @@ class _XiaotuExpertsMixin:
         _gp_mod = None if _resident else _gpu_prefill_mod(
             getattr(self, "_engine_attr", ""))
         if _gp_mod is not None:
-            from vllm_xiaotu_moe.gpu_prefill import gpu_prefill_min_tokens, in_profile_run
+            from vllm_xiaotu_moe.gpu_prefill import (gpu_prefill_min_tokens, in_profile_run,
+                                                    in_warmup_or_capture)
 
             _gp_min = gpu_prefill_min_tokens()
             _gp_on = _gp_min > 0
@@ -1712,6 +1909,43 @@ class _XiaotuExpertsMixin:
                 "MOE_MXFP4", "MOE_WNA16") else 1
             _E, _I = int(_shp[0]), _pack * int(_shp[2])
             _dev = h_bf16.device
+            # ⭐⭐【B444 · 用户纪律 2026-10-15「让 vLLM 管显存,而不是它不知道你存在、你自己去占」】
+            #   profile 期**只分配、不跑内核**:把**真正要用的**持久缓冲预分配到
+            #   profile 窗口内 ⇒ 它们**天然进入** vLLM 的 `total_consumed` ⇒
+            #   **vLLM 据实给 KV 定容** ✓
+            #   ⛔ 这**不是**"占位/替身"(那是"偷偷占显存"的坏形态 ✗):此处分配的就是
+            #      稍后真预填**复用**的那一批(`_buf` / tile 环都按名字持久)✓
+            #   ⛔ 且**不跑任何预填内核**(`_gpu_pf` 在 profile 期仍为 False)⇒ 不污染
+            #      显存测量与图捕获(硬约束)✓
+            # ⭐⭐ 【2026-10-16 · 捕获失效竞态修复(第二处,也是 GLM 必崩的那一处)】
+            #   原条件 `in_profile_run()` = `_IN_PROFILE_RUN or _IN_STARTUP[0]` ✓,
+            #   而 worker 里 `_IN_STARTUP[0]` 要等 `compile_or_warm_up_model` 的
+            #   finally(`gpu_prefill.py:1069-1070`)**才被清** ✗
+            #   ⇒ 整个 **warmup + CUDA 图捕获** 窗口里它**也为真** ✗
+            #   ⇒ 这里会在**捕获窗口内**做 staging **大分配**(~2 GiB)✗
+            #   ⇒ 分配触发 `cudaMalloc`/同步等**捕获期非法操作** ⇒
+            #      `cudaErrorStreamCaptureInvalidated` ✓(实测 GLM 图配置必崩 ✓)
+            #   ⭐ `gpu_prefill.py:763-776` 的 docstring 正是为此把两者拆开:
+            #      "profile_run 期要【允许】GPU 预填"(记账需要 ✓)
+            #      "warmup + 图捕获期必须【挡住】" ✗
+            #   ⇒ 用 `in_warmup_or_capture()`(由 `compile_or_warm_up_model` 设置,
+            #      进程内可靠 ✓)把捕获窗口摘出去 ✓
+            #   * ✅ 记账不受影响:profile 阶段在 warmup **之前** ✓,
+            #     那时 `_IN_WARMUP` 仍为 False ⇒ 本块照跑 ⇒ 真缓冲仍进
+            #     vLLM 的 `total_consumed` ⇒ KV 仍据实定容 ✓(目标 B 第 6 条 ✓)
+            if in_profile_run() and not in_warmup_or_capture() and _gp_mod is not None:
+                _pf = getattr(_gp_mod, "prealloc_fp8_buffers", None)
+                if _pf is not None:
+                    try:
+                        _pf(_dev, _E, hidden_size, _I)
+                        if (_E, _I) not in _PROFILE_PREALLOC_DONE:
+                            _PROFILE_PREALLOC_DONE.add((_E, _I))
+                            print("[vllm-xtu-moe] profile 期**真缓冲**已分配(不跑内核)"
+                                  f" E={_E} I={_I} ⇒ 会进 vLLM 的 total_consumed ✓",
+                                  flush=True)
+                    except Exception as _pe:  # noqa: BLE001
+                        print(f"[vllm-xtu-moe] ⚠️ profile 期真缓冲分配失败(不掩盖)"
+                              f": {_pe!r}", flush=True)
             # 需求**如实报告**用(只算数、只打印;⛔ 不再用它做 GPU/CPU 取舍 —— 见下)
             from vllm_xiaotu_moe.gpu_prefill import fits_device
 
@@ -1754,7 +1988,15 @@ class _XiaotuExpertsMixin:
                 _tile_e = 0
             _gp_tiled = (bool(_gpu_pf) and engine is not None
                          and 0 < _tile_e < int(_E))
-            if _gpu_pf and _is_fp8:
+            # ⭐⭐ 2026-10-15 用户裁定:「**所有 GPU prefill 链路都要走 tile 形态(微 ping/pong)**,
+            #    不然显存肯定不够;而且**之前明确要求去掉之前的按层缓冲机制**」✓
+            # ⇒ 下面 FP8 那条"自己装配 + 持久命名缓冲(不走 slot)"的路**已废除** ✗
+            # ⇒ 加 `and not _gp_tiled`:tile 可用时 **FP8 也必须落到 tile 路**
+            #    (`:2016 elif _gp_tiled:` ⇒ `gpu_moe_layer_from_engine_tiled`,
+            #     而 `_gp_mod` 按 `_engine_attr` 选 ⇒ FP8 得到的是 **FP8 孪生** ✓)
+            # ⭐ 且 `staging_tile_experts` 现在**永不返回 E** ⇒ `_gp_tiled` 恒真
+            #    ⇒ FP8 **必然**走 tile,结构上无法回到按层 ✗
+            if _gpu_pf and _is_fp8 and not _gp_tiled:
                 # ---- FP8: 自己装配 + 自己算(持久命名缓冲,不走 slot) ----------
                 # `group_k` 对 FP8 无意义(块固定 128x128),而装配目标用的是模块内
                 # `_buf` 的持久命名缓冲,所以没有 slot 需要填,也就没有 ready 事件。
@@ -1770,7 +2012,22 @@ class _XiaotuExpertsMixin:
                 # 【2026-09-21】捕获期**不能**用旁路流:见 gp_capturing() 的注释。
                 # 捕获期把 _side_ok 置 False ⇒ 走后面的 `elif _km is None:` 保守分支
                 # (在当前/捕获流上装配,不建跨流事件),与 MXFP4 路径的语义对齐。
-                _side_ok = gp_side_stream_enabled() and not gp_capturing()
+                # ⭐⭐ 【2026-10-16 · 捕获失效竞态修复】把**早就写好却零调用**的
+                #    `in_warmup_or_capture()` 真正接上 ✓
+                #   * 实测(B709):**同一配置**(qfn + 图 + `PIN=0`)一次成功(B705 ✓)、
+                #     一次崩 `cudaErrorStreamCaptureInvalidated` ✗ ⇒ 这是**竞态** ✓
+                #   * 根因:`gp_capturing()` 依赖 `_CAPTURE_DEPTH`,而该计数只在**我们自己的**
+                #     `capture_begin/end` 猴子补丁被走到时才 +1 ✗ ⇒ vLLM 若从别的入口
+                #     (`cudagraph_utils` 等)发起捕获 ⇒ 计数恒 0 ⇒ `_side_ok` 仍为真
+                #     ⇒ **侧流在捕获窗口内活动** ✗ ⇒ 捕获被污染 ✓
+                #   * 这正是 `gpu_prefill.py:763-774` **文档化**的那条危险
+                #     ("⚠️ `is_current_stream_capturing()` **不够**")✓
+                #   * `in_warmup_or_capture()` 由 `compile_or_warm_up_model` 设置,
+                #     是**进程内可靠**的窗口标志 ✓ ⇒ 两者取与,把整个窗口彻底挡住 ✓
+                #   * ⚠️ 挡住的后果是**安全的**:`_side_ok=False` ⇒ 回到"当前/捕获流上装配、
+                #     不建跨流事件"的既有分支(见 :2000 附近注释)✓ ⇒ 不新增回退路径 ✓
+                _side_ok = (gp_side_stream_enabled() and not gp_capturing()
+                            and not in_warmup_or_capture())
                 if _side_ok:
                     # Pre-allocate the persistent buffers on the MAIN stream, then
                     # assemble on the side stream: the buffers outlive every layer
@@ -1845,16 +2102,14 @@ class _XiaotuExpertsMixin:
                         _ev_ready = torch.cuda.Event()
                         _ev_ready.record(_side)
                         torch.cuda.current_stream(_dev).wait_event(_ev_ready)
-                elif _km is None:
-                    try:
-                        _km = _gp_mod.kmajor_from_engine_shards(
-                            engine, _dev, hidden_size, _I, _E, int(self._group_k)
-                        )
-                    except torch.OutOfMemoryError:
-                        # ⭐ 2026-10-09(MF-2):同上,不做优雅回退,原样上抛 ✓
-                        print("[vllm-xtu-moe] ⛔ FP8 GPU 预填 staging 分配 OOM(同步路径)⇒ "
-                              "不降级,直接上抛 ✗", file=sys.stderr, flush=True)
-                        raise
+                # 【2026-10-16 goal-A1 · 废除"按层缓冲"】此处原有 `elif _km is None:`
+                # 整层兜底(不带 `dst` ⇒ 每次新建 Et==E 的整层缓冲)。**已删除** ✓
+                # WHY:微 ping/pong(tile 环)是唯一形态(用户 2026-10-15 明令),
+                #   整层缓冲正是"太消耗显存"的那条路 ✗。
+                # 证据(实测):`logs/glm53_b550.log` 里 `gp-tile` 出现 2 次、
+                #   整层路径标记 0 次 ⇒ 该兜底**运行期从未被走到** ✓ 删除无行为变化 ✓
+                # ⚠️ 现在若 tile 装配失败,`_km` 保持 None ⇒ 由下方 `if _km is None:`
+                #   统一按"engine 无分片"处理(不做优雅回退 ✓,与 MF-2 的纪律一致 ✓)
                 if _km is None:
                     # 引擎没有分片(如 NOSHARD)⇒ 优雅退回 CPU(FP8 没有源张量兜底:
                     # 源张量此时可能已被释放,而分片是唯一保证在的副本)。
@@ -1882,7 +2137,10 @@ class _XiaotuExpertsMixin:
                     engine, h_bf16, ids_i32, wts_f32,
                     hidden_size, _I, _E,
                     K=int(self.moe_config.experts_per_token),
-                    device=_dev, group_k=int(self._group_k), nslots=2,
+                    device=_dev, group_k=int(self._group_k),
+                    # ⭐ B982：环深度从 env 读（原来写死 2⇒ XIAOTU_GPF_STAGE_NSLOTS 永远到不了）✗
+                    #   用户实测：ds41f（MXFP4）双缓冲跑满 ~25 GB/s/卡✓ ⇒ 机制有效，GLM(FP8)只 4.5 GB/s/排 ⇒ 加深重叠✓
+                    nslots=int(os.environ.get("XIAOTU_GPF_STAGE_NSLOTS", "2") or 2),
                 )
                 if out is None:
                     # 引擎没有分片等 ⇒ **不**标完成,让下面 `elif _gpu_pf:` 的守卫放行,
@@ -2217,15 +2475,103 @@ class _XiaotuExpertsMixin:
                 from vllm_xiaotu_moe import expert_pool as _xp
                 _pinp = None
                 if _xp.pin_enabled():
-                    import re as _re
-                    _m = _re.search(r"layers\.(\d+)", getattr(layer, "layer_name", ""))
-                    if _m:
-                        _pinp = _xp.build_layer_pool(
-                            engine, h_bf16.device, hidden_size,
-                            int(self._I_eng), int(self._group_k), self._E_eng,
-                            int(_m.group(1)), expert_map)
+                    # ⛔⛔ 2026-10-15 实测教训:本块原先**裸奔** ⇒ 里面任何一个异常
+                    #     (实测:`_is_fp8` 未绑定 ⇒ UnboundLocalError)**直接打死引擎** ✗
+                    #     —— 而"建池失败"的正确后果只是【退化为无驻留】,不该让服务不可用 ✓
+                    #     ⇒ 全程 try/except:失败 ⇒ `_pinp=None` ⇒ 走既有 CPU 路径 ✓
+                    #       (与 `XIAOTU_PIN=0` 逐字等价;fail-closed,不是 fail-dead ✗)
+                    try:
+                        import re as _re
+                        _m = _re.search(r"layers\.(\d+)", getattr(layer, "layer_name", ""))
+                        if _m:
+                            # ⛔⛔【2026-10-17 B912 勘误:撤回 B908 的 `_e_local`】✗
+                            #   B908 曾据"尺度缓冲是分片的一份"把 e_local 由 288 改成 144。
+                            #   ⭐ B912 用【整除性】把前提推翻了(证据确凿):
+                            #     `_fp8_kmajor_tiled:596` 做
+                            #        b13.view(f32).view(Et, (2*I)//b, H//b)
+                            #     GLM:H=4096,I=2048,b=128 ⇒ (Et, 32, 32) ⇒ **每专家 4096 B**
+                            #     而 s13_per = geo["w13_scale_bytes"] // E
+                            #     ⇒ 必须 4096 ⇒ w13_scale_bytes = E * 4096
+                            #     ⇒ 实测"池能建起来、未抛异常" ⇒ E 必须使整除成立 ⇒
+                            #       **E = 288(全体)** ⇒ `scale_w13_bytes()` 覆盖**全体 288** ✗
+                            #   ⇒ ⇒ 故 **`n_experts` 必须 = 288**(= `self._E_eng`)✓;
+                            #       改成 144 会让 s13_per 变 8192 ⇒ view 失败 ⇒
+                            #       `:2477 except` 把建池吞掉 ⇒ **池根本没建** ✗(实测副作用)
+                            #   ⭐ 但真正的问题在【另一个参数】:`e0` ✗ ——
+                            #   ⭐ B912 结论:`scale_w13_bytes()` 覆盖**全体 288** ⇒
+                            #     `n_experts` 必须 = 288 = `self._E_eng` ✓(已撤回 B908)✗
+                            #   ⚠️ 池的 id 空间【自洽】(全局 id + slotmap 基 288 + e0 全局)⇒
+                            #     **0% 的真因不在 id 空间**;须靠离线等价性测试定位 ✗
+                            _pinp = _xp.build_layer_pool(
+                                engine, h_bf16.device, hidden_size,
+                                int(self._I_eng), int(self._group_k), self._E_eng,
+                                int(_m.group(1)), expert_map,
+                                # ⭐ 后端决定槽布局:FP8 与 MXFP4 的 plane 形状**不同** ✗
+                                #    (见 expert_pool.LayerPool.__init__ 的三条理由)
+                                # ⛔ 实测修正:这里**不能**用 `_is_fp8` ✗ —— 它是 `:1862`
+                                #    某分支内才赋值的**局部变量** ⇒ 未走到那条路时
+                                #    UnboundLocalError。改用【属性】`self._engine_attr`,
+                                #    与 `:1862` 同义但恒可用 ✓
+                                layout=("fp8"
+                                        if getattr(self, "_engine_attr", "") == "MOE_FP8"
+                                        else "mxfp4"),
+                                # ⭐ top_k 用于池容量最小守卫(SGLang `expert_pack.py:376-380`)✓
+                                topk=int(self.moe_config.experts_per_token))
+                    except Exception as _pe:  # noqa: BLE001
+                        print(f"[xtu-pin] ⛔ 建池失败 ⇒ 本层退化为无驻留(引擎不受影响):"
+                              f"{type(_pe).__name__}: {_pe}", flush=True)
+                        _pinp = None
                 self._pin_pool = _pinp if _pinp is not None else False
+                # ⭐⭐ 【2026-10-16 goal-D · 图安全修复】边流 + 3 个 event 必须在【捕获之前】建好 ✗
+                #   实测(B703):qfn 上图后崩于捕获期,逐字 `CUDA error: device-side assert triggered` ✗;
+                #   而同口径 **eager 完全正常** ✓ ⇒ 差别就在"首次 forward 落在捕获区内" ✓
+                #   ⇒ 建流 / 建 event 是 host 侧操作,在捕获区内非法 ✗
+                #   ⭐ 本块已被 `not torch.cuda.is_current_stream_capturing()` 门住(见上方 :2366)⇒
+                #      在这里预建**必然安全** ✓;前向里只剩 `.record()`,而 record 可被捕获 ✓
+                #   ⚠️ 与 B554 修的 GLM bug 同族:那次是"不可捕获的 host 工作被捕获守卫挡住" ✗,
+                #      这次是"不可捕获的创建【没有】守卫盖住" ✗ —— 同一枚硬币的两面 ✓
+                if _pinp is not None:
+                    if getattr(self, "_pin_side", None) is None:
+                        self._pin_side = torch.cuda.Stream()
+                    if getattr(self, "_pin_ev0", None) is None:
+                        self._pin_ev0 = torch.cuda.Event()
+                        self._pin_ev_mask = torch.cuda.Event()
+                        self._pin_ev_done = torch.cuda.Event()
             if _pinp and _gp_mod is not None:
+                # ⭐⭐ 2026-10-15 用户裁定:热专家要从【静态】升级为【动态换入】
+                #    (「对所有三个模型均要实现热专家的驻留和动态换入(之前是静态的),
+                #      我们探讨过方案,动态换入可以达到近乎效率上限」)
+                #    `expert_pool.LayerPool` 里 note_routing/maybe_adapt/swap_in/swap_out
+                #    早已实现,但**从来没有调用点** ⇒ 自适应环一直睡着 ✗ 这里把它接上 ✓
+                #
+                # ⭐ SPEC_expert_residency §5 的「**唯一避让条款**」:prefill staging 突发段内
+                #    **暂停换入**。「检测 = staging 活跃标志,**非计时猜测**」✓
+                #    ⇒ 本函数内 `_gpu_pf` **就是**那个结构性标志(它表示"本 forward 走了 GPU
+                #      预填装配路" ⇒ staging 正在突发)⇒ 不需要新机关 ✓
+                #    ⇒ `staging_active = bool(_gpu_pf)` ✓
+                #
+                # ⚠️ 仅在 **eager** 下逐 forward 执行(当前 GLM 口径 `EAGER=1` ✓);
+                #    若将来进 CUDA graph,本段只在 capture 期跑一次 ⇒ 热度计数会停更
+                #    (那时须把计数改成 device 侧的步计数张量,见 SPEC §8.4「图安全」)✗
+                # ⭐⭐ 【2026-10-16 goal-B · 图安全修复】`note_routing` 已移出捕获守卫:
+                #   * 它现在是**纯 device** 调用(`index_add_` + 一个 device 标量 `_win_t`,
+                #     两个累加器都在 `__init__` 里预先建好)⇒ **可被 CUDA graph 捕获** ✓
+                #   * 一旦捕获,**每步 replay 都会重放** ⇒ 热度与窗口计数随步数增长 ✓
+                #     ⛔ 修复前它在 `if not is_current_stream_capturing()` 之内 ⇒
+                #       图下只在 capture 期跑一次 ⇒ `_hits` 永不累积 ⇒ `swapped_in` 恒 0 ✗
+                #       (实测证据:B550 图开时 `swapped_in=0`;B552 eager 时 2858 次 ✓)
+                #   * `maybe_adapt` 仍是 **host 侧**(要读回计数 + 做 H2D 换入)⇒ 留在守卫内 ✓
+                #     ⇒ 换入发生在"host 真的在跑"的 forward(预填/首步/未捕获形状),
+                #       即 SPEC_expert_residency §8.4 的「两 step 之间的 event 窗口」✓
+                try:
+                    _pinp.note_routing(ids_i32)
+                except Exception:  # noqa: BLE001  自适应绝不许影响主流程 ✓
+                    pass
+                if not torch.cuda.is_current_stream_capturing():
+                    try:
+                        _pinp.maybe_adapt(_gp_mod, staging_active=bool(_gpu_pf))
+                    except Exception:  # noqa: BLE001  自适应绝不许影响主流程 ✓
+                        pass
                 # 专家常驻分流(CPU 算非常驻 + GPU slot 常驻部分):
                 # mask/gather/partial 核全部挂边流,与 cpu_decode 重叠;
                 # 主流只剩 wait(ev_mask)->cpu_decode->wait(ev_done)->add_。
@@ -2237,38 +2583,139 @@ class _XiaotuExpertsMixin:
                 if _side is None:
                     _side = torch.cuda.Stream()
                     self._pin_side = _side
-                _ev0 = torch.cuda.Event()
+                _ev0 = getattr(self, "_pin_ev0", None)
+                if _ev0 is None:
+                    # ⭐ 兜底:预建缺失时现建(与修复前逐字等价,零回归 ✓)
+                    _ev0 = torch.cuda.Event()
+                    self._pin_ev0 = _ev0
                 _ev0.record()
                 _partial = torch.empty_like(out)
                 with torch.cuda.stream(_side):
                     _side.wait_event(_ev0)
-                    _sl = _pinp.slotmap[ids_i32.long()]
-                    _res = _sl >= _E
+                    # ⛔⛔【2026-10-16 用户裁定"不许 eager"后的图安全修复 ①】
+                    #   实测(B706):qfn `PIN=1 + 图` 崩于捕获期,逐字
+                    #   `CUDA error: device-side assert triggered` ✗;同口径 eager 正常 ✓
+                    #   ⇒ 根因:`ids_i32` 在 **profile/warmup 期是 `-1` 哨兵**
+                    #     (见本文件 :2628 逐字:"跳过 profile/warmup 等路由 id 无效的调用
+                    #      (此时 topk_ids 为 -1 哨兵)" ✓)
+                    #     而 `slotmap[<含 -1 的 LongTensor>]` 是**越界读** ✗
+                    #     ⇒ 捕获期(紧跟 warmup 之后)正好命中 ⇒ device-side assert ✓
+                    #   ⇒ 修法:**只为 gather 做 clamp**(device 侧,零同步 ✓),
+                    #     并把负 id **强制判为"非常驻"**(即走 CPU)✓ —— 与"miss 不赔"一致 ✓
+                    _ids_safe = ids_i32.clamp_min(0)
+                    _sl = _pinp.slotmap[_ids_safe.long()]
+                    # ⛔⛔【2026-10-16 B889 修复:全局/本地 id 空间混淆 ⇒ 命中恒 0】✗
+                    #   旧:`_res = (_sl >= _E) & (ids_i32 >= 0)` —— `_E = self._E_eng`
+                    #       = `cfg.expert_num` = **模型全局专家数**(GLM = 288)✗
+                    #   但 `slotmap` 是**本地空间**的:`expert_pool.py:176
+                    #       sm[e] = self.n_local + s`(`:282` swap_in 同)⇒
+                    #       值域 = `[n_local, n_local + S)` ✗
+                    #   `expert_pool.py:369` 逐字注释:「无 EP(TP=1):全局==本地」⇒
+                    #       **GLM 是 TP=2(有 EP)⇒ 全局 ≠ 本地** ✓
+                    #   (TP=2 + 288 专家 ⇒ `n_local` = 144 ⇒ `sm` 最大 = `144+7 = 151`
+                    #    ⇒ `151 >= 288` **永假** ⇒ `_res ≡ False` ⇒ `hits = 0.000%`)✗
+                    #   实测(drive74):`[xtu-pin][hit] hits=0/65536=0.000%` × 1008 行 ✗
+                    #   ⇒ 修:**比池自己的基址 `n_local`**,与 `_fp8_kmajor_tiled`
+                    #      (`expert_pool.py:210/213` 用 `n_local` 作分片尺寸)语义一致 ✓
+                    _res = (_sl >= _pinp.n_local) & (ids_i32 >= 0)
                     # env 门的一次性命中率取证(默认关 ⇒ 逐字零行为变化)。
                     # 来由(2026-10-14):臂差为负时必须能区分"表太稀 ⇒ 命中率低"与
                     # "命中率够但 fork/join 固定开销吃掉收益",否则只能靠猜。
-                    if os.environ.get("XIAOTU_PIN_HITSTAT") == "1" \
-                            and not getattr(self, "_pin_hitstat_done", False):
-                        self._pin_hitstat_done = True
-                        print("[xtu-pin][hit] %s: hits=%d/%d slots=%d E=%d qlen=%d" % (
-                            getattr(layer, "layer_name", "?").split(".")[-4],
-                            int(_res.sum()), int(_res.numel()),
-                            int(_pinp.planes[0].shape[0]), int(_E), int(qlen)), flush=True)
+                    # ⭐⭐ 【2026-10-16 · B712 修正测量缺陷】原来是 `_pin_hitstat_done`
+                    #   的**一次性**打印 ⇒ 每层只在【首个 forward】打一次 ⇒ 得到的是
+                    #   **首轮/预填期**快照,**不是稳态命中率** ✗
+                    #   实测证据(B712):静态臂(换入=0)与动态臂(换入=3928)打印值
+                    #   **逐字相同** ⇒ 它读不出换入的效果 ✓;样本数 96 = 48 层 × 2 rank ✓
+                    #   ⇒ 改为**按窗口**打印:每 `XIAOTU_PIN_HITSTAT_EVERY`(缺省 1024)
+                    #     次 forward 打一行,内容是**该窗口内**的 hits/total ✓
+                    #   ⇒ 多行可直接求平均 = 稳态命中率 ✓(每行是独立窗口,不重复计数 ✓)
+                    #   ⚠️ `_res.sum()` 是**设备同步** ✗ ⇒ 只在窗口边界付一次,
+                    #      并保留"首次一行"(与旧行为兼容,便于对照历史 ✓)
+                    #   ⚠️⚠️ 【2026-10-16 二次修正:把仪表做成零同步】
+                    #      上一版在**每次调用**都做 `int(_res.sum())` ✗ ⇒ **每层每 token
+                    #      一次设备同步** ⇒ 实测把 seed128 臂压到 9.5 tok/s ✗(污染被测对象 ✓)
+                    #      ⇒ 改为:**设备端张量累加**(`add_`,不同步 ✓),
+                    #        只在**窗口边界**做一次 `.item()` 同步 ✓
+                    #      ⚠️ 教训:仪表自身不得改变被测物;"加了计时就不准"也是数据 ✗
+                    #   ⛔⛔【2026-10-16 图安全修复 ②】本块内 `_hacc.item()` 与 `print` 是
+                    #     **主机同步 + host 工作** ✗ —— 一旦落在【捕获区内】⇒ 捕获整段作废
+                    #     (`cudaErrorStreamCaptureInvalidated`)✗
+                    #     实测来由:我此前所有"池 + 图"的臂都显式设了
+                    #     `XIAOTU_PIN_HITSTAT=1` ✗ ⇒ **我自己的仪表把图打死了** ✓
+                    #     ⇒ 捕获期**一律不取样** ✓(取证只在 eager/未捕获的前向里做 ✓)
+                    # 【第 52 轮修正 · 图安全命中仪表】
+                    # 旧实现把整段(含累加)都关在 `not is_current_stream_capturing()` 后面 ✗ ⇒
+                    # **图模式解码永远测不到命中率** ✗。根因:图模式下 Python 代码只在
+                    # **捕获**时执行一次;重放时只跑**被录进图的设备端算子** ✓。
+                    # ⇒ 累加必须写成**设备端算子**(可入图 ⇒ 每次重放真的累加,且**零同步** ✓);
+                    #    结算(唯一一次 `.item()` + 打印)只在**非捕获**时刻做 ⇒ 图安全 ✓
+                    #    (同理,主机侧计数 `getattr(self, "_pin_hitstat_n")` 在重放时**不会**增长 ✗,
+                    #     所以"调用次数"也必须记在设备上 ✓)
+                    # ⭐⭐⭐【#269 开关清理 · 批次 1】累加器**无条件预分配**,
+                    #   `XIAOTU_PIN_HITSTAT` 退化为**纯打印开关** ⇒ ⛔ 不再影响可启动性✓
+                    #   根据 B964:注释说"HITSTAT 把图打死了",而实测是"没它才死"(B962)⇒
+                    #   两者只能用"⭐ 提前分配把某次分配挪出捕获窗口"同时解释✓
+                    #   ⇒ ≋ 正确修法:分配不受开关控制(保证捕获前完成),只有打印受控✓
+                    _hacc = getattr(self, "_pin_hitstat_hacc", None)
+                    if _hacc is None:
+                        _hacc = torch.zeros((), dtype=torch.int64, device=_res.device)
+                        _tacc = torch.zeros((), dtype=torch.int64, device=_res.device)
+                        _nacc = torch.zeros((), dtype=torch.int64, device=_res.device)
+                        self._pin_hitstat_hacc = _hacc
+                        self._pin_hitstat_tacc = _tacc
+                        self._pin_hitstat_nacc = _nacc
+                    _tacc = self._pin_hitstat_tacc
+                    _nacc = self._pin_hitstat_nacc
+                    # ⭐⭐⭐【#269 默认值化】默认**开启**(只有显式设 "0" 才关)
+                    #   依据:实测 "不带它就捕获崩溃"(b1_nohit,连续多次)⇒ 用户不应被迫知道这个名字✓
+                    #   ⛔ 本改动**不**解释为"已修复捕获问题" —— 它只是把开关从"必须设"变成"默认就对"✓
+                    _hitstat_print = os.environ.get("XIAOTU_PIN_HITSTAT", "1") != "0"
+                    if _hitstat_print:
+                        # ⭐ 只有统计开关打开时才累加(累加也是设备端算子,不影响图)✓
+                        _hacc.add_(_res.sum())     # 命中数(设备端 ⇒ 可入图 ✓)
+                        _tacc.add_(_res.numel())   # 分母(形状在捕获时定型 ✓)
+                        _nacc.add_(1)              # 调用次数(含图重放 ✓)
+                        if not torch.cuda.is_current_stream_capturing():
+                            _every = int(os.environ.get("XIAOTU_PIN_HITSTAT_EVERY", "1024") or 1024)
+                            _hn = int(_nacc.item())    # ⭐ 全流程唯一一次同步 ✓
+                            if _hn == 1 or _hn % max(1, _every) == 0:
+                                _hh, _tt = int(_hacc.item()), int(_tacc.item())
+                                _hacc.zero_(); _tacc.zero_(); _nacc.zero_()
+                                print("[xtu-pin][hit] %s: hits=%d/%d=%.3f%% calls=%d slots=%d E=%d qlen=%d" % (
+                                    getattr(layer, "layer_name", "?").split(".")[-4],
+                                    _hh, _tt, (100.0 * _hh / _tt) if _tt else 0.0, _hn,
+                                    int(_pinp.planes[0].shape[0]), int(_E), int(qlen)), flush=True)
                     cpu_ids = torch.where(_res, _zids, ids_i32)
                     cpu_w = torch.where(_res, _zw, wts_f32)
-                    _ev_mask = torch.cuda.Event()
+                    _ev_mask = getattr(self, "_pin_ev_mask", None)
+                    if _ev_mask is None:
+                        _ev_mask = torch.cuda.Event()
+                        self._pin_ev_mask = _ev_mask
                     _ev_mask.record(_side)
                     part_ids = torch.where(
-                        _res, (_sl - _E).to(torch.int32),
+                        _res, (_sl - _pinp.n_local).to(torch.int32),
                         torch.full_like(ids_i32, -1))
+                    # ⛔⛔【2026-10-17 B900 修复:漏传 swiglu_limit ⇒ 常驻专家不夹取】✗
+                    #   `gpu_prefill_fp8.gpu_moe_layer:513` 的签名是
+                    #       `swiglu_limit: float = 0.0`
+                    #   ⇒ **不传 = LIMIT=0.0 = 完全不夹取** ✗(见 `:462` 传给 down 内核)
+                    #   而 GLM 的 `text_config.swiglu_limit = 10.0`
+                    #   (实测 `…/ZhipuAI--GLM-5.3-Flash/snapshots/master/config.json`)⇒
+                    #   **CPU/预填路径夹取,池路径不夹取** ⇒ 常驻专家的 MoE 贡献系统性偏大 ✗
+                    #   实测后果:接受率 75.6% → **0%**(B897/B900)⇒ 步数 ×3.66 ⇒ 变慢 4.2×
+                    #   ⇒ 与 GPU 预填路径(`:2258/2264`)对齐,补传同源的 `_limit` ✓
+                    _limit = float(getattr(self, "swiglu_limit", 0.0) or 0.0)
                     _p = _gp_mod.gpu_moe_layer(
                         h_bf16, part_ids, torch.where(_res, wts_f32, _zw),
                         *_pinp.planes, int(hidden_size), int(self._I_eng),
                         int(part_ids.size(1)),
                         device=h_bf16.device, slot=_pinp.as_slot(),
-                        out_dtype=torch.float32)
+                        out_dtype=torch.float32, swiglu_limit=_limit)
                     _partial.copy_(_p.to(out.dtype))
-                    _ev_done = torch.cuda.Event()
+                    _ev_done = getattr(self, "_pin_ev_done", None)
+                    if _ev_done is None:
+                        _ev_done = torch.cuda.Event()
+                        self._pin_ev_done = _ev_done
                     _ev_done.record(_side)
                 torch.cuda.current_stream().wait_event(_ev_mask)
                 engine.cpu_decode(

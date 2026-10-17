@@ -32,13 +32,19 @@ from vllm.model_executor.layers.quantization.utils.fp8_utils import (
     _e4m3_uint8_to_f32,
 )
 
+from vllm_xiaotu_moe.byte_transpose import ktranspose_into
 from vllm_xiaotu_moe.gpu_prefill import (
     _build_segmentation,
     _dma_hostbuf,
+    _dma_hostbuf_range,
     _kmajor_bytes,
     _pin_engine_hostbufs,
+    _prefetch_stream,
     _stage_begin,
     _stage_mark,
+    _tile_ring,
+    stage_tiles,
+    staging_tile_experts,
 )
 
 FP8_BLOCK = 128
@@ -186,6 +192,30 @@ def down_kernel_fp8(
 # ---------------------------------------------------------------------------
 
 
+def _fp8_tile_ring(device, n_experts: int, hidden: int, inter: int,
+                   tile: "int | None" = None, nslots: int = 2):
+    """⭐ 【微 ping/pong】FP8 的 tile 环(进程级复用,复用 `gpu_prefill._tile_ring`)。
+
+    槽内 4 项与 `fp8_staging_bytes` 的 tile 分支**一一对应**:
+      K-major w13 `[tile, H, 2I]` / 尺度 `[tile, H/128, 2I/128]` fp32 /
+      K-major w2  `[tile, I, H]` / 尺度 `[tile, I/128, H/128]` fp32
+
+    ⚠️ **尺度是 fp32(4 B/项)** ⇒ 这里用 **uint8 槽 + 末维 ×4** 再 `.view(torch.float32)`;
+       若按**元素数**申请,只会拿到 1/4 字节 ⇒ **静默越界** ✗
+    ⚠️ 为什么必须**进程级复用**(不自建、不每次层分配)⇒ 见 `gpu_prefill._tile_ring`
+       的两条理由(不可回收碎片 + **跨流 use-after-free**),此处不重复 ✗
+    """
+    E = int(n_experts)
+    t = int(tile if tile is not None else staging_tile_experts(E))
+    b = FP8_BLOCK
+    H, I = int(hidden), int(inter)
+    shapes = ((t, H, 2 * I),
+              (t, H // b, (2 * I) // b * 4),
+              (t, I, H),
+              (t, I // b, H // b * 4))
+    return _tile_ring(device, shapes, max(2, int(nslots)))
+
+
 def prealloc_fp8_buffers(device, n_experts: int, hidden: int, inter: int) -> None:
     """Allocate this layer's persistent named buffers on the CURRENT stream.
 
@@ -196,13 +226,12 @@ def prealloc_fp8_buffers(device, n_experts: int, hidden: int, inter: int) -> Non
     stream association simple.
     """
     E, H, I = int(n_experts), int(hidden), int(inter)
-    _buf("raw13", (E, 2 * I, H), device)
-    # 【②c】共享模式下 raw2 是 raw13 上的视图(w2_raw = w13_raw.view(...)),
-    # 不再单独分配 —— 省 1.12 GiB 设备显存。`XIAOTU_GPF_RAW2_SHARE=0` 退回独立缓冲。
-    if os.environ.get("XIAOTU_GPF_RAW2_SHARE", "0") != "1":
-        _buf("raw2", (E, H, I), device)
-    _buf("km13", (E, H, 2 * I), device)
-    _buf("km2", (E, I, H), device)
+    # ⭐⭐ 2026-10-15 用户裁定:所有 GPU 预填充路径**一律**走 tile 形态(微 ping/pong),
+    #    旧的"按层持久缓冲"机制**已删除** ✗
+    #    ⇒ `staging_tile_experts` 现在**永不返回 E** ⇒ 下面**不再有**整层分支 ✓
+    #    ⇒ 整层的 `raw13`/`raw2`/`km13`/`km2` **一个都不分配** ✓(那是 §601 里永不释放的整层槽)
+    tile = staging_tile_experts(E)
+    _fp8_tile_ring(device, E, H, I, tile)
 
 
 def fp8_staging_bytes(n_experts: int, hidden: int, inter: int, ns: int = 2) -> int:
@@ -230,7 +259,16 @@ def fp8_staging_bytes(n_experts: int, hidden: int, inter: int, ns: int = 2) -> i
     s2d = E * (H // b) * (I // b) * 4
     n = max(1, int(ns))
     dma = (w13d + w2d) // n          # one node's staging buffer, per weight block
-    return int(2 * w13d + 2 * w2d + s13d + s2d + dma)
+    tile = staging_tile_experts(E)
+    # ⭐⭐ 2026-10-15 用户裁定:所有 GPU 预填充路径**一律** tile 形态
+    #    ⇒ `staging_tile_experts` **永不返回 E** ⇒ **整层记账分支已删除** ✗
+    # ⭐ 【微 ping/pong】tile 环走 noraw 直填 ⇒ **不再有 raw 那一份**,只留 2 个
+    #    (K-major 权重 + 尺度) 槽,外加按 tile 缩小的 DMA staging。
+    # ⚠️ 与 `_fp8_tile_ring`(分配)**共用 `staging_tile_experts`** ⇒ 口径结构上不可能分叉
+    #    —— 这正是 §600/§601 两次"预检说够、实际 OOM"的唯一防线 ✓
+    # ⭐ 现在两者**都只可能是 tile 形态** ⇒ 分叉在结构上不可能发生 ✓
+    frac = tile / E
+    return int(2 * frac * (w13d + w2d + s13d + s2d) + frac * dma)
 
 
 def kmajor_from_engine_shards_fp8(engine, device, hidden: int, inter: int,
@@ -366,15 +404,16 @@ def kmajor_from_engine_shards_fp8(engine, device, hidden: int, inter: int,
     s13t = s13_raw.transpose(1, 2).contiguous()      # [E, H/128, 2I/128]
     s2t = s2_raw.transpose(1, 2).contiguous()        # [E, I/128, H/128]
 
-    if dst is not None:
-        w13t = w13t if w13t is not None else _kmajor_bytes(w13_raw, dst[0])
-        w2t = _kmajor_bytes(w2_raw, dst[1])
-    else:
-        # Reuse the K-major targets too: fresh-per-layer allocation is the
-        # documented ~365 ms/layer allocator churn (NOTES §466). One slot is
-        # safe here because assembly and GEMM are strictly ordered on one stream.
-        w13t = w13t if w13t is not None else _kmajor_bytes(w13_raw, _buf("km13", (E, H, 2 * I), device))
-        w2t = _kmajor_bytes(w2_raw, _buf("km2", (E, I, H), device))
+    # ⭐⭐ 2026-10-15 用户裁定:所有 GPU 预填充路径**一律** tile 形态;
+    #    **旧的"按层缓冲"机制已删除** ✗ ⇒ `dst`(tile 槽)**必需** ✓
+    #    ⛔ 不再有 `dst is None` 的整层兜底 —— 缺槽即**显式失败**,
+    #       绝不静默退回按层持久缓冲(那正是 §601 里"永不释放的整层槽")✗
+    if dst is None:
+        raise RuntimeError(
+            "gpu-prefill(fp8): 需要 tile 槽(dst);"
+            "按层持久缓冲已按 2026-10-15 用户裁定删除")
+    w13t = w13t if w13t is not None else _kmajor_bytes(w13_raw, dst[0])
+    w2t = _kmajor_bytes(w2_raw, dst[1])
     _stage_mark(_t_dma_end, "tr")
     if _trace:
         _hit("done")
@@ -403,6 +442,27 @@ def gpu_moe_layer_fp8(x, topk_ids, topk_weights, w13t, s13t, w2t, s2t,
     output (what the MXFP4 path does, since its `out` is bf16) costs ~2-4e-3 rms
     relative error; fp32 accumulation measures ~5e-7. The caller casts once.
     """
+    # ⛔⛔⛔【2026-10-17 B923 修复:尺度槽可能是 **uint8 字节槽**】✗
+    #   实测根因(⭐ 同缓冲双入口对照,rms_rel 806 倍 vs 4.4e-3):
+    #     热专家池 `expert_pool.planes` 与 `_fp8_tile_ring` 的尺度平面都按
+    #     **`uint8` + 末维 ×4** 分配(注释自述:省空间,末维 ×4 后 `.view(torch.float32)`)
+    #     ⇒ 此时 `s13t.stride(0)/stride(1)` 是 **【字节】步长** ✗,
+    #   而内核 `gate_up_kernel_fp8`/`down_kernel_fp8` 按 **【fp32 元素】** 寻址
+    #     (`:127` `s13t_ptr + s_off + (kk>>7)*row_stride + n_blk`
+    #      / `:181` 同理)
+    #     ⇒ 尺度整体错位 **4×** ⇒ 解量化全错 ⇒ 输出与真值无关 ✗
+    #   ⭐ 对照证据:`_moe_tile_launch_fp8` 的调用方
+    #     `gpu_moe_layer_from_engine_tiled:712` **显式**传
+    #     `b[1][:e1-e0].view(torch.float32)` ⇒ 它做对了 ⇒ 4.4e-3 ✓;
+    #     而本入口**原样接收** `s13t` ⇒ 806 ✗
+    #   ⭐ 修法与另两处**逐字同构**(`_fp8_kmajor_tiled:565-568`、
+    #     `gpu_moe_layer_from_engine_tiled:712`)⇒ 三处统一 ✓
+    #   ⚠️ 兼容性:浮点尺度(如 harness 的 `kmajor_from_engine_shards_fp8` 输出)
+    #     走 `else` 分支,行为**逐字不变** ✓
+    if s13t.dtype == torch.uint8:
+        s13t = s13t.view(torch.float32)
+    if s2t.dtype == torch.uint8:
+        s2t = s2t.view(torch.float32)
     T = x.shape[0]
     E = int(w13t.shape[0])
     tok, wts, seg_start, A = _build_segmentation(topk_ids, topk_weights, E, device)
@@ -426,16 +486,15 @@ def gpu_moe_layer_fp8(x, topk_ids, topk_weights, w13t, s13t, w2t, s2t,
     return out
 
 
-def gpu_moe_layer_fp8_from_engine(x, topk_ids, topk_weights, engine,
-                                  H: int, I: int, K: int, *, device,
-                                  swiglu_limit: float = 0.0, n_experts: int,
-                                  **kw):
-    """Assemble this layer's K-major FP8 weights from the engine and run it."""
-    built = kmajor_from_engine_shards_fp8(engine, device, H, I, n_experts)
-    if built is None:
-        return None
-    return gpu_moe_layer_fp8(x, topk_ids, topk_weights, *built, H, I, K,
-                             device=device, swiglu_limit=swiglu_limit, **kw)
+# 【2026-10-16 goal-A1 · 废除"按层缓冲"】此处原有
+#   `def gpu_moe_layer_fp8_from_engine(x, topk_ids, topk_weights, engine, H, I, K, ...)`
+# —— 它是"装【整层】K-major 权重再算一层"的死入口(内部 `kmajor_from_engine_shards_fp8`
+#    不带 dst ⇒ 每次新建整层缓冲)。**已删除** ✓
+# 证据:`grep -rn gpu_moe_layer_fp8_from_engine` 在插件内**零调用者** ✓
+#   (仅 build/lib/ 下的旧拷贝与自身定义)⇒ 删除无行为变化 ✓
+# 保留:`kmajor_from_engine_shards_fp8` 本体 ✓ —— tile 版(见下方 `..._tiled`)
+#   与 3 个 harness(test_gpu_prefill_fp8_assembly / bench_gpf_asm_phases /
+#   test_gpu_prefill_fp8_vs_cpu)仍在用 ✓
 
 
 # ---------------------------------------------------------------------------
@@ -472,13 +531,239 @@ def kmajor_from_engine_shards(engine, device, hidden: int, inter: int,
 
 def gpu_moe_layer(x, topk_ids, topk_weights, w13t, s13t, w2t, s2t,
                   H: int, I: int, K: int, *, device, slot=None,
-                  swiglu_limit: float = 0.0, **kw):
+                  swiglu_limit: float = 0.0, out_dtype=None, **kw):
     """``gpu_prefill.gpu_moe_layer``-compatible entry point.
 
-    ``slot`` is accepted for interface parity but unused -- the kernels are fed by
-    persistent named buffers, so there is nothing per-layer to prefetch into.
-    Returns fp32 (the caller casts once), unlike the MXFP4 path's bf16 output.
+    ``slot`` is accepted for interface parity but unused -- the weights arrive
+    **positionally** as the 4 tensors, and for the residency pool those 4 ARE the
+    pool's planes (``mixed_experts`` unpacks ``*_pinp.planes`` into exactly these
+    four slots), so there is nothing to look up here ✓
+
+    ⭐ ``out_dtype``: MXFP4's ``gpu_moe_layer`` takes it and returns bf16. The FP8
+    path **always returns fp32** (fp32 accumulation measures ~5e-7 vs ~2-4e-3 for
+    bf16 accumulation) and the caller casts once, so we accept the kwarg and
+    ignore it.  ⛔ 2026-10-15 修:**先前没有这个参数** —— 而 `mixed_experts` 的驻留
+    分流路**总是**传 `out_dtype=torch.float32` ⇒ 经 `**kw` 转发后在此处
+    **TypeError** ⇒ **FP8 热专家驻留一启用就会崩** ✗(此路此前从未被执行过)
     """
-    del slot
+    del slot, out_dtype
     return gpu_moe_layer_fp8(x, topk_ids, topk_weights, w13t, s13t, w2t, s2t,
                              H, I, K, device=device, swiglu_limit=swiglu_limit, **kw)
+
+
+# ---------------------------------------------------------------------------
+# 【微 ping/pong】tile 环路径(FP8 版)
+# ---------------------------------------------------------------------------
+# ⭐【2026-10-17 注释更正】下面这条已**过期**,勿再引用 ✗:
+#    ~~默认关闭:`XIAOTU_GPF_STAGE_TILE_E=0`(或 >= E)⇒ `stage_tiles` 只给 `[(0, E)]`,
+#      走的仍是上面的**整层**装配 ⇒ 与改动前**逐字节等价**~~
+#    ⇒ 事实(读码,`gpu_prefill.py:1081-1118`):2026-10-15 用户裁定去掉按层缓冲后,
+#      `staging_tile_experts()` **永不返回 `E`** ✓,`stage_tiles()` 是它的**纯派生** ✓
+#      ⇒ `XIAOTU_GPF_STAGE_TILE_E=0`(或 >= E)现在等价于**默认** `max(1, E//3)` ✓
+#      ⇒ **tile 环是唯一形态**;该 env 只用来**调 tile 宽度**,**不能**再退回整层 ✓
+# ⭐ 与 MXFP4 版(`gpu_prefill.gpu_moe_layer_from_engine_tiled`)**逐字同构**:环、事件、
+#    调度顺序全部照抄,只把"权重装配"换成 FP8、把"内核"换成 fp8 内核 ✓
+
+
+
+def _fp8_kmajor_tiled(engine, device, hidden: int, inter: int, n_experts: int,
+                      e0: int, e1: int, dst):
+    """把专家区间 `[e0, e1)` 的 K-major FP8 权重**逐 NUMA node 直填**进 `dst`。
+
+    ⭐ **无 raw 缓冲**(noraw):每个 node 的切片直接转置进目标的 K-major 列区间
+    ⇒ 省掉整层 raw 那一份(FP8 下 raw13+raw2 与 K-major 同尺寸,是**成对**的开销)✓
+
+    与 `gpu_prefill.kmajor_from_engine_shards_noraw` 同构;两处差异:
+      * 布局是 FP8 的 `[E, H, 2I]` / `[E, I, H]`(node 切片 `[gate cbytes][up cbytes]`);
+        ⛔⛔【2026-10-17 B916/B923 勘误】**原文写的是 `[E, 2I, H]` / `[E, H, I]`,是错的** ✗
+        ⇒ 实测(`scripts/test_fp8_pool_planes_vs_ring.py`,E=16 H=2048 I=1024):
+          按 `[E, 2I, H]`/`[E, H, I]` 分配必抛
+          `ValueError: ktranspose_into shape mismatch: x(1, 256, 1024) -> y(1, 2048, 256)` ✗;
+          按 `[E, H, 2I]`/`[E, I, H]` 分配 ⇒ `rms_rel=4.407e-03` ✅
+        ⭐ 判据:函数体按【末维】切 N(`:126` 用 `kk*row_stride + n`,`n` 覆盖 `2I`),
+          且 `ktranspose_into` 负责 K-major→目标的转置 ⇒ **N 必须在最后一维** ✓
+        ⭐ 对接口径与 `_fp8_tile_ring`(`shapes=((t,H,2I),(t,H//b,(2I)//b*4),(t,I,H),(t,I//b,H//b*4))`)
+          和 `expert_pool.planes` **完全一致** ✓
+      * **尺度是 fp32** ⇒ 用 torch `transpose(1,2).contiguous()`,**不走** `ktranspose`
+        (`ktranspose_into` 只接受 uint8;尺度量很小,整层路径也是这么做的 ✓)
+    """
+    # ⭐⭐⭐【B985 修】tile 路径缺少锁页⇒ DMA 跑在 pageable 上✗
+    #   MXFP4 路径在 `kmajor_from_engine_shards` 开头就调用它（`:1638`）✓，
+    #   而 FP8 只在**整层**入口 `kmajor_from_engine_shards_fp8`（`:300`，已废）里调✗
+    #   ⇒ benchmark：pageable 15-21 GB/s vs pinned 26.85 GB/s（同文件注释实测）
+    #   幂等、失败只告警、`XIAOTU_GPF_PIN=0` 可关 ✓
+    _pin_engine_hostbufs(engine)
+    geo = engine.shard_geometry()
+    ns = int(geo["ns"])
+    E, Et = int(n_experts), int(e1) - int(e0)
+    if Et <= 0:
+        return dst
+    H, I = int(hidden), int(inter)
+    b = FP8_BLOCK
+    c13, cr13 = int(geo["w13_cbytes"]), int(geo["w13_crows"])
+    c2, cr2 = int(geo["w2_cbytes"]), int(geo["w2_crows"])
+    w13t, s13t, w2t, s2t = dst
+    # ⭐ 尺度槽在环里是 **uint8 字节槽**(见 `_fp8_tile_ring` 的 ×4 说明)⇒ **由本函数**
+    #    统一转 fp32,避免"转换知识"散落到每个调用点(实测:散落会立刻写出形状不匹配)✗
+    if s13t.dtype == torch.uint8:
+        s13t = s13t.view(torch.float32)
+    if s2t.dtype == torch.uint8:
+        s2t = s2t.view(torch.float32)
+
+    # w13:每个 node 的切片 = [gate c13 B][up c13 B];K-major 目标行区间 [c0,c0+cr13) ✓
+    for n in range(ns):
+        buf = _dma_hostbuf_range(engine, 0, n, device, int(e0) * 2 * c13, Et * 2 * c13)
+        if buf is None:
+            return None
+        c0 = n * cr13
+        blk = buf.view(Et, 2, c13)
+        ktranspose_into(blk[:, 0, :].reshape(Et, cr13, H), w13t[:, :, c0:c0 + cr13])
+        ktranspose_into(blk[:, 1, :].reshape(Et, cr13, H),
+                        w13t[:, :, I + c0:I + c0 + cr13])
+        del buf, blk
+    # w2:每个 node 的切片 = (cr2, I) 连续 ✓
+    for n in range(ns):
+        buf = _dma_hostbuf_range(engine, 1, n, device, int(e0) * c2, Et * c2)
+        if buf is None:
+            return None
+        c0 = n * cr2
+        ktranspose_into(buf.view(Et, cr2, I), w2t[:, :, c0:c0 + cr2])
+        del buf
+    # 尺度:整块按专家维连续,不按 node 切(与整层路径同一假设)✓
+    s13_per = int(geo["w13_scale_bytes"]) // E
+    s2_per = int(geo["w2_scale_bytes"]) // E
+    b13 = _dma_hostbuf_range(engine, 2, 0, device, int(e0) * s13_per, Et * s13_per)
+    b2 = _dma_hostbuf_range(engine, 3, 0, device, int(e0) * s2_per, Et * s2_per)
+    if b13 is None or b2 is None:
+        return None
+    s13t.copy_(b13.view(torch.float32).view(Et, (2 * I) // b, H // b)
+               .transpose(1, 2).contiguous())
+    s2t.copy_(b2.view(torch.float32).view(Et, H // b, I // b)
+              .transpose(1, 2).contiguous())
+    # ⚠️ `view` 成立的前提 = 字节数恰好等于 Et*per:整层路径对**整块**用了同一个 view,
+    #    故只要整块无尾部填充就成立;若有填充,整层路径同样会错 ⇒ 不是本条新引入的风险 ✓
+    del b13, b2
+    # ⭐ 返回**归一化后**的元组(尺度已是 fp32 视图,与内核/对拍期望的 dtype 一致)
+    #    ⛔ 曾经 `return dst` ⇒ 调用方拿到 uint8 字节槽,而函数内部用的是 fp32 视图
+    #    ⇒ dtype 与布局在各调用点分叉(实测立刻写出形状不匹配)✗
+    return (w13t, s13t, w2t, s2t)
+
+
+def _moe_tile_launch_fp8(x, tok, wts, seg_local, w13_t, s13_t, w2_t, s2_t,
+                         inter_view, out, H, I, *, BM, BN, BK, BH, NS, NW,
+                         LIMIT: float = 0.0):
+    """按【专家 tile】发一次 FP8 gate_up + down(内核**零改动**,只传视图)。
+
+    与 `gpu_prefill._moe_tile_launch` 同一条理由:`pid_e` 只经 `seg_ptr` 与专家 stride
+    (`W*_E`)寻址,而 `inter/tok/wts` 全按**全局排序行号**索引 ⇒ 按专家切分后一个 tile
+    恰好拥有连续区间 `[seg_start[e0], seg_start[e1])` ⇒ 切好视图 + 平移 seg 即可;
+    `out` 在 `down_kernel_fp8` 里是 `tl.atomic_add` ⇒ 多次 launch 自然累加 ✓
+    """
+    E_t = int(w13_t.shape[0])
+    W13_E, S13_E = w13_t.stride(0), s13_t.stride(0)
+    W2_E, S2_E = w2_t.stride(0), s2_t.stride(0)
+    gate_up_kernel_fp8[(E_t, triton.cdiv(2 * I, BN))](
+        x, x.stride(0), tok, seg_local,
+        w13_t, w13_t.stride(1), s13_t, s13_t.stride(1),
+        inter_view, inter_view.stride(0), W13_E, S13_E,
+        H=H, BM=BM, BN=BN, BK=BK, NS=NS, num_warps=NW,
+    )
+    down_kernel_fp8[(E_t, triton.cdiv(H, BH))](
+        inter_view, inter_view.stride(0), tok, wts, seg_local,
+        w2_t, w2_t.stride(1), s2_t, s2_t.stride(1),
+        out, out.stride(0), W2_E, S2_E,
+        H=H, I=I, BM=BM, BH=BH, BK=BK, NS=NS, LIMIT=LIMIT, num_warps=NW,
+    )
+
+
+def gpu_moe_layer_from_engine_tiled(engine, x, topk_ids, topk_weights,
+                                    H: int, I: int, E: int, K: int, *, device,
+                                    group_k: int = 128, nslots: int = 2, out=None,
+                                    swiglu_limit: float = 0.0):
+    """【微 ping/pong】FP8 孪生:`gpu_prefill.gpu_moe_layer_from_engine_tiled`。
+
+    调度逐字同构:`issue(t)` 在侧流上 wait(该槽上一个 free) → `_fp8_kmajor_tiled`
+    → record ready;`compute(t)` 在主流 wait(ready) → `_moe_tile_launch_fp8`(共享
+    `out`,原子累加) → record free ✓
+    `tile_e<=0/>=E` ⇒ 只有 1 个 tile,等价于整层一次算完(便于先做数值对拍)✓
+    """
+    device = torch.device(device) if not isinstance(device, torch.device) else device
+    T, H, I, E = int(x.shape[0]), int(H), int(I), int(E)
+    del group_k                      # FP8 的块固定 128x128
+    tiles = stage_tiles(E)
+    if not tiles:
+        return None
+    tile = staging_tile_experts(E)
+    # ⭐ B981：tile 环深度可调（原仅函数参数默认 2，没有 env）✗
+    #   每个槽 = 一个 tile 的 w13+s13+w2+s2；tile=96 时约 1.125 GiB✓
+    #   更深 = 给 H2D 更多提前量（与 MXFP4 路径的 XIAOTU_MOE_PREFETCH_SLOTS 同意）✓
+    _ns_env = os.environ.get("XIAOTU_GPF_STAGE_NSLOTS")
+    if _ns_env:
+        nslots = max(2, int(_ns_env))
+    nslots = max(2, int(nslots))
+    ring = _fp8_tile_ring(device, E, H, I, tile, nslots)
+    free = [None] * nslots
+    ready = [None] * nslots
+
+    tok_all, wts_all, seg_start, A = _build_segmentation(topk_ids, topk_weights, E, device)
+    if out is None:
+        out = torch.zeros((T, H), dtype=torch.float32, device=device)
+    if T == 0 or int(K) == 0:
+        return out
+    inter = _buf("inter", (A, 2 * I), device, torch.bfloat16)
+
+    BM = int(os.environ.get("XIAOTU_GPF_GEMM_BM", 64))
+    BN = int(os.environ.get("XIAOTU_GPF_GEMM_BN", 64))
+    BK = int(os.environ.get("XIAOTU_GPF_GEMM_BK", 64))
+    BH = int(os.environ.get("XIAOTU_GPF_GEMM_BH", 64))
+    NS = int(os.environ.get("XIAOTU_GPF_GEMM_STAGES", 2))
+    NW = int(os.environ.get("XIAOTU_GPF_GEMM_WARPS", 4))
+
+    cur = torch.cuda.current_stream(device)
+    side = _prefetch_stream(device)
+
+    def _issue(i: int) -> bool:
+        s = i % nslots
+        e0, e1 = tiles[i]
+        if free[s] is not None:
+            side.wait_event(free[s])          # 该槽上次的使用者(主流内核)必须先完成
+        with torch.cuda.stream(side):
+            km = _fp8_kmajor_tiled(engine, device, H, I, E, e0, e1,
+                                   tuple(b[:e1 - e0] for b in ring[s]))
+            ev = torch.cuda.Event()
+            ev.record(side)
+        if km is None:
+            return False
+        ready[s] = ev
+        return True
+
+    if not _issue(0):
+        return None
+    # ⭐ 每层**只做一次**设备→主机同步取段边界(逐 tile `.item()` 会把流水反复打断)✓
+    _bounds = seg_start.tolist()
+
+    for i, (e0, e1) in enumerate(tiles):
+        s = i % nslots
+        if ready[s] is None:                  # 该槽 DMA 没排上(引擎无分片)⇒ 整体放弃
+            return None
+        cur.wait_event(ready[s])
+        row0, row1 = int(_bounds[e0]), int(_bounds[e1])
+        if row1 > row0:
+            seg_local = (seg_start[e0:e1 + 1] - row0).contiguous()
+            b = ring[s]
+            _moe_tile_launch_fp8(
+                x, tok_all[row0:row1], wts_all[row0:row1], seg_local,
+                b[0][:e1 - e0], b[1][:e1 - e0].view(torch.float32),
+                b[2][:e1 - e0], b[3][:e1 - e0].view(torch.float32),
+                inter[row0:row1], out, H, I,
+                BM=BM, BN=BN, BK=BK, BH=BH, NS=NS, NW=NW,
+                LIMIT=float(swiglu_limit),
+            )
+        fe = torch.cuda.Event()
+        fe.record(cur)
+        free[s] = fe
+        ready[s] = None
+        if i + 1 < len(tiles):
+            if not _issue(i + 1):
+                return None
+    return out

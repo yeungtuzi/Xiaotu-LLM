@@ -499,9 +499,22 @@ public:
         // Serialize access to the shared generation/counter state. When the pool
         // is shared process-wide (one pool for all MoE layers, mirroring lk_moe's
         // single Backend_NUMA), different layers could otherwise race on
-        // counter_/task_/current_gen_. vLLM-eager drives layers sequentially, so
-        // this lock is uncontended in practice; it only orders genuinely-concurrent
-        // forward_many calls issued from multiple driver threads.
+        // counter_/task_/current_gen_.
+        //
+        // 【2026-10-17 修正前提 —— 原注释写错了,别据此删锁】
+        // 本锁"无争用"的真正前提是 **XIAOTU_MOE_ASYNC=0 且只有一条提交路径**,
+        // 不是"vLLM-eager 顺序驱动各层":
+        //   · binding.cpp 的常驻 worker `g_async_thr`(async_loop)也会进池 ——
+        //     :328 调 w_fn -> :914 的 lambda -> run_moe_and_ep -> forward_many -> 本池;
+        //   · hostfunc 路径与它**共用同一个** run_moe_and_ep(:917 / :1017,
+        //     源码注释 binding.cpp:399-400 自述"两条路径共用");
+        //   · async_init 在某层不满足 pin 前提时返回 false => 该层退回 hostfunc,
+        //     其它层仍走 async => **混合模式两线程可同时进池**。
+        // 原注释("vLLM-eager drives layers sequentially, so this lock is uncontended
+        // in practice")会让人误判这把锁不必要 => 删锁、或以为开 ASYNC=1 是安全的,
+        // 即复现上游 KT-FT RCA 那类"票被丢 => remaining_ 永挂"。
+        // 细则:IRON_RULES.md「R16 补充」;PAPER_KTFT_READING_2026-10-17.md §10.6a。
+        // 另:本锁覆盖【整次】parallel_for(含等 worker),真争用的代价是阻塞一整个层。
         std::lock_guard<std::mutex> call_lock(call_mtx_);
         if (nt_ <= 1 || n <= 1) {
             for (size_t i = 0; i < n; ++i) fn(i);

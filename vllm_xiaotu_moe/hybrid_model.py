@@ -145,7 +145,10 @@ def register_spec_layer_floor(num_hidden_layers: int | None) -> None:
     背景:GLM-5.3-Flash 的 MTP 起草层是 `layers.45`(目标模型 0..44),它在整个
     模型里**只构造一次** ⇒ DSpark 那套"同一 prefix 第二次出现"的判定
     (`_instance_index(prefix) > 0`)**认不出它**,于是它被当普通层、默认落 CPU,
-    而实测 CPU draft 会让投机净负(7.11 vs 10.76 t/s,NOTES §245)。
+    ⛔ 旧文写「实测 CPU draft 会让投机净负(7.11 vs 10.76 t/s,NOTES §245)」——
+    ⭐ **该依据已失效**(2026-10-16):今天同口径实测 draft 落 CPU **30.1 tok/s** vs
+    常驻 **15.0 tok/s** vs 不开投机 **18.3 tok/s**(真 agent 载荷/k=4/MBT=8192/TP=2/outlen=256,
+    见 EXPERIMENTS **B840**)⇒ **默认改为"落 CPU"** ✓,只有显式 `=1` 才强制常驻。
 
     这里记下目标模型的 `num_hidden_layers`(取值取**最大**:起草模型的 config 可能
     把 `num_hidden_layers` 设成 0,见 MiMo MTP),任何 index ≥ 它的层就是起草层。
@@ -191,7 +194,10 @@ def reserve_draft_bytes(per_layer_bytes: int) -> None:
 
     构造顺序是"目标模型在前、draft 在后"(`LLMBaseProposer.load_model()`),若不预留,
     `XIAOTU_MOE_RESIDENT_BUDGET_GB` 会被 42 层目标层吃光,draft 只能落回 CPU ——
-    而实测 draft 走 CPU 时投机是**净负**的(7.11 vs 不开投机 10.76 t/s,见 NOTES §245)。
+    ⛔ 旧文写「而实测 draft 走 CPU 时投机是**净负**的(7.11 vs 不开投机 10.76 t/s)」——
+    ⭐ **已失效**(2026-10-16):今天同口径(draft 落 CPU 30.1 / 常驻 15.0 / 不开投机 18.3 tok/s,
+    EXPERIMENTS B840)⇒ **落 CPU 反而最优**;7.11/10.76 两数**都低于今天的不开投机基线** ⇒
+    必然来自更早更慢的配置。⇒ **默认已改为"落 CPU"** ✓。
     因此按用户要求:**draft 永远在 GPU**,预算先扣掉它的份额。
     """
     st = _resident_state()
@@ -603,7 +609,25 @@ class CpuXiaotuMoE(nn.Module):
             else num_hash_layers
         )
         self.routed_scaling_factor = getattr(config, "routed_scaling_factor", 1.0)
+        # ⭐⭐⭐【B971 · E 项修复】GLM 的 `swiglu_limit` 在 `text_config` 里(顶层 None)✗
+        #   B903 只修了 mixed_experts.py ⇒ 经本文件的路径(MTP draft)仍漏掉 clamp✗
+        #   修法同 B903:仅在顶层取不到时回退到 text_config ⇒ 对已能取到的模型零影响✓
         self.swiglu_limit = getattr(config, "swiglu_limit", None)
+        if self.swiglu_limit is None:
+            _tc = getattr(config, "text_config", None)
+            if _tc is not None:
+                self.swiglu_limit = getattr(_tc, "swiglu_limit", None)
+        # ⭐ B972 临时诊断(1 行,验证完即删):config 到底是哪一层?
+        if os.environ.get("XIAOTU_CFG_DIAG", "0") == "1":
+            _t = getattr(config, "text_config", None)
+            print("[xtu-cfg] type=%s has_text_config=%s swiglu_limit=%r routed_scaling=%r "
+                  "scoring_func=%r norm_topk_prob=%r | text_config: scaling=%r scoring=%r"
+                  % (type(config).__name__, _t is not None, getattr(config, "swiglu_limit", "<NA>"),
+                     getattr(config, "routed_scaling_factor", "<NA>"),
+                     getattr(config, "scoring_func", "<NA>"),
+                     getattr(config, "norm_topk_prob", "<NA>"),
+                     getattr(_t, "routed_scaling_factor", "<NA>") if _t else "<NA>",
+                     getattr(_t, "scoring_func", "<NA>") if _t else "<NA>"), flush=True)
         self.renormalize = config.norm_topk_prob
         self.scoring_func = getattr(config, "scoring_func", "sqrtsoftplus")
         self.n_shared_experts = config.n_shared_experts or 0
@@ -715,20 +739,34 @@ class CpuXiaotuMoE(nn.Module):
             _dup = self._resident_instance > 0
             if _dup:
                 # 同一 prefix 第二次出现 = **draft/speculator 模型**。
-                # 【用户要求·第 210 轮】draft 层**永远在 GPU**:它只有几层,而且实测
-                # draft 走 CPU 时投机是净负的(7.11 vs 10.76 t/s)。因此它的常驻
-                # **不依赖** `XIAOTU_MOE_GPU_RESIDENT_LAYERS`,默认就开;只有显式
-                # `XIAOTU_MOE_RESIDENT_DRAFT=0` 才关(关掉时会告警,因为那会让投机变负)。
+                # 【用户要求·第 210 轮】draft 层默认**在 GPU**:它只有几层,GPU 常驻
+                # 让 draft 前向不必走 CPU MoE(那条路每 token 都要重读专家权重)。
+                # ⚠️【2026-10-16 勘误 · B745】原注释引用的旧实测「draft 走 CPU 时投机净负
+                #   (7.11 vs 10.76 t/s)」**已被本轮同口径实测推翻** ✗:
+                #   `XIAOTU_MOE_RESIDENT_DRAFT=0`(draft 回 CPU)= 接受率 **72.0%** ✓、
+                #   解码 **22.3 tok/s** vs 无投机 **18.4 tok/s**(**+21%** ✓),
+                #   见 `docs/EXPERIMENTS.md` **B730/B739**。
+                # ⇒ 正确表述:CPU draft 让 draft 前向**变慢**(每 token 读专家权重),
+                #   但**不必然**使投机净负 —— 净收益取决于
+                #   `spec_period / rest` 的比值(rest 是与 batch 无关的固定层间开销)。
+                # ⇒ 因此本告警**不再断言"net-negative"**,只说明"会让 draft 前向变慢"。
+                # ⛔⛔ 2026-10-16 修【E 项根因】:默认**由"常驻"改为"落 CPU"** ✓
+                #    B840 同口径三臂(真 agent 载荷/k=4/MBT=8192/TP=2/outlen=256):
+                #      * 无投机        = 18.3 tok/s / TPOT 54.6 ms
+                #      * draft 落 CPU  = **30.1 tok/s / TPOT 33.2 ms** ✓(+64.5%,最优)
+                #      * draft GPU 常驻 = 15.0 tok/s / TPOT 66.9 ms ⛔(**比不开投机还慢**)
+                #    ⇒ 默认必须是"落 CPU";只有显式 `=1` 才常驻 ✓
                 self._is_draft = True
                 self._gpu_resident = (
-                    os.environ.get("XIAOTU_MOE_RESIDENT_DRAFT", "1") != "0"
+                    os.environ.get("XIAOTU_MOE_RESIDENT_DRAFT", "0") == "1"
                 )
-                if not self._gpu_resident:
+                if self._gpu_resident:
                     print(
-                        f"[xiaotu] WARNING: draft layer {prefix} forced onto CPU by "
-                        f"XIAOTU_MOE_RESIDENT_DRAFT=0. Speculative decoding is "
-                        f"net-negative with a CPU draft (measured 7.11 vs 10.76 t/s); "
-                        f"drop --speculative-config or unset that variable.",
+                        f"[xiaotu] WARNING: draft layer {prefix} 被显式 "
+                        f"XIAOTU_MOE_RESIDENT_DRAFT=1 强制常驻 GPU。"
+                        f"⛔ 2026-10-16 同口径实测它**比落 CPU 慢一倍、且比不开投机还慢**"
+                        f"(15.0 vs 30.1 vs 18.3 tok/s;真 agent 载荷/k=4/MBT=8192/TP=2/outlen=256)"
+                        f"⇒ 除非你正在复核该测量,否则请 unset 该变量。",
                         flush=True,
                     )
             else:
@@ -883,9 +921,10 @@ class CpuXiaotuMoE(nn.Module):
                 # draft 是 mandatory ⇒ 正常不会走到这里;真走到了说明显存彻底不够。
                 print(
                     f"[xiaotu] ERROR: draft layer {self.prefix} could not be made "
-                    f"GPU-resident. Speculative decoding is net-negative with a CPU "
-                    f"draft (measured 7.11 vs 10.76 t/s). DISABLE it: drop "
-                    f"--speculative-config, or lower XIAOTU_MOE_GPU_RESIDENT_LAYERS / "
+                    f"GPU-resident. The draft will run on CPU and pay the CPU MoE "
+                    f"cost per draft step (slower; not necessarily net-negative: "
+                    f"measured +21% decode in EXPERIMENTS B730/B739). To avoid it, "
+                    f"lower XIAOTU_MOE_GPU_RESIDENT_LAYERS / "
                     f"raise XIAOTU_MOE_RESIDENT_BUDGET_GB.",
                     flush=True,
                 )

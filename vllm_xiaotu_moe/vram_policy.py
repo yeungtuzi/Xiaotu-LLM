@@ -366,19 +366,19 @@ def emit_env(p: dict) -> str:
     _gpm = _env_gib("XIAOTU_GPU_PREFILL_SWITCH_TOKENS", 4096)
     lines.append(f"VLLM_XIAOTU_GPU_PREFILL_MIN_TOKENS={int(_gpm) if p['gpu_prefill'] else 0}")
     lines.append(f"XIAOTU_GPU_RESIDENT_LAYERS={p.get('resident_spec','')}")
-    # 【§508 更正】draft 上不上 GPU **不需要新旋钮**:hybrid_model.py:669-686 里
-    # "同一 prefix 第二次构造 = draft",默认 `XIAOTU_MOE_RESIDENT_DRAFT=1` ⇒
-    # **draft 层永远在 GPU**(实测 draft 走 CPU 时投机净负:7.11 vs 10.76 t/s)。
-    # 所以这里只输出"要不要显式关掉它",而 spec 本身由 `--speculative-config` 决定。
-    if p["spec_on_gpu"]:
-        lines.append("XIAOTU_MOE_RESIDENT_DRAFT=1")   # 默认值,显式写出便于审计
-    else:
-        # 【§594 修】**绝不能输出 DRAFT=0**:那表示"draft 层不进 GPU",会走 CPU 引擎,
-        # 而 §508 实测 draft 走 CPU 时投机是**净负**(7.11 vs 10.76 t/s)。
-        # 正确做法是**根本不传 `--speculative-config`**(整块关掉投机),而不是把 draft 放 CPU。
-        lines.append("# ⚠️ 优先级 3 不足:请**不要**传 --speculative-config(整块关掉投机);"
-                     "把 draft 放 CPU 是净负(§508:7.11 vs 10.76 t/s)")
-        lines.append("XIAOTU_MOE_RESIDENT_DRAFT=1")
+    # ⛔⛔ 2026-10-16 修【E 项根因】:原实现**两个分支都下发 `XIAOTU_MOE_RESIDENT_DRAFT=1`**
+    #    (`:374` / `:381`),且注释把 `=0` 定为"**绝不能输出**" ✗ —— 依据是 §508 的
+    #    「draft 走 CPU 时投机净负(7.11 vs 10.76 t/s)」。
+    #    ⭐ 该依据**已失效** —— 今天同口径实测(B840;真 agent 载荷 / k=4 / MBT=8192 /
+    #    TP=2 / outlen=256):
+    #      * draft 落 CPU   = **30.1 tok/s / TPOT 33.2 ms** ✓(最优,+64.5% vs 无投机)
+    #      * draft GPU 常驻 = **15.0 tok/s / TPOT 66.9 ms** ⛔(比"不开投机"的 18.3 还慢)
+    #    ⭐ 且**连"完全不开投机"都已 18.3 tok/s** ⇒ 7.11/10.76 两数**都低于今天基线**
+    #      ⇒ 必然来自更早、更慢的配置 ⇒ 用它封死 `=0`,等于**把系统锁在慢的一侧** ✗
+    #    ⇒ 现在:**不再下发该变量**(插件默认 = draft 落 CPU ✓);
+    #      要用常驻请**显式**在 env 里给 `XIAOTU_MOE_RESIDENT_DRAFT=1` ✓
+    lines.append("# XIAOTU_MOE_RESIDENT_DRAFT 不在此下发 ⇒ 插件默认 = draft 落 CPU")
+    lines.append("# (2026-10-16 实测:落 CPU 30.1 / 常驻 15.0 / 无投机 18.3 tok/s)")
     # 【§508】**恒 0**:GPU 预填充的活跃路径从引擎分片直接填 K-major,不需要 Python 副本;
     # 只有"引擎没有分片"的兜底路径才建副本(那时会打告警)。
     lines.append("XIAOTU_GPUPREFILL_WCOPY=0")

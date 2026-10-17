@@ -24,6 +24,8 @@
 #include <algorithm>
 #include <cstddef>
 #include <cstdint>
+#include <cstdlib>
+#include <immintrin.h>
 #include <vector>
 
 #include "../kernels/bf16_gemm.hpp"
@@ -73,6 +75,25 @@ inline float vhsum(Vec v) {
 // Row-range variant: computes C[i][j] only for j in [n0, n1), indexing W/S by the
 // GLOBAL row j so a caller can hand out disjoint row slices to different threads
 // (N-sliced decode). C keeps its full [M][N] row stride.
+// ⭐⭐ XIAOTU_MOE_PF_ROWS —— **fp8 解码路径的软件预取**(2026-10-16 加)。
+//   来由(读码 + 实测):同族的 `moe_v2_packed4_*.inc`(4bit 布局)有 12 处预取,
+//   而 **fp8 路径此前是 0 处**;`PF_ROWS` 自己的注释逐字写着:
+//     「…1 个 j 迭代(80 个 group ≈ 400–800 cycle ≈ 130–260 ns)**刚好等于 DRAM 延迟**
+//      ⇒ 余量太小,**行首/行尾仍在停等**。实测每线程只有 ~1.24 GB/s,而单核流式可达 ~36 GB/s」
+//   实测对照:GLM(fp8)decode 时 100.7 MB/层 ÷ 60 线程 ÷ 0.66 ms = **2.54 GB/s/线程** ⇒ 正落此区间 ✓
+//   ⛔ **纯预取提示,不改任何数值语义** ⇒ 结果逐位不变(与 packed4 的 PF_ROWS 同性质)✓
+//   调法:`XIAOTU_MOE_PF_ROWS=n`(1..4,默认 1 = 预取下一行;n 行 = 前瞻 n×K 字节)。
+inline int fp8_pf_rows() {
+    static const int v = []() {
+        const char* s = std::getenv("XIAOTU_MOE_PF_ROWS");
+        int n = s ? std::atoi(s) : 1;
+        if (n < 1) n = 1;
+        if (n > 4) n = 4;
+        return n;
+    }();
+    return v;
+}
+
 inline void matmul_fp8_quant_range(const uint16_t* A, const uint8_t* W, const float* S,
                                    float* C, int M, int N, int K,
                                    int groupN, int groupK, int n0, int n1) {
@@ -82,6 +103,7 @@ inline void matmul_fp8_quant_range(const uint16_t* A, const uint8_t* W, const fl
     if (n1 > N) n1 = N;
     if (n1 <= n0) return;
 #if defined(__AVX2__)
+    const int pf = fp8_pf_rows();   // ⭐ 只有 AVX2/AVX512 路径用到
     for (int i = 0; i < M; ++i) {
         const uint16_t* Arow = A + (size_t)i * K;
         float* Crow = C + (size_t)i * N;
@@ -95,8 +117,17 @@ inline void matmul_fp8_quant_range(const uint16_t* A, const uint8_t* W, const fl
                 Vec gacc = vzero();
                 int k = kbase;
                 int kend = (kbase + gk < K) ? (kbase + gk) : K;
-                for (; k + kVW <= kend; k += kVW)
+                for (; k + kVW <= kend; k += kVW) {
+                    // ⭐ 软件预取:每推进 64B,把「下面 pf 行」的同一 cache line 提前拉进 L1。
+                    //   价值在**行首/行尾**(顺序流由硬件预取器覆盖,行边界它覆盖不到)✓
+                    //   越界读**不会**触发异常(预取是提示),且行号已由 `j + r < n1` 界定 ✓
+                    if ((k & 63) == 0) {
+                        const int rmax = (j + pf < n1) ? pf : (n1 - j - 1);
+                        for (int r = 1; r <= rmax; ++r)
+                            _mm_prefetch((const char*)(Wrow + (size_t)r * K + k), _MM_HINT_T0);
+                    }
                     gacc = vfma(load_bf16_as_f32(Arow + k), load_fp8_as_f32(Wrow + k), gacc);
+                }
                 float gscalar = 0.f;
                 for (; k < kend; ++k)
                     gscalar += bf16::bf16_to_fp32(Arow[k]) * fp8::e4m3_to_fp32_scalar(Wrow[k]);

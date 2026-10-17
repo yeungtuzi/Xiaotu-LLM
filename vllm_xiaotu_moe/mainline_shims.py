@@ -839,6 +839,102 @@ def _install_oracle_shims() -> list[str]:
 
 
 # ---------------------------------------------------------------------------
+# shim 2b: FP8 专家块的 TP 补齐(TP>1 且 I/TP 不是 128 的整数倍)⭐ 2026-10-15
+# ---------------------------------------------------------------------------
+# ⛔ 问题(qfn 实测,2026-10-15):
+#   `I=640`、`TP=2` ⇒ 每 rank 分片 `ispp = 320`,而 `320 % 128 = 64 ≠ 0`
+#   ⇒ `refine_fp8_moe_block_shape` 返回精化形状 `(64, 64)`
+#   ⇒ 权重 QuantKey 变成 `GroupShape(row=64, col=64)` ⇒ **所有** FP8 MoE 内核都不支持 ✗
+#   ⇒ `NotImplementedError: No FP8 MoE backend supports the deployment configuration.`
+#      (`oracle/fp8.py:539`;DEBUG 日志里 13 个 FP8 MoE 后端**逐个**报
+#       `kernel does not support quantization scheme ... row=64,col=64`)
+#   ⭐ 对照:**GLM 在同一个 CPU 后端上 TP=2 正常** —— 因为 `I=1024 ÷ 2 = 512` 是 128 的整数倍 ✓
+#      ⇒ 差别**只在 `I/TP` 能否被 128 整除**,不是设备/后端/EP 问题 ✓
+#
+# ⭐ 上游本来就有解:`pad_tp_shard_to_weight_blocks`(`oracle/fp8.py:323`)把本地分片
+#   **补齐到完整检查点块**(320→384)⇒ 块保持 **128×128** ⇒ CPU 后端可接受 ✓;
+#   消费者 `routed_experts.py:389`(`moe_config.tp_shard_with_padding`)按补齐分片搬权重 ✓
+#   ⇒ 非死代码 ✓。我们的插件是**自己装配权重**,128 块更是它的**硬前提**
+#      (`gpu_prefill_fp8.py:50 FP8_BLOCK=128`、`staging_bytes` 显式 `del group_k`);
+#      `I=320` 会让 `320//128=2` 的尺度槽**静默少算** ✗ ⇒ 补齐对我们**必要且正确** ✓
+#
+# ⛔ 但它被一条前提挡住(`oracle/fp8.py:363`):
+#       `if is_checkpoint_fp8_serialized and config.moe_backend != "auto":`
+#   ⇒ **只有显式指定 moe 后端**才走补齐 ✗;`auto`(我们的用法)直接退化成 64×64 ✗
+# ⛔ 而"用 `--moe-backend <x>` 把前提满足掉"这条路**已实测否决**(2026-10-15 独立审计):
+#   显式后端之后 `select_fp8_moe_backend` 走 `_return_or_raise`(`oracle/fp8.py:454-478`)
+#   ⇒ **强制选定该后端且不回落**,而 SM80 上
+#      `supports_fp8() = has_device_capability(89)` = **False**(`platforms/cuda.py:605-606`)
+#   ⇒ Triton 对**任何** FP8 key 都 False(`triton_moe.py:158` 整块跳过)
+#   ⇒ 只是把 `NotImplementedError` 换成 `ValueError` ✗;且它**绕过**上面 CPU-first 的排序 ✗
+#   (`map_fp8_backend` 也没有 `cpu` 这个取值 ⇒ 无可用值 ✗)
+#
+# ⇒ 本 shim:**让 `auto` 时也执行那条补齐** ✓
+#   判据与上游函数**逐条一致**(不新增任何放宽),只是不再要求"显式后端" ✓;
+#   补齐不可能时(`pad` 返回 False 或抛错)**原样返回**上游结果 ⇒ 行为不劣化 ✓
+#
+# ⚠️ 必须补丁**两个**命名空间:`quantization/fp8.py:28-34` 用的是
+#    `from ...oracle.fp8 import resolve_fp8_moe_weight_block_shape` ⇒ 名字绑在**调用方**模块上,
+#    只改 `oracle.fp8` 的模块属性**不会**影响它 ✗(与本文件 shim 2 只依赖属性查找的情形不同)
+_FP8_PAD_TARGETS = (
+    "vllm.model_executor.layers.fused_moe.oracle.fp8",
+    "vllm.model_executor.layers.quantization.fp8",
+)
+
+
+def _install_fp8_block_pad_shim() -> list[str]:
+    try:
+        oracle = importlib.import_module(
+            "vllm.model_executor.layers.fused_moe.oracle.fp8"
+        )
+    except Exception as exc:  # noqa: BLE001
+        _log(f"skip fp8 block pad: {type(exc).__name__}: {exc}")
+        return []
+    pad = getattr(oracle, "pad_tp_shard_to_weight_blocks", None)
+    if pad is None or getattr(pad, "_xtu_shim", False):
+        _log("skip fp8 block pad: upstream has no pad_tp_shard_to_weight_blocks")
+        return []
+
+    applied: list[str] = []
+    for mod_name in _FP8_PAD_TARGETS:
+        try:
+            mod = importlib.import_module(mod_name)
+        except Exception as exc:  # noqa: BLE001
+            _log(f"skip {mod_name}: {type(exc).__name__}: {exc}")
+            continue
+        orig = getattr(mod, "resolve_fp8_moe_weight_block_shape", None)
+        if orig is None or getattr(orig, "_xtu_shim", False):
+            continue
+
+        @functools.wraps(orig)
+        def wrapper(config, weight_block_size, activation_key,
+                    is_checkpoint_fp8_serialized, _orig=orig, _pad=pad):
+            res = _orig(config, weight_block_size, activation_key,
+                        is_checkpoint_fp8_serialized)
+            if not mixed_mode_enabled():
+                return res
+            # 只在【上游会退化、而我们确实要补齐】的情形介入;其余原样返回 ✓
+            if getattr(config, "moe_backend", "auto") != "auto":
+                return res                       # 显式后端:上游自己会补齐 ✓
+            if getattr(config, "tp_shard_with_padding", False):
+                return res                       # 已经补齐过(幂等)✓
+            try:
+                if _pad(config, list(weight_block_size)):
+                    _log("fp8 moe block shape padded to the full checkpoint "
+                         f"block (tp={getattr(config, 'tp_size', '?')}, "
+                         f"ispp={getattr(config, 'intermediate_size_per_partition', '?')})")
+                    return list(weight_block_size), None
+            except Exception as exc:  # noqa: BLE001
+                _log(f"fp8 block pad not applicable: {type(exc).__name__}: {exc}")
+            return res
+
+        wrapper._xtu_shim = True  # type: ignore[attr-defined]
+        setattr(mod, "resolve_fp8_moe_weight_block_shape", wrapper)
+        applied.append(f"{mod_name.rsplit('.', 1)[-1]}.resolve_fp8_moe_weight_block_shape")
+    return applied
+
+
+# ---------------------------------------------------------------------------
 # shim 3: skip the AMX prepack
 # ---------------------------------------------------------------------------
 _PREPACK_PASSTHROUGH = {
@@ -1923,6 +2019,7 @@ def apply_mainline_shims() -> list[str]:
         # 而层的 residual 仍是全长 ⇒ mHC 的 `assert x.shape == (num_tokens, …)` 立刻失败
         # (c11 实测:long_300 从可用退回失败)。要开必须显式 `XIAOTU_CED_ATTN_ALIGN=1`。
         _install_oracle_shims,
+        _install_fp8_block_pad_shim,   # ⭐ 2026-10-15:TP>1 时 FP8 专家块补齐到完整 128 块
         _install_prepack_shims,
         _install_mxfp4_cpu_convert_shim,
         _install_input_ids_shim,

@@ -832,6 +832,10 @@ def _reserve_staging_from_model(runner) -> None:
     cands = []
     try:
         from vllm_xiaotu_moe import mixed_experts as _mx
+        # ⭐⭐ 【item④】`_GP_PROFILE_LAYERS` 在**权重加载期**(`process_weights_after_loading`)
+        #    就登记 ⇒ 它在 profile 期**非空**;而 `_GP_LAYERS` 只在引擎构建时(第一次
+        #    forward)才填 ⇒ profile 期**是空的** ⇒ 只问后者会"扫到 0 个"、占位 = 0 ✗
+        cands.extend(list(getattr(_mx, "_GP_PROFILE_LAYERS", [])))
         cands.extend(list(getattr(_mx, "_GP_LAYERS", {}).values()))
     except Exception:  # noqa: BLE001
         pass
@@ -842,6 +846,7 @@ def _reserve_staging_from_model(runner) -> None:
         except Exception:  # noqa: BLE001
             pass
     seen = set()
+    _best = None
     for m in cands:
         if id(m) in seen:
             continue
@@ -851,17 +856,53 @@ def _reserve_staging_from_model(runner) -> None:
             continue
         _asked += 1
         try:
-            need = max(need, int(f()))
+            v = int(f())
         except Exception:  # noqa: BLE001
             continue
-    print(f"[vllm-xtu-moe] profile 期占位:扫到 {_asked} 个可问 staging 的模块,"
-          f" max need = {need / 2**30:.2f} GiB", flush=True)
-    if need > 0:
-        reserve_staging_for_profile(need)
+        if v > need:
+            need, _best = v, m
+    # ⭐ 把**产生最大需求那个模块**的几何与 ns 打出来:ns 是除数,偏小⇒多算(抢 KV)、
+    #    偏大⇒少算(首次长请求 OOM)⇒ 它必须可见,而不是静默 ✗
+    _info = getattr(_best, "_prof_info", None) if _best is not None else None
+    _extra = ""
+    if isinstance(_info, dict) and _info:
+        _src = "引擎" if _info.get("engine") else "权重形状(引擎尚未构建)"
+        _extra = (f" [E={_info.get('E')} H={_info.get('H')} I={_info.get('I')}"
+                  f" ns={_info.get('ns')} group_k={_info.get('group_k')} 几何来源={_src}]")
+    print(f"[vllm-xtu-moe] profile 期 staging 记账:扫到 {_asked} 个可问 staging 的模块,"
+          f" max need = {need / 2**30:.2f} GiB{_extra}", flush=True)
+    if need <= 0:
+        print("[vllm-xtu-moe] ⚠️ profile 期 staging 记账:**扫到 0** ⇒ 本次 KV 会按"
+              "『没有 staging』定容 ⇒ 首次长请求可能 OOM ✗(须查 _GP_PROFILE_LAYERS 是否为空)",
+              flush=True)
+        return
+    # ⭐⭐【B512】优先让**产生最大需求那个模块**去分配**持久真缓冲** ✓
+    #    ⛔ 不能用替身代替:替身在 KV 定容测点之后**立刻被释放** ⇒ 那块显存被 KV 拿走
+    #       ⇒ 运行期再分配同一批缓冲 ⇒ **必然 OOM**(B444 原话 + B510/B512 实测)✗
+    #    ✅ 真缓冲 = 运行时复用的**同一批命名缓冲** ⇒ vLLM 测得到、且运行期缓存命中 ✓
+    _real_ok = False
+    _pref = getattr(_best, "prealloc_staging", None) if _best is not None else None
+    if callable(_pref):
+        try:
+            _real_ok = bool(_pref())
+        except Exception as _e:  # noqa: BLE001
+            print(f"[vllm-xtu-moe] ⛔ 真缓冲预分配抛异常(不掩盖):"
+                  f" {type(_e).__name__}: {_e}", flush=True)
+            _real_ok = False
+    if _real_ok:
+        print(f"[vllm-xtu-moe] ⭐ profile 期**真缓冲**已分配(不跑任何内核)"
+              f" ~{need / 2**30:.2f} GiB{_extra} ⇒ 进 vLLM 的 total_consumed ⇒ KV 据实定容 ✓",
+              flush=True)
+        return
+    # 回落:后端没有真分配接口(非 FP8),或分配失败。**必须出声** ✗
+    print("[vllm-xtu-moe] ⚠️ **回落**到替身占位(后端无真分配接口或真分配失败)"
+          "⇒ 替身在 KV 定容后即被释放 ⇒ 运行期可能 OOM ✗", flush=True)
+    reserve_staging_for_profile(need)
 
 
 def install_profile_guard() -> list[str]:
-    """把 `profile_run` 暴露给我们(用来① 设 `_IN_PROFILE_RUN` ② **profile 期占位 staging**)✓
+    """把 `profile_run` 暴露给我们(用来**设 `_IN_PROFILE_RUN`**,禁止 profile 期跑预填内核)✓
+    ⭐ 2026-10-15【B441】:占位**不再**挂在这里(会漏记)⇒ 见 `GPUWorker.determine_available_memory` ✓
 
     ⭐⭐ 2026-10-09 修(R38 复审后实测发现的真 bug):本构建的 worker 用的是 **V2** runner
     (`vllm/v1/worker/gpu_worker.py:551` → `vllm.v1.worker.gpu.model_runner.GPUModelRunner`),
@@ -893,12 +934,14 @@ def install_profile_guard() -> list[str]:
                 global _IN_PROFILE_RUN
                 _IN_PROFILE_RUN = True
                 try:
-                    # ⭐⭐ 先占位(让 vLLM 记账),再跑 profile —— **不跑预填内核** ✓
-                    _reserve_staging_from_model(self)
+                    # ⛔【B441 修】占位**不能**放在这里!实测(真模型启动,OOM 崩溃):
+                    #   vLLM 是在 `profile_run` **返回之后**才测 `after_profile.free_memory`
+                    #   ⇒ 在本函数的 finally 里释放 ⇒ 占位**必然漏记** ⇒ KV 把 0.9 用满
+                    #   ⇒ 随后真正的 tile 环要 800 MiB 时只剩 475 MiB ⇒ **OOM 崩溃** ✗
+                    #   ⇒ 已挪到下面包住 `GPUWorker.determine_available_memory` ✓
                     return orig_fn(self, *a, **kw)
                 finally:
                     _IN_PROFILE_RUN = False
-                    release_staging_reserve()
             profile_run._xtu_shim = True  # type: ignore[attr-defined]
             return profile_run
 
@@ -906,6 +949,74 @@ def install_profile_guard() -> list[str]:
         applied.append(f"{mod_name.rsplit('.', 1)[-1]}.GPUModelRunner.profile_run")
     if not applied:
         return []
+
+    # ⭐⭐【B441 修 · 关键】占位必须**活到 vLLM 测完 KV 预算**那一刻 ✓
+    #   vLLM `GPUWorker.determine_available_memory()` 的真实结构(读码,mainline 树):
+    #       with memory_profiling(self.init_snapshot, ...) as profile_result:
+    #           self.model_runner.profile_run(...)
+    #       free_gpu_memory = profile_result.after_profile.free_memory   # ← 测点在这
+    #   ⇒ 旧实现把 `release_staging_reserve()` 放在 `profile_run` 的 finally 里
+    #     ⇒ **释放发生在测点之前** ⇒ 占位必然漏记 ⇒ KV 把 `gpu_util` 用满
+    #     ⇒ 随后真正的 tile 环分配只剩 475 MiB ⇒ **OOM 崩溃**(B441 实测)✗
+    #   ⇒ 正确位置 = 包住**整个** `determine_available_memory`:
+    #     占位是 category 2 的【活引用】⇒ `memory_profiling` 里的 `empty_cache()`
+    #     **不会**回收它(empty_cache 只回收 cache 块,不动活张量)⇒ 必被计入
+    #     `after_profile` ⇒ KV 预算**恰好少 need** ⇒ 释放后那块显存正好留给真正的环 ✓
+    #   ⚠️⚠️【B442 实测踩坑】该模块里的类叫 **`Worker`**(`gpu_worker.py:187`)✗,
+    #      **不是** `GPUWorker` —— 我第一版写 `from ... import GPUWorker` ⇒ ImportError
+    #      被下面那个 `except` **静默吞掉** ⇒ shim 根本没装;而日志只显示
+    #      `mainline shims applied (32)`(**没有 +1**)⇒ 白跑一次启动才发现 ✗
+    #      ⇒ ① 类名改为 `Worker`(带回退)② **装不上必须出声**,不许静默 ✗
+    _gpf_worker = None
+    for _wn in ("Worker", "GPUWorker"):
+        try:
+            _gpf_worker = getattr(
+                __import__("vllm.v1.worker.gpu_worker", fromlist=[_wn]), _wn)
+            break
+        except Exception:  # noqa: BLE001
+            continue
+    if _gpf_worker is None:
+        print("[vllm-xtu-moe] ⚠️ profile 占位:**装不上** gpu_worker shim(Worker 找不到)"
+              "⇒ KV 预算**不会**为 staging 留量 ✗", flush=True)
+    else:
+        orig_dam = getattr(_gpf_worker, "determine_available_memory", None)
+        if orig_dam is None or getattr(orig_dam, "_xtu_shim", False):
+            print("[vllm-xtu-moe] ⚠️ profile 占位:`determine_available_memory` 缺失或已装"
+                  "⇒ 本次**未**新装 ✗", flush=True)
+        else:
+            @functools.wraps(orig_dam)
+            def determine_available_memory(self, *a, **kw):
+                # ⚠️ 参数是 **Worker**,而 `_reserve_staging_from_model` 要的是
+                #    **runner**(它读 `runner.model` 作兜底)⇒ 必须取 `.model_runner` ✓
+                # ⭐⭐【B512 · 2026-10-15 修】恢复调用,但**不再放替身** ✓
+                #   * 本 hook 是**唯一被证明会执行**的记账落点:类名 `Worker`
+                #     (`gpu_worker.py:187`)、方法体 `600→770`、KV 日志 `:721` 在其内 ✓
+                #   * ⛔ 原先"由 `mixed_experts` 在 profile 窗口内分配真缓冲"的落点
+                #     (`mixed_experts.py:1771`)被套在 `elif _gpu_pf:` 里,而 profile 期
+                #     `_gpu_pf ≡ False` ⇒ **结构性不可达** ⇒ 记账**从未发生**(B508/B510)✗
+                #   * ✅ 现由 `_reserve_staging_from_model` 调**各层的 `prealloc_staging()`**
+                #     分配**持久真缓冲** ⇒ vLLM 测得到 ⇒ KV 据实定容 ✓
+                #   * ⛔ 失败**必须出声**:静默退化正是 B510 那次事故的形态 ✗
+                try:
+                    _reserve_staging_from_model(getattr(self, "model_runner", None))
+                except Exception as _e:  # noqa: BLE001
+                    print("[vllm-xtu-moe] ⛔ profile 期 staging 记账失败(不掩盖)"
+                          f" ⇒ 本次 KV 可能按『没有 staging』定容:"
+                          f" {type(_e).__name__}: {_e}", flush=True)
+                return orig_dam(self, *a, **kw)
+
+            determine_available_memory._xtu_shim = True  # type: ignore[attr-defined]
+            _gpf_worker.determine_available_memory = determine_available_memory
+            applied.append(f"{_gpf_worker.__module__}.{_gpf_worker.__name__}"
+                           ".determine_available_memory")
+            # ⛔【B512 修 · R63-3】旧文案声称"占位已挂到…(预算恰好少 need)"✗,
+            #   而 B444 已把该处的替身删空 ⇒ 那是一句**谎报**,曾把判断带偏两轮 ✗
+            #   ⇒ 新文案只描述**能力**,真实结果由 `_reserve_staging_from_model` 的
+            #     运行时锚点(带 need/E/H/I 数值)负责报出 ✓
+            print("[vllm-xtu-moe] ⭐ profile 期 staging 记账钩子已挂到 "
+                  f"{_gpf_worker.__name__}.determine_available_memory"
+                  "(将由各层 prealloc_staging() 分配**持久真缓冲**;真实结果见"
+                  "『profile 期 staging 记账:… max need = …』那行)✓", flush=True)
 
     # 关键的一半:KV cache 定容完成 = startup 结束。
     try:
@@ -953,6 +1064,8 @@ def install_profile_guard() -> list[str]:
                 return orig_warm(self, *a, **kw)
             finally:
                 _IN_WARMUP[0] = False
+                # ⛔【B444】这里**不再释放任何"占位"** ✗ —— 真缓冲由 mixed_experts
+                #   在 profile 窗口内分配并**常驻**(vLLM 已据实给 KV 定容)✓
                 if _IN_STARTUP[0]:
                     _IN_STARTUP[0] = False
                     print("[vllm-xtu-moe] worker startup finished (KV sized + graphs "
@@ -968,27 +1081,39 @@ def install_profile_guard() -> list[str]:
 def staging_tile_experts(n_experts: int) -> int:
     """【微 ping/pong】每个 staging tile 覆盖多少专家。
 
-    `XIAOTU_GPF_STAGE_TILE_E`:
-      * **`0`(默认)或 `>= E`** ⇒ **整层** —— 即现行行为,记账与分配逐字不变 ✓
-      * `k`(0<k<E)⇒ 每槽只装 k 个专家的权重 ⇒ 环变小,代价是每层多几次 DMA/launch
+    ⭐⭐ 2026-10-15 用户裁定:「**所有 GPU prefill 链路都要走 tile 形态(微 ping/pong)**,
+    不然显存肯定不够;而且**之前明确要求去掉之前的按层缓冲机制**」✓
+    ⇒ 本函数**永不返回 `E`(整层)** —— 按层缓冲那条路**已不存在** ✗
 
-    ⭐⭐ **记账(`staging_bytes`)与分配(槽形状)必须共用本函数** ——
+      * **默认(env 未设 / `0` / `>= E`)** ⇒ `max(1, E // 3)`
+        (E=288 时 = **96**,即先前生产在用、且**已实测**过的值 ✓)
+      * `XIAOTU_GPF_STAGE_TILE_E=k` ⇒ 用 k,但**强制夹到 `[1, E-1]`**
+        ⇒ ⛔ `=0` **不再能**退回整层(按层路径已删除 ✓)
+
+    ⭐⭐ **记账(`staging_bytes` / `fp8_staging_bytes`)与分配(槽形状)必须共用本函数** ——
     这是"预检说够、实际 OOM"的唯一防线(§600/§601 两次事故都是口径不一致造成的)✗
+    ⭐ 现在两者**都只可能是 tile 形态** ⇒ 结构上不可能再分叉 ✓
     """
     E = int(n_experts)
-    if E <= 0:
-        return 0
+    if E <= 1:
+        return max(1, E)
     try:
         v = int(os.environ.get("XIAOTU_GPF_STAGE_TILE_E", "0") or 0)
     except (TypeError, ValueError):
         v = 0
-    return E if (v <= 0 or v >= E) else v
+    if v <= 0 or v >= E:
+        v = max(1, E // 3)
+    return min(max(1, int(v)), E - 1)
 
 
 def stage_tiles(n_experts: int) -> list:
     """`[(e0, e1), ...]` —— 按 tile 切专家维。
 
-    整层时恰好返回 `[(0, E)]` ⇒ 调用方循环一次,**行为与改动前等价** ✓
+    ⭐【2026-10-17 注释更正】原句「整层时恰好返回 `[(0, E)]` ⇒ 调用方循环一次,
+    行为与改动前等价」**已过期** ✗ —— 见 `staging_tile_experts` 的文档串:
+    2026-10-15 用户裁定去掉按层缓冲后,该函数**永不返回 `E`** ✓
+    ⇒ 本函数是它的**纯派生**(`t = staging_tile_experts(E)` ✓),
+      `E >= 2` 时 `t <= E-1` ⇒ **至少 2 个 tile**,**不可能**再返回 `[(0, E)]` ✓
     """
     E = int(n_experts)
     t = staging_tile_experts(E)
@@ -1127,7 +1252,7 @@ def _dma_hostbuf(engine, which: int, node: int, nbytes: int, device) -> torch.Te
 
 
 def _dma_hostbuf_range(engine, which: int, node: int, device,
-                       off: int, size: int) -> torch.Tensor:
+                       off: int, size: int, slot: int = 0) -> torch.Tensor:
     """【微 ping/pong】只搬 node 缓冲里 `[off, off+size)` 这一段(而不是整段)。
 
     ⭐⭐ 为什么**必须**这样 —— 2026-10-09 实测教训(§18):
@@ -1144,7 +1269,13 @@ def _dma_hostbuf_range(engine, which: int, node: int, device,
     fn = getattr(engine, "copy_hostbuf_to_device_2d", None)
     if fn is None:
         return None                      # 引擎不支持 ⇒ 调用方回退整段路径
-    t = _reuse(("dma_tile", int(which)), (int(size),), device)
+    # ⭐⭐⭐【B995 修】中间缓冲按【槽号】隔离✗
+    #   原键 `("dma_tile", which)` 只有 which(0=w13/1=w2)，没有槽号
+    #   ⇒ `binding.cpp:1115` 作者实测原话：【one staging buffer per weight
+    #   block serializes every DMA in the layer behind the previous copy】
+    #   ⇒ 槽 s+1 的 H2D 必须等槽 s 的转置读完才能写，双缓冲形同虚设✗
+    #   现在按 slot 隔离 ⇒ 各槽各自一块 ⇒ DMA 可真并发✓
+    t = _reuse(("dma_tile", int(which), int(slot)), (int(size),), device)
     stream = torch.cuda.current_stream(device).cuda_stream
     got = fn(int(which), int(node), int(off), t.data_ptr(),
              int(size), int(size), int(size), 1, stream)
@@ -1391,11 +1522,18 @@ def kmajor_from_engine_shards_noraw(engine, device, hidden: int, inter: int,
     Et = max(0, _e1 - _e0)
     if Et <= 0:
         return None
+    # 【2026-10-16 goal-A1 · 废除"按层缓冲"】此处原有 `if dst is None:` ⇒ 每次新建
+    # (Et, rb13, 2I)/(Et, H/gk, 2I)/(Et, rb2, H)/(Et, I/gk, H) 四块**整层**缓冲。
+    # 那就是用户 2026-10-15 明令废除的"按层缓冲(太消耗显存)"✗ ⇒ **已删除** ✓
+    # ⭐ 现在 `dst` 必须由调用方(tile 环)提供 —— 环是唯一形态 ✓
+    # 为什么安全:`mixed_experts.py` 里唯一的 `dst=None` 整层兜底已同批删除 ✓;
+    #   实测 `logs/glm53_b550.log` 中 `gp-tile` 2 次、整层标记 0 次 ⇒ 运行期从不走整层 ✓
     if dst is None:
-        dst = (torch.empty((Et, rb13, 2 * I), dtype=torch.uint8, device=device),
-               torch.empty((Et, H // gk, 2 * I), dtype=torch.uint8, device=device),
-               torch.empty((Et, rb2, H), dtype=torch.uint8, device=device),
-               torch.empty((Et, I // gk, H), dtype=torch.uint8, device=device))
+        raise RuntimeError(
+            "[vllm-xtu-moe] ⛔ kmajor_from_engine_shards 收到 dst=None:"
+            "按层缓冲已于 2026-10-16 废除(goal-A1),必须由 tile 环提供 dst ✗"
+            " —— 若在此看到本行,说明有调用方仍在走【整层】路径,请改走 tile 环 ✓"
+        )
     c13, cr13 = int(geo["w13_cbytes"]), int(geo["w13_crows"])
     c2, cr2 = int(geo["w2_cbytes"]), int(geo["w2_crows"])
     # 【2026-10-04 goal-A 诊断】把 `dma`/`tr` 两相接**实际生效路径**上。

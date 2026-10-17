@@ -1,5 +1,19 @@
 # AGENTS.md —— 本仓库对自动化代理的强制纪律
 
+## ⛔⛔⛔ 【环境事实 · 2026-10-15】这是**两台机器**,别搞混 ⇒ 先读 `dev-docs/ENV_TWO_MACHINES.md`
+
+> **用户原话(2026-10-15)**:"你先把**远程开发环境**和**本地 DSH 环境**这个问题**醒目记录**下来,**免得后续每次会话我都要解释一下**"
+
+⭐ **一句话**:我(DSH / GUI :3080)跑在一台 **8 核小 VM(hostname `harness`,工作目录 `/root/lvllm`)** 上;
+**所有 GPU / vLLM / 基准的"重活"都在远端 `gpu` 执行器上跑**(192 核 / 1.5 TiB / 3×A100)✓
+⛔ ⇒ **本机没有 GPU、没有 conda env、没有 vLLM、没有模型权重、没有 vLLM 树** ✗ —— **永远不要在本机启动 vllm** ✗
+⭐ **连远端只有一种姿势**:`ssh -F /root/lvllm/tmp/sshcfg gpu` ✓
+  (**裸 `ssh gpu` 会 "Could not resolve hostname"** ✗ —— 那不是机器故障,是没读配置)
+⛔ **`/home/user/...` 开头的路径默认是【远端】路径** ✗;本机 `/home/user/lvllm` 是**一个已断的 sshfs**
+  (半死时会进 `D` 状态、连 `timeout` 都杀不掉 ⇒ 表现为"agent 卡住")✗
+⭐ 每条 ssh **自带 `timeout`**;长任务 **后台 + 轮询日志**,**不许无限等** ✓
+⇒ **对照表 / 路径映射 / 纪律全文**:**`dev-docs/ENV_TWO_MACHINES.md`(唯一权威源 ✓)**
+
 ⭐ **新会话/续做前先读** `dev-docs/NEW_SESSION_BOOTSTRAP.md`(一页:模型×精度×实验线对照、今晚两个硬雷、判卡死判据、反退化纪律、待办)✓
 
 ⭐ **当前任务交接**:`dev-docs/HANDOFF_DEGEN_AND_MBT_2026-10-06.md`(生产退化诊断 + MBT 显存预算;⚠️ 与 `HANDOFF_W4A8_2026-10-06.md` 是两个不同任务 ✗)
@@ -34,8 +48,8 @@
 
 | 缩写 | 含义(**精度是定义的一部分,不可省** ✗) |
 |---|---|
-| **qfn** | ⚠️ **第三方量化**的 Qwen3.8-Flash-Next(**MXFP4-FP8**)—— 引擎优化实验用的替代模型 ✓ |
-| **qfn官方** | **官方量化**的 Qwen3.8-Flash-Next(**FP8**)—— 与 `qfn` **不是同一个东西** ✗ |
+| ⭐ **qfn** | **官方量化**的 Qwen3.8-Flash-Next(**FP8**)—— 引擎优化实验用的替代模型 ✓
+| ~~**qfn官方**~~ | ⛔ **已废弃的同义词**(**2026-10-15 用户明令:`qfn` 即官方版**);旧文里的 `qfn官方` 一律读作 `qfn` ✓ |
 | **ds41f** | **官方量化**的 DeepSeek-V4.1-Flash(**FP8 稠密 + FP4 专家** ✓)|
 | **glm** | **官方量化**的 GLM-5.3-Flash ✓ |
 | ⭐ **生产服务** | 本地 `vllm-xtu-moe` 服务的 **ds41f**,`TP=2`(GPU1+GPU2)✓ —— **就是我自己的推理后端** ✗ |
@@ -44,7 +58,10 @@
 | ⭐ **外网** | **中国大陆【境外】的网站** —— 已知的主要是 **github / huggingface / google** 等 ✓ ⇒ **必须走代理** ✓。⭐ **国内镜像不算外网**(modelscope.cn / hf-mirror.com ⇒ **直连**)✓ |
 
 ⚠️ **两条硬含义**:
-1. ⭐ 说 **qfn** 时,默认指**第三方量化的 MXFP4-FP8** ✓;要指官方那个必须写 **qfn官方** ✓
+1. ⭐⭐ **2026-10-15 用户明令**:**「我已经删除了那个过时的 qfn 量化版…即日起,黑话中 qfn 就是指官方版」** ✓
+   ⇒ **`qfn` = 官方量化的 Qwen3.8-Flash-Next(FP8)**,**没有第二种含义** ✗
+   ⚠️ **第三方 MXFP4-FP8 版(作者 `tcclaviger`,已弃用)的检查点【已被删除】** ⇒
+     凡旧文/旧台账里把 `qfn` 当"第三方 MXFP4"用的地方,**按当时事实理解,不得外推到今天的 `qfn`** ✗
 2. ⭐ **"测试服务 = 开发分支 + qfn"** ⇒ **凡是"在测试服务上验的"结论,都属于 qfn 线** ✓
    ⇒ **不能自动外推到生产(ds41f)** ✗ ⇒ 要上生产**必须再验一次** ✓(见 `dev-docs/NEW_SESSION_BOOTSTRAP.md` §0.5)
 
@@ -388,8 +405,8 @@ DRY=1 scripts/apply_xtu_patches.sh <树>            # 只试第一条(系列必�
 * ⭐ **`present` 才是"可打开"的机制** ✓(对话末尾会出现可点开的卡片/按钮 ✓);
   **只在回复里写路径是不够的** ✗(用户实测:没有出现打开按钮 ✗)
 * ✅ 回复里**同时**写**以工作目录为根的完整相对路径**(行内代码 ✓)⇒ 便于复制/引用 ✓
-  ⇒ 例如 `vllm-xiaotu-moe/dev-docs/FORUM_REPLIES.md` ✓
-* ⚠️ **工作目录是 `/home/user/lvllm`** ✓,项目在 `vllm-xiaotu-moe/` 下 ⇒ 别漏这一层 ✓(虽非"可打开"的原因,但引用会错 ✗)
+  ⇒ 例如 `repos/vllm-xiaotu-moe/dev-docs/FORUM_REPLIES.md` ✓
+* ⚠️ **工作目录是 `/root/lvllm`** ✓(**2026-10-15 更正**:旧文写 `/home/user/lvllm` ✗ —— 那是**迁移前**的宿主口径;本机是 harness VM,`/home/user/lvllm` 现为**已断的 sshfs** ✗ ⇒ 见 `dev-docs/ENV_TWO_MACHINES.md`),项目在 `repos/vllm-xiaotu-moe/` 下 ⇒ 别漏这两层 ✓(虽非"可打开"的原因,但引用会错 ✗)
 * ✅ **一次会话里凡是我产出的文档,收尾时要 `present`**(二进制 PDF/PPTX 也可 present ✓,但预览能力取决于 DSH ✓)
 
 ## ⛔ 用户 QA 台账纪律(用户 2026-10-03 提出)

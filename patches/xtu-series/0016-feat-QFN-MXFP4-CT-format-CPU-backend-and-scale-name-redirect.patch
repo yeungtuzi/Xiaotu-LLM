@@ -1,0 +1,159 @@
+diff --git a/vllm/model_executor/layers/linear.py b/vllm/model_executor/layers/linear.py
+index 65cda32..f99bfc2 100644
+--- a/vllm/model_executor/layers/linear.py
++++ b/vllm/model_executor/layers/linear.py
+@@ -670,6 +670,12 @@ class DCPGroupColumnParallelLinear(ColumnParallelLinear):
+         return out[..., start : start + n, :].contiguous()
+ 
+ 
++_XTU_UNFUSED_NAMES = frozenset({
++    "in_proj_qkv", "in_proj_z", "in_proj_b", "in_proj_a",  # Qwen3.8-Flash-Next GDN 未融合名
++    "q_proj", "k_proj", "v_proj",                          # 经典 QKV 未融合名
++})
++
++
+ class MergedColumnParallelLinear(ColumnParallelLinear):
+     """Packed linear layers with column parallelism.
+ 
+@@ -984,6 +990,35 @@ class MergedColumnParallelLinear(ColumnParallelLinear):
+                 param = getattr(self, name, self)
+             if param is None and name == "bias":
+                 continue
++            if param is self:
++                _base = name.rsplit(".", 1)[-1]
++                # [xtu-2] CT 的块量化 scheme(CompressedTensorsW8A16Fp8)在 create_weights
++                # 时把 scale 注册为 "weight_scale",而检查点给的名字是 "weight_scale_inv"
++                # (该改名要到 process_weights_after_loading 才发生,
++                #  见 compressed_tensors_w8a16_fp8.py:121-135)。
++                # ⇒ 加载期把它【重定向】到已存在的 weight_scale:
++                #   不新增参数 ⇒ 不会内存×2;且其后 process_weights_after_loading
++                #   仍会把它改名成 weight_scale_inv ⇒ 最终名字与权威约定一致。
++                if _base == "weight_scale_inv" and hasattr(self, "weight_scale"):
++                    param = self.weight_scale
++                # [xtu-6] 检查点里的【未融合】名(其权重已由 packed_modules_mapping 折进
++                # 融合参数)。上游原实现 getattr(..., self) 会静默兜底成【模块】,随后
++                # param.data 抛 AttributeError 直接崩掉引擎(EXPERIMENTS B477)。
++                elif _base not in _XTU_UNFUSED_NAMES:
++                    raise ValueError(
++                        "[xtu-6] unresolvable weight name=%r on %r; neither a "
++                        "weight_scale_inv redirect nor a known unfused name, so refusing "
++                        "to skip blindly (upstream would fall back to the module). "
++                        "See EXPERIMENTS B477/B478/B481." % (name, getattr(self, "prefix", "?"))
++                    )
++                else:
++                    _n = getattr(self, "_xtu_unresolved_names", 0) + 1
++                    self._xtu_unresolved_names = _n
++                    logger.warning_once(
++                        "[xtu-6] skip unfused weight name=%s on %s (count=%d)",
++                        name, getattr(self, "prefix", "?"), _n,
++                    )
++                    continue
+             param.weight_loader(param, loaded_weight, shard_id)
+             logger.debug(
+                 "Loaded shard %s with shape %s into %s.%s",
+@@ -1338,6 +1373,35 @@ class QKVParallelLinear(ColumnParallelLinear):
+                 param = getattr(self, name, self)
+             if param is None and name == "bias":
+                 continue
++            if param is self:
++                _base = name.rsplit(".", 1)[-1]
++                # [xtu-2] CT 的块量化 scheme(CompressedTensorsW8A16Fp8)在 create_weights
++                # 时把 scale 注册为 "weight_scale",而检查点给的名字是 "weight_scale_inv"
++                # (该改名要到 process_weights_after_loading 才发生,
++                #  见 compressed_tensors_w8a16_fp8.py:121-135)。
++                # ⇒ 加载期把它【重定向】到已存在的 weight_scale:
++                #   不新增参数 ⇒ 不会内存×2;且其后 process_weights_after_loading
++                #   仍会把它改名成 weight_scale_inv ⇒ 最终名字与权威约定一致。
++                if _base == "weight_scale_inv" and hasattr(self, "weight_scale"):
++                    param = self.weight_scale
++                # [xtu-6] 检查点里的【未融合】名(其权重已由 packed_modules_mapping 折进
++                # 融合参数)。上游原实现 getattr(..., self) 会静默兜底成【模块】,随后
++                # param.data 抛 AttributeError 直接崩掉引擎(EXPERIMENTS B477)。
++                elif _base not in _XTU_UNFUSED_NAMES:
++                    raise ValueError(
++                        "[xtu-6] unresolvable weight name=%r on %r; neither a "
++                        "weight_scale_inv redirect nor a known unfused name, so refusing "
++                        "to skip blindly (upstream would fall back to the module). "
++                        "See EXPERIMENTS B477/B478/B481." % (name, getattr(self, "prefix", "?"))
++                    )
++                else:
++                    _n = getattr(self, "_xtu_unresolved_names", 0) + 1
++                    self._xtu_unresolved_names = _n
++                    logger.warning_once(
++                        "[xtu-6] skip unfused weight name=%s on %s (count=%d)",
++                        name, getattr(self, "prefix", "?"), _n,
++                    )
++                    continue
+             param.weight_loader(param, loaded_weight, shard_id)
+             logger.debug(
+                 "Loaded shard %s with shape %s into %s.%s",
+diff --git a/vllm/model_executor/layers/quantization/compressed_tensors/compressed_tensors.py b/vllm/model_executor/layers/quantization/compressed_tensors/compressed_tensors.py
+index a3fc11b..dcb0107 100644
+--- a/vllm/model_executor/layers/quantization/compressed_tensors/compressed_tensors.py
++++ b/vllm/model_executor/layers/quantization/compressed_tensors/compressed_tensors.py
+@@ -716,7 +716,7 @@ class CompressedTensorsConfig(QuantizationConfig):
+         via Humming kernel."""
+         if input_quant is None:
+             return False
+-        is_pack_format = format == CompressionFormat.pack_quantized.value
++        is_pack_format = format in (CompressionFormat.pack_quantized.value, "mxfp4-pack-quantized")
+         is_channel_group = weight_quant.strategy in (
+             QuantizationStrategy.CHANNEL.value,
+             QuantizationStrategy.GROUP.value,
+@@ -819,7 +819,7 @@ class CompressedTensorsConfig(QuantizationConfig):
+             )
+ 
+         if self._is_wNa16_group_channel(weight_quant, input_quant) and (
+-            format == CompressionFormat.pack_quantized.value
++            format in (CompressionFormat.pack_quantized.value, "mxfp4-pack-quantized")
+         ):
+             return CompressedTensorsWNA16(
+                 num_bits=weight_quant.num_bits,
+diff --git a/vllm/model_executor/layers/quantization/compressed_tensors/compressed_tensors_moe/compressed_tensors_moe_w4a4_mxfp4.py b/vllm/model_executor/layers/quantization/compressed_tensors/compressed_tensors_moe/compressed_tensors_moe_w4a4_mxfp4.py
+index 4dd1e7a..f123f42 100644
+--- a/vllm/model_executor/layers/quantization/compressed_tensors/compressed_tensors_moe/compressed_tensors_moe_w4a4_mxfp4.py
++++ b/vllm/model_executor/layers/quantization/compressed_tensors/compressed_tensors_moe/compressed_tensors_moe_w4a4_mxfp4.py
+@@ -6,6 +6,10 @@ import torch
+ 
+ import vllm.model_executor.layers.fused_moe.modular_kernel as mk
+ from vllm.logger import init_logger
++from vllm import envs
++from vllm.model_executor.layers.fused_moe.experts.cpu_moe import (
++    CPUExpertsMxfp4,
++)
+ from vllm.model_executor.layers.fused_moe import (
+     FusedMoeWeightScaleSupported,
+     RoutedExperts,
+@@ -61,7 +65,17 @@ class CompressedTensorsW4A4Mxfp4MoEMethod(CompressedTensorsMoEMethod):
+         # repacks weights and scales, and the megakernels take the checkpoint
+         # tensors as they are.
+         self.use_cutlass_mxfp4 = CutlassExpertsMxfp4._supports_current_device()
+-        if moe.moe_backend == "b12x" or is_flashinfer_moe_ep_backend(moe.moe_backend):
++        # [xtu-9] 主机驻留(host-resident)的 MXFP4 专家必须走 **CPU 后端**,且**优先于一切** ✓
++        #   本项目的 CPU 专家引擎直接吃检查点原始 MXFP4 打包,不做任何 GPU 重排 ✓
++        #   ⚠️ 必须排在 `elif self.use_cutlass_mxfp4` **之前** —— 否则 SM100 上本分支永不可达 ✗
++        #   ⚠️ 必须显式 `use_cutlass_mxfp4 = False` —— 否则加载链的首个分支仍按 CUTLASS 走 ✗
++        #   ⇒ 语义逐条对齐 2026-10-05 实测可跑的 devpatch #9 ✓(B320 / qmx_cpu3.1778161.log)
++        if envs.VLLM_EXPERTS_LOAD_DEVICE == "cpu":
++            self.mxfp4_backend = Mxfp4MoeBackend.CPU
++            self.experts_cls = CPUExpertsMxfp4
++            self.use_cutlass_mxfp4 = False
++            logger.info_once("[xtu-9] MXFP4 MoE -> CPU 后端, experts_cls=CPUExpertsMxfp4")
++        elif moe.moe_backend == "b12x" or is_flashinfer_moe_ep_backend(moe.moe_backend):
+             self.mxfp4_backend, experts_cls = select_mxfp4_moe_backend(moe)
+             assert experts_cls is not None
+             self.experts_cls = experts_cls
+@@ -226,6 +240,13 @@ class CompressedTensorsW4A4Mxfp4MoEMethod(CompressedTensorsMoEMethod):
+             replace_parameter(layer, "w2_weight_scale", w2_scale)
+         elif self.mxfp4_backend in B12X_BACKENDS or current_platform.is_xpu():
+             pass
++        elif self.mxfp4_backend == Mxfp4MoeBackend.CPU:
++            # [xtu-9] CPU 后端 = 树外引擎,直接吃检查点原始 uint8/e8m0 打包(block-32)✓
++            #   ⇒ **必须跳过** Marlin 重打包,否则主机张量会被喂给 `_C::gptq_marlin_repack` ✗
++            #   (2026-10-15 实证:`NotImplementedError: ... 'CPU' backend`,worker 起 2 分钟即死 ✗)
++            #   ⇒ 与 shim5(`convert_weight_to_mxfp4_moe_kernel_format` 对 CPU 原样返回)**同语义** ✓
++            #   ⇒ 对齐 devpatch #9 后半段(`process_weights_after_loading` 屏蔽该次重排)✓
++            pass
+         else:
+             logger.warning_once(
+                 "Your GPU does not have native support for FP4 computation "

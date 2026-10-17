@@ -12,3 +12,4 @@
 0012-sparse-MLA-prefill-2-D-BLOCK_H-tile-2.89x-on-th.patch
 0013-Revert-feat-MiMo-V2.5-SM80-build-all-3-MTP-dept.patch
 0015-feat-GLM-5.3-fp8_ds_mla-KV-cache-on-the-SM8x-sp.patch
+0016-feat-QFN-MXFP4-CT-format-CPU-backend-and-scale-name-redirect.patch

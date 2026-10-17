@@ -79,8 +79,12 @@ for p in paths:
     # ---- §2.4 请求数下限 ----
     n = len(good)
     if A.conc:
-        need = 16
-        chk(n >= need, "S4", "§2.4 n ≥ %d(并发 C=%d)" % (need, A.conc), "实际 n=%d" % n)
+        # 2026-10-15 修订(docs/BENCH_PROTOCOL.md §8.1,用户定案):
+        #   固定基准矩阵只测 C∈{1,2,4},下限改为 **n ≥ 4×C**
+        #   (C=1⇒4、C=2⇒8、C=4⇒16)。旧值硬编码 16 ⇒ C=1/2 会被误判为不通过 ✗。
+        #   ⚠️ C=4 时新下限仍 = 16 ⇒ 与旧口径在最高档完全一致 ✓
+        need = max(4 * int(A.conc), 4)
+        chk(n >= need, "S4", "§8.1 n ≥ 4×C = %d(并发 C=%d)" % (need, A.conc), "实际 n=%d" % n)
     # ---- §2.7 健康列必须可得 ----
     chk(all("deg" in r for r in good), "S5", "§2.7 每条都有 deg(健康列可算)")
     deg = st.median(r["deg"] for r in good)

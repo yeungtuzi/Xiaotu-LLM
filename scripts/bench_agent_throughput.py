@@ -50,8 +50,15 @@ def deg(t, n=8):
 
 def one(prompt, outlen, port, model, sink, tag):
     """流式发一条:记 ttft / 末 token 时刻 / chunks(≈解码步数)/ 全文。"""
+    # ⭐⭐【2026-10-17 用户裁定 · QA #264】**不得强制输出**:`max_tokens` 仅作上限,模型自然结束 ✓
+    #   废止旧口径 `"min_tokens": outlen` + `"ignore_eos": True` ✗
+    #   ⛔ 旧口径的副作用(协议 §2.7/§4.2 自述):强制长度把生成推进"复制循环"体制
+    #      ⇒ **AL 虚高、tok/s 假快**、`deg` 告警 ⇒ **我们自己的数字被自己的口径污染** ✗
+    #   ⚠️ 连带重构(缺一即不可读):
+    #     ① 长度不再固定 ⇒ `tok/s` **失去可比性** ⇒ ⭐ **主判据改为"步时"**(协议 §4.1 ✓)
+    #     ② **必须同报**【实际输出长度中位】与【被上限截断的比例】⇒ 否则等于"偷偷变短" ✗
     body = {"model": model, "prompt": prompt,
-            "max_tokens": outlen, "min_tokens": outlen, "ignore_eos": True,
+            "max_tokens": outlen, "ignore_eos": False,
             "temperature": 0.0, "stream": True,
             "stream_options": {"include_usage": True}}
     req = urllib.request.Request("http://127.0.0.1:%d/v1/completions" % port,
@@ -87,10 +94,18 @@ def one(prompt, outlen, port, model, sink, tag):
     except Exception as e:  # noqa: BLE001
         sink[tag] = {"err": repr(e)}
         return
-    sink[tag] = {"tok": int(ntok) if ntok else nchunk,
+    # ⭐ 步时(协议 §4.1 指定:本口径里**最接近"引擎速度"**的量,因为它不含 AL)= 解码段耗时 ÷ 步数
+    #   ⚠️ 步数以 SSE delta 数近似;`chunks` 含首块与 usage 尾块 ⇒ `chunks-1` 并做下限保护 ✓
+    _nt = int(ntok) if ntok else nchunk
+    _step = ((last - first) / (nchunk - 1) * 1000
+             if (first and last and nchunk > 1) else None)
+    sink[tag] = {"tok": _nt,
                  "n_src": "usage" if ntok else "chunks",
                  "ptok": ptok, "ttft": first, "tlast": last,
                  "dt": time.time() - t0, "chunks": nchunk,
+                 "outlen": _nt, "cap": int(outlen),
+                 "capped": int(_nt >= int(outlen)),
+                 "step_ms": _step,
                  "deg": deg("".join(texts))}
 
 
@@ -130,7 +145,7 @@ def main():
             with lock:
                 t_end[0] = time.time()
 
-    print("并发=%d(**满 C 连续灌入**)载荷=%d 条 × %d 轮 固定输出=%d token(ignore_eos) %s"
+    print("并发=%d(**满 C 连续灌入**)载荷=%d 条 × %d 轮 ⭐**自然结束**、上限=%d token %s"
           % (a.conc, len(recs), a.rounds, a.outlen, ("[%s]" % a.tag) if a.tag else ""), flush=True)
     ths = [threading.Thread(target=worker) for _ in range(a.conc)]
     for th in ths:
@@ -151,6 +166,10 @@ def main():
     tpot = sorted((v["tlast"] - v["ttft"]) / (v["tok"] - 1) * 1000 for v in dec)
     ttfts = sorted(v["ttft"] * 1000 for v in good if v.get("ttft"))
     degs = [v["deg"] for v in good]
+    # ⭐ 新口径必报三列(QA #264):步时 / 实际输出长度 / 被上限截断率
+    stepms = sorted(v["step_ms"] for v in good if v.get("step_ms"))
+    outs = sorted(v.get("outlen", v["tok"]) for v in good)
+    ncap = sum(1 for v in good if v.get("capped"))
     ptok = sum(v["ptok"] or 0 for v in good)
     if a.jsonl:
         with open(a.jsonl, "w") as f:
@@ -167,6 +186,15 @@ def main():
           % (statistics.median(per_req) if per_req else float("nan"),
              statistics.median(tpot) if tpot else float("nan"),
              statistics.median(ttfts) if ttfts else float("nan")))
+    print("③b ⭐**步时中位 = %.1f ms/步**(⭐ 主判据,不含 AL)⇒ 等效解码步率 = %.1f 步/s"
+          % (statistics.median(stepms) if stepms else float("nan"),
+             1000.0 / statistics.median(stepms) if stepms else float("nan")))
+    print("③c ⭐**实际输出长度**:中位=%.0f token(上限=%d);⭐ **被上限截断 = %d/%d = %.0f%%**"
+          " ;最短=%d 最长=%d"
+          % (statistics.median(outs) if outs else float("nan"),
+             int(good[0].get("cap", 0)) if good else 0,
+             ncap, len(good), 100.0 * ncap / len(good) if good else float("nan"),
+             outs[0] if outs else 0, outs[-1] if outs else 0))
     print("④ 每请求端到端耗时中位 = %.1fs ;输入 token 合计=%d ⇒ 总吞吐(含输入)= %.1f tok/s"
           % (statistics.median(v["dt"] for v in good), ptok,
              (ptok + stok) / wall if ptok else float("nan")))

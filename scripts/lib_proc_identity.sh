@@ -32,7 +32,14 @@ PROC_LOGDIR="${LOGDIR:-$PROC_ROOT/dev-docs/report/tuning/logs}"
 PROD_PIDFILES_RE='^(vllm_prod_8070|v41_8070|prod768|dsv41_prod|lmcache_server|prometheus|grafana|node_exporter|xtu_exporter|coremap|coremap_png|vram_sampler|vram_watch|hang_watch|sess_watch.*|deg_watch|lmcache.*)\.pid$'
 
 # ⭐ 生产判据 B:端口(生产 vLLM + LMCache + 看板/监控栈,同生命周期 ✓)
-PROD_PORTS='8070 5555 8080 9090 3000 9100 8787'
+# ⛔⛔ 2026-10-15 用户明令【永久关闭】:「端口 8070 被硬编码判为『生产/监控栈』⇒ 要求用户许可」
+#    ⇒ **`8070` 已从本名单移除** ⇒ **端口号本身不再构成生产证据** ✗
+#    依据(实证):当次被拦下的是 **我 17:22 自己起的 GLM 实例** —— 它有 PID 文件
+#      `glm53_b543.pid`=1641716 **与监听 pid 完全一致** ✓、`CUDA_VISIBLE_DEVICES=1,2` ✓,
+#      三条正证据齐全 ✓;仅凭端口号判生产是【启发式压倒了实证】✗,且**连续两次**拦下合法操作 ✗
+#    判据收敛为(PID 文件 / 端口派生 PID 的命令行 / CUDA_VISIBLE_DEVICES)三条,**缺省仍拒绝** ✓
+#    ⚠️ 保留 `5555 8080 9090 3000 9100 8787`(LMCache 与看板/监控栈,用户本次未涉及 ✓)
+PROD_PORTS='5555 8080 9090 3000 9100 8787'
 # ─────────────────────────────────────────────────────────────────────────────
 
 # ⭐ 所有"证据输出"全局变量的初值 —— 必须在 lib 里初始化,

@@ -49,15 +49,15 @@ Every performance number below was taken on this machine:
 
 ## Performance
 
-* The **DeepSeek-V4.1-Flash row is the 2026-10-12 measurement on the current production config** (the authoritative numbers in this table); **GLM-5.3 and MiMo-V2.6 rows are legacy** v0.2.4-v0.2.6 numbers (random dataset, aggregate metric), pending re-measurement.
+* The **DeepSeek-V4.1-Flash row is the 2026-10-12 measurement on the current production config** (the authoritative numbers in this table); **The GLM-5.3-Flash row is measured on 2026-10-17** per `docs/BENCH_PROTOCOL.md` §2/§3: genuine DSH 15K payload, **16 requests per concurrency level**, `--outlen 1024`, **fully warmed**; **the MiMo-V2.6 row is still legacy** (v0.2.4-v0.2.6, random dataset, aggregate metric), pending re-measurement.
 * Metrics (**changed in v0.2.8; the authoritative definition is [`docs/BENCH_PROTOCOL.md`](docs/BENCH_PROTOCOL.md)**): **prefill** = `sum(prefill tokens) / (last decode start)`, measured **cold** (always count from server `usage`); **decode** = the **`sum(output tokens) / sum(decode windows)`** measured under a **fixed output length** (`max_tokens=min_tokens` + `ignore_eos`, every request emits exactly N tokens) with **C requests kept in flight**, then **x C** for the aggregate. Fixing the output length removes the acceptance-length sampling noise (+-10%) that plagued the old metric (**B416/B418**); verifier: `scripts/bench_protocol_check.py`. **`deg` (8-gram copy rate) is a mandatory health column** for these numbers.
 * Config details, criteria and the `MBT` trade-off: `docs/TUNING_GUIDE.md` section 8 and `docs/MODEL_GUIDES.md` section 0.1.
 
 | Model (optimal config) | load | actual tokens | conc. | prefill (tok/s) | decode (tok/s) |
 |---|---|---|---|---|---|
-| **GLM-5.3-Flash**<br>TP=2 · util 0.90 · **MAXLEN 262144**<br>MBT 8192 · **MTP k=1** · **GPU prefill on** (v0.2.8 config) | genuine DSH payload‡ | ≈8,900 | 1 | **901** | **23.1** |
-| | genuine DSH payload‡ | ≈8,900 | 2 | **≈901**§ | **27.1** |
-| | genuine DSH payload‡ | ≈8,900 | 4 | **≈901**§ | **32.2** |
+| **GLM-5.3-Flash**<br>TP=2 · util 0.90 · **MAXLEN 262144**<br>MBT 8192 · **MTP k=4** · **GPU prefill on** (v0.2.8 config) | genuine DSH payload‡ | ≈14,500 | 1 | **1,477** | **29.8** |
+| | genuine DSH payload‡ | ≈14,500 | 2 | **1,441** | **31.6** |
+| | genuine DSH payload‡ | ≈14,500 | 4 | **1,394** | **37.2** |
 | **DeepSeek-V4.1-Flash**<br>TP=2 · util 0.90 · **MAXLEN 524288**<br>**MBT 8192** · **seqs 4** · **DSpark k=5** · **PIN hot-expert residency** (v0.2.8 config) | genuine DSH payload‡ | ≈9,340 | 1 | **1,041** | **47.5** |
 | | genuine DSH payload‡ | ≈9,340 | 2 | **1,045** | **81.5** |
 | | genuine DSH payload‡ | ≈9,340 | 4 | **1,156** | **101.7** |

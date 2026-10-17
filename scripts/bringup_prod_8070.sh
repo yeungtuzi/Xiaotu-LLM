@@ -34,6 +34,11 @@ set -uo pipefail
 
 R=/home/user/lvllm/vllm-xiaotu-moe
 cd "$R" || exit 1
+# ⛔⛔ 2026-10-15 【机械闸 · 用户明令】NOSHARD(socket 副本 / 内存×2)**绝对禁止**:`moe_v2.hpp:556`(⭐ **全文唯一**的 `getenv("XIAOTU_MOE_NOSHARD")`;:682 **只是注释**、不是第二个消费点)一见到值就为**每个 socket 复制一份完整权重** ⇒ 实测 **+253 GiB**(§422.5),而「按 NUMA 切片、避免跨 socket 访存」正是本项目的**核心特色** ⇒ 有值即【大声告警 + 忽略】✓
+# ⚠️ **覆盖范围仅【本 bringup 链】**:直接调 `scripts/serve_v41.sh` / `serve_glm53_mainline.sh`(后者 :262 还主动写回 env 文件)仍可打开内存×2 ⇒ 这**不是**全局禁令,只是本路径上的机械闸;把闸下沉到 `serve_v41.sh` 已登记为待办(独立审计员 2026-10-15 的 must_fix)✗
+# ⚠️ §422.5 那次 **1147 GB** 崩溃的**归因未定论**(OOM vs 分组路径硬崩;NOTES.md:17530 已撤回其中一种解释)⇒ 本行只断言**代码事实**("为每 socket 复制整份权重"),不替那次崩溃定因 ✓
+[ -n "${XIAOTU_MOE_NOSHARD:-}" ] && echo "[bringup] ⛔ 已【忽略】XIAOTU_MOE_NOSHARD=${XIAOTU_MOE_NOSHARD}:内存×2 被用户 2026-10-15 明令绝对禁止(NUMA 切片是本项目核心特色)⇒ 按默认【分片】启动 ✗" >&2
+unset XIAOTU_MOE_NOSHARD
 PY=/home/user/anaconda3/envs/vllm-xiaotu-moe/bin/python
 # ⭐ 【唯一真源】进程归属证据(生产名单/端口/端口属主解析)全部来自 lib,禁止在此重复定义 ✗
 LOGDIR="$R/dev-docs/report/tuning/logs"

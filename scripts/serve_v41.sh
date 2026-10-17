@@ -325,6 +325,15 @@ XTU_ENV_FILE="${XIAOTU_ENV_FILE:-/tmp/xiaotu_env}"
   echo "XIAOTU_MOE_RESIDENT_BUDGET_GB=${XIAOTU_MOE_RESIDENT_BUDGET_GB:-0}"
   echo "VLLM_XIAOTU_GPU_PREFILL_MIN_TOKENS=${VLLM_XIAOTU_GPU_PREFILL_MIN_TOKENS:-${POLICY_GP_MIN:-0}}"
   echo "XIAOTU_RELEASE_SOURCE=${XIAOTU_RELEASE_SOURCE:-1}"
+  # ⭐⭐ 【2026-10-16 · 目标 B:ds41f 从"静态驻留"升级到"动态换入"】
+  #   为什么必须写进**本白名单**:EngineCore 会**静默丢弃** launcher 侧的 `XIAOTU_*`
+  #   (本文件 :268-269 早已记录该现象,当时丢的是 THREADS/SPIN_IDLE_US/RELEASE_SOURCE)⇒
+  #   只有 `$XTU_ENV_FILE` 这条通道可靠 ✓
+  #   实测证据(B600):`XIAOTU_PIN*` 未进白名单时,`ds41f_b600.log` 里这三个变量
+  #   **出现 0 次** ✗ ⇒ 池根本没建 ⇒ 动态换入恒不生效,**且无任何报错**(静默失效)✗
+  for _pv in XIAOTU_PIN XIAOTU_PIN_TABLE XIAOTU_PIN_WINDOW XIAOTU_PIN_HYST XIAOTU_PIN_HITSTAT; do
+    if [ -n "${!_pv:-}" ]; then echo "$_pv=${!_pv}"; fi
+  done
   # 【§565】**R11 的"Engram 最后加载"从本节起默认开启(=1)** —— §562d 的正确性疑虑已在 §563/§564 证伪并闭环:
   #   * §562d 的"greedy 跨臂 1/5"**不是"最后加载"的错**,而是我们流式拷贝漏了本 rank 的
   #     `engram_vocab_start` 偏移(§563):表按 head shard 切,checkpoint 里是**完整表**,

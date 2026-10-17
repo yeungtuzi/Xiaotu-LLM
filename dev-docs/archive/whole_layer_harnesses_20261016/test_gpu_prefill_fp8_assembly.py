@@ -21,6 +21,13 @@ import torch
 REPO = os.path.dirname(os.path.dirname(os.path.abspath(__file__)))
 sys.path.insert(0, REPO)
 
+# ⛔⛔ 【测试隔离门 —— 必须在 import 包之前】本机 `/tmp/xiaotu_env` 是【生产】环境文件,
+#    包内有一条"默认桥"会把它的值**补齐**进来(实测:生产正在用的
+#    `XIAOTU_GPF_STAGE_TILE_E=96` 会被灌进本测试)⇒ 测试口径被生产污染 ✗
+#    ⇒ 显式赋值(而非依赖缺省)即可,因为"桥"只补**缺失**的键 ✓
+os.environ["XIAOTU_GPF_STAGE_TILE_E"] = "0"   # ⭐ 前置对拍必须先跑【整层】基线
+os.environ["XIAOTU_GPF_RAW2_SHARE"] = "0"
+
 import xiaotu_moe  # noqa: E402
 from vllm_xiaotu_moe.byte_transpose import ktranspose_bytes  # noqa: E402
 from vllm_xiaotu_moe.gpu_prefill_fp8 import (  # noqa: E402
@@ -82,7 +89,63 @@ def main() -> int:
     print(f"[{'OK ' if ok else 'BAD'}] assembly: w13t_bytes_equal={r['w13t']} "
           f"w2t_bytes_equal={r['w2t']} shapes_ok={r['shape13'] and r['shape2']} "
           f"scale_maxdiff=({r['s13t']:.1e}, {r['s2t']:.1e})")
-    return 0 if ok else 1
+
+    # ------------------------------------------------------------------
+    # ⭐ 【微 ping/pong】tile 环:① 逐字节对拍(装配)② 数值对拍(整层 vs 环)
+    # 这两条是本路径的**唯一防线** —— tile 只是"换个写法搬同样的字节",
+    # 所以装配必须**逐字节相等**,而不是"差不多" ✗
+    # ------------------------------------------------------------------
+    from vllm_xiaotu_moe import gpu_prefill_fp8 as G
+    from vllm_xiaotu_moe.gpu_prefill import stage_tiles, staging_tile_experts
+    from vllm_xiaotu_moe.gpu_prefill_fp8 import (
+        _fp8_kmajor_tiled, _fp8_tile_ring, gpu_moe_layer_from_engine_tiled,
+    )
+
+    tile = max(1, E // 2)
+    os.environ["XIAOTU_GPF_STAGE_TILE_E"] = str(tile)
+    if staging_tile_experts(E) != tile:
+        raise SystemExit(f"tile env 未生效: {staging_tile_experts(E)} != {tile}")
+    tiles = stage_tiles(E)
+    ring = _fp8_tile_ring(dev, E, H, I, tile, 2)
+    ok_t = True
+    for (e0, e1) in tiles:
+        Et = e1 - e0
+        got = _fp8_kmajor_tiled(eng, dev, H, I, E, e0, e1,
+                                tuple(b[:Et] for b in ring[0]))
+        torch.cuda.synchronize()
+        same13 = bool(torch.equal(got[0], exp_w13t[e0:e1]))
+        same2 = bool(torch.equal(got[2], exp_w2t[e0:e1]))
+        d13 = float((got[1] - exp_s13t[e0:e1]).abs().max().item())
+        d2 = float((got[3] - exp_s2t[e0:e1]).abs().max().item())
+        ok_t &= same13 and same2 and d13 == 0.0 and d2 == 0.0
+        print(f"      tile[{e0}:{e1}) w13_bytes_equal={same13} w2_bytes_equal={same2} "
+              f"scale_maxdiff=({d13:.1e}, {d2:.1e})")
+    print(f"[{'OK ' if ok_t else 'BAD'}] tile 装配逐字节对拍 (E={E} tile={tile} "
+          f"tiles={len(tiles)})")
+
+    g2 = np.random.default_rng(1)
+    T, K2 = 24, 4
+    xs = torch.randn(T, H, dtype=torch.bfloat16, device=dev)
+    ids = torch.randint(0, E, (T, K2), dtype=torch.int32, device=dev)
+    wts_r = torch.rand(T, K2, dtype=torch.float32, device=dev)
+    ref = G.gpu_moe_layer_fp8(xs, ids, wts_r, w13t, s13t, w2t, s2t, H, I, K2,
+                              device=dev)
+    got_l = gpu_moe_layer_from_engine_tiled(eng, xs, ids, wts_r, H, I, E, K2,
+                                            device=dev)
+    torch.cuda.synchronize()
+    if got_l is None:
+        print("[BAD] tile 环整层调用返回 None")
+        ok_n, dmax, rel = False, float("nan"), float("nan")
+    else:
+        dmax = float((ref - got_l).abs().max().item())
+        rel = dmax / max(1e-9, float(ref.abs().max().item()))
+        ok_n = rel < 1e-5
+    print(f"[{'OK ' if ok_n else 'BAD'}] tile 环数值对拍:maxdiff={dmax:.3e} "
+          f"rel={rel:.2e}")
+
+    # 复位 env,避免污染同进程后续(整层路径必须仍是默认)✓
+    os.environ["XIAOTU_GPF_STAGE_TILE_E"] = "0"
+    return 0 if (ok and ok_t and ok_n) else 1
 
 
 if __name__ == "__main__":

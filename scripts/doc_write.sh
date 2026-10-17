@@ -14,10 +14,15 @@
 # 用法:
 #   bash scripts/doc_write.sh <file> --append              <<'EOF'  ...  EOF
 #   bash scripts/doc_write.sh <file> --append-auto         <<'EOF'  ...  EOF
-#        ⭐ 两者差在【编号】:--append 要求调用方自己写的 `### #NN` 不撞号(撞 ⇒ exit 4,不写);
-#           --append-auto 由【脚本在锁内】把首行 `### #NN` 改成 `#<现有最大+1>` ✓
+#        ⭐ 两者差在【编号】:--append 要求调用方自己写的 `## #NN` 不撞号(撞 ⇒ exit 4,不写);
+#           --append-auto 由【脚本在锁内】把首行 `## #NN` 改成 `<同井号数> #<现有最大+1>` ✓
+#           ⭐ 井号个数【两或三个都认】(`## #NN` / `### #NN`;重写时保留调用方原样 ✓)
 #           ⇒ ⭐ 多会话共写台账时**一律用 --append-auto**(R36 第 4 条的机械执行点 ✓)
 #   bash scripts/doc_write.sh <file> --replace '<old>' '<new>'
+#        ⚠️⚠️ 调用方警示(2026-10-17 实测踩过):bash 的 `${v/pat/rep}` 里,若 **pat 以 `#` 开头**,
+#           那个 `#` 会被 bash 当成**【锚定在开头】的标记** ⇒ 对 `## #255` 这类文本**静默不替换** ✗
+#           (实测:`${C/#255/#257}` 不动,`${D//#/X}` 却能动 ⇒ 极易误判为"已改") 
+#           ⇒ 构造 new 时用 `sed`/python,并**断言 new != old**(脚本已内置该断言 ⇒ 空操作直接 exit 2 ✓)
 #   bash scripts/doc_write.sh <file> --truncate-at '<marker>'   # 自 marker 删到文末(撤销误记)
 #   bash scripts/doc_write.sh <file> --check     # 只查锁是否空闲(不写)
 #
@@ -66,14 +71,18 @@ f, tmp, auto = sys.argv[1], sys.argv[2], int(sys.argv[3])
 src = open(f, encoding='utf-8').read()
 body = open(tmp, encoding='utf-8').read()
 mx = max([int(m) for m in re.findall(r'^#{2,3} #(\d+)', src, re.M)] or [0])
+# ⭐ 2026-10-17 修正:下面两处原为 '^### #\d+' / '^### #(\d+)'(【只认三井号】),而
+#    `USER_QA_LEDGER.md` 等台账实际写的是【两井号】`## #NN` ⇒ 撞号检查对它们【完全失效】✗
+#    实测:两次追加都打印 "本条 -"(即 ids 为空、检查根本没跑)⇒ 已真的撞出 #255/#256 各两条 ✗
+#    ⇒ 统一按 '^(#{2,3}) #NN' 匹配,并【保留调用方的井号个数】✓
 if auto:
-    body2 = re.sub(r'^### #\d+', lambda m: f"### #{mx+1}", body, count=1, flags=re.M)
+    body2 = re.sub(r'^(#{2,3}) #\d+', lambda m: f"{m.group(1)} #{mx+1}", body, count=1, flags=re.M)
     if body2 == body:
-        print("⛔ --append-auto: 首行没有 '### #NN' 可分配 ⇒ 未写", file=sys.stderr)
+        print("⛔ --append-auto: 首行没有 '## #NN' / '### #NN' 可分配 ⇒ 未写", file=sys.stderr)
         sys.exit(4)
     body, tag = body2, f"#{mx+1}"
 else:
-    ids = [int(x) for x in re.findall(r'^### #(\d+)', body, re.M)]
+    ids = [int(x) for x in re.findall(r'^#{2,3} #(\d+)', body, re.M)]
     bad = [i for i in ids if i <= mx]
     if bad:
         print(f"⛔ doc_write: 撞号 —— 本条要写 {bad},而现有最大是 #{mx}"
@@ -92,6 +101,12 @@ PY
     python3 - "$F" "$OLD" "$NEW" <<'PY'
 import os, sys, tempfile
 f, old, new = sys.argv[1], sys.argv[2], sys.argv[3]
+if old == new:
+    print("⛔ doc_write: --replace 的 old 与 new 【完全相同】⇒ 空操作,未写 ✗"
+          "(常见成因:调用方用 bash `${v/pat/rep}` 构造 new,而 pat 以 `#` 开头 ⇒"
+          " bash 把它当成\"锚定开头\"的标记而【静默不替换】⇒ 用 sed/python 构造,并确认 new != old)",
+          file=sys.stderr)
+    sys.exit(2)
 src = open(f, encoding='utf-8').read()
 cnt = src.count(old)
 if cnt != 1:

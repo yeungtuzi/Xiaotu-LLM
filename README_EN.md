@@ -33,6 +33,7 @@
 3. **Supports older GPUs such as SM80**, and **NVFP4 / MXFP4** quantized weights; where the hardware has no native support, the weights are **dequantized and computed on the best available path**.
 4. Supports **AVX-512 VNNI and other ISAs**, picking the best CPU compute backend automatically.
 5. **Hardware-aware NUMA slicing**: the process is spread evenly across cores according to the NUMA topology, and the MoE weights are sharded to match, so **every node's compute only touches local memory** (no cross-socket traffic) while **total memory stays at a single copy of the weights**.
+6. **Hot experts can be pinned resident on the GPU with policy-driven dynamic swap-in**, giving **cooperative GPU + CPU decoding** and significantly higher decode throughput on **DeepSeek-V4.1-Flash** (since **v0.2.8**). **GLM-5.3-Flash is not supported yet** (VRAM limit); **Qwen3.8-Flash-Next is under validation**.
 
 ## Measurement host
 

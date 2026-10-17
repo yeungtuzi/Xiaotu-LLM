@@ -392,3 +392,154 @@ python scripts/probe_oracle.py                # 后端选择
 python scripts/tiny_moe_equiv.py              # CPU/GPU 专家等价性
 python report/make_figs.py                    # 由 report/*.json 生成图表
 ```
+
+---
+
+## 4.6 GLM-5.3-Flash 按新口径复测(2026-10-16;**含 GPU 常驻热专家 + 图内动态换入**)⭐
+
+> 本节即 README 性能表里 GLM 行所标注的"**待按新口径复测**"的结果 ✓。
+> ⚠️ 口径权威定义见 [`BENCH_PROTOCOL.md`](BENCH_PROTOCOL.md) §8;**三项口径校验全部通过** ✅
+
+### 配置(唯一口径)
+
+| 项 | 值 |
+|---|---|
+| 模型 / TP / GPU | GLM-5.3-Flash / `TP=2` / GPU1,2(`util 0.90`) |
+| `MAXLEN` / `MBT` | 262144 / **8192** |
+| 投机 | `SPEC_K=0`(**关**;理由见 §4.3 的 A/B —— GLM 的 `p0=0.46`,k=1 速度中性但 **KV −27%** ✗) |
+| GPU 预填 | 开(微 ping/pong **tile 环**:`tile=96`,`nslots=2`,`2.25 GiB`) |
+| 热专家常驻 | **开**:池 **6.3 GiB** + PIN 表(seed8,窗口 200,迟滞 0.25)+ **图内动态换入**(本次实测 **558 次**换入) |
+| 层驻留 | 无(`vram_policy` 在 `MAXLEN=262144` 下不给层预算 ✓) |
+| 图 / Engram | **CUDA graph 开**(`EAGER=0`,`FULL_DECODE_ONLY`)/ 无 Engram |
+| 载荷 / 输出 | `dsh_assembled_bench_15k.jsonl`(`prompt≈14474` = **1.77×MBT**)/ `outlen=1024` 固定 |
+
+### 结果(服务端 `usage` 口径;`n = 4×C` ✓)
+
+| C | ① 聚合输出(含预填) | ② 聚合解码 | ×C 外推 | **TPOT 中位** | TTFT 中位 | 步时中位 | deg 中位 / >0.30 | 失败 |
+|---|---|---|---|---|---|---|---|---|
+| **1** | 15.0 | **18.3** | 18.3 | **54.7 ms** | 8637 ms | 56.0 s | 0.00 / 0% | 0 |
+| **2** | 22.8 | 13.3 | 26.6 | 75.1 ms | 12833 ms | 76.8 s | 0.00 / 0% | 0 |
+| **4** | 32.7 | 9.4 | **37.8** | **103.4 ms** | 19292 ms | 105.8 s | 0.00 / 0% | 0 |
+
+* ⭐ **预填(§3 冷缓存口径,C=1)** = `14474 ÷ 8.637 s` ≈ **1676 tok/s**
+  ⇒ 这是**硬件上限**(权重 H2D:`tile=96 < E=288` ⇒ 每层 3 片 ×1152 MiB ×40 层 ≈ 135 GiB/块)
+  ⇒ ⛔ **不再优化,也不许为它扩大 `MBT`**(显存留给 KV / 常驻)✓
+* ✅ 校验:`scripts/bench_protocol_check.py`(md5 `dcfc37101efdcbccfceda043bd3912fa`)
+  S1 固定长度 / S2 usage 计数 / S3 流式 / **S4 `n ≥ 4×C`** —— **全部通过** ✓
+* **KV 容量 / 并发**:671,491 token ⇒ `MAXLEN=262144` 下 **2.56×**
+* **staging**:need **2.53 GiB** / required ≥ **5.78 GiB** / had **11.38 GiB**(**slack +5.59 GiB** ✓)
+* ⚠️ **本表与 v0.2.4~v0.2.6 的旧 GLM 行不可混比**(载荷、口径、驻留策略、投机开关全变)✗
+
+## 4.7 微负载往返基线(ds41f,生产口径 + 热专家动态换入)**【D#10 交付】**
+
+> 工具 `scripts/bench_lat.sh`(固定协议、`--dataset-name random`、不依赖 chat 模板 ✓)
+
+### 口径(R43,缺一不可比)
+
+模型 **DeepSeek-V4.1-Flash**;服务**经 `bringup_prod_8070.sh` 启动**(唯一真源)⇒
+`COMPILE=1` · `EAGER=0` · `GPU_UTIL=0.90` · `MBT=8192` · `MAXLEN=524288` · `KV_DTYPE=fp8_ds_mla` ·
+`PYTORCH_CUDA_ALLOC_CONF=expandable_segments:False` · `SPEC=1`(serve_v41 默认 JSON)· `GPU_PREFILL=1`;
+TP=2 / **GPU 1,2**;`THREADS=60`;
+**驻留策略**:`XIAOTU_PIN=1` + `pintab/expert_pin.ds41f.seed10.bin` + `WINDOW=200` + `HYST=0.25`;
+APC 默认;**Engram 未开**;`TOKENIZER=…/deepseek-ai--DeepSeek-V4.1-Flash/snapshots/master` ✓;
+服务已在 C=1/C=4 真实流量后(**KV 已热**,非冷启)
+
+### 数字
+
+| 组 | L / out | C | agg tok/s | TPOT 中位 | p99 | TTFT 中位 | 完成 |
+|---|---|---|---|---|---|---|---|
+| 固定协议 | 512 / 128 | 1 | 19.86 | 41.91 ms | 55.87 ms | 1121 ms | 8/8 ✓ |
+| 固定协议 | 512 / 128 | 2 | 25.02 | 68.09 ms | 84.12 ms | 810 ms | 8/8 ✓ |
+| 固定协议 | 512 / 128 | 4 | 36.27 | 89.15 ms | 115.12 ms | 1334 ms | 8/8 ✓ |
+| ⭐ **微 ping/pong** | **16 / 16** | 1 | 20.28 | 39.64 ms | 46.94 ms | ⭐ **194 ms** | 8/8 ✓ |
+| ⭐ **微 ping/pong** | **16 / 16** | 4 | 35.84 | 87.82 ms | 111.63 ms | 393 ms | 8/8 ✓ |
+
+### 读法与警告
+
+* ⭐ **微往返(16/16)的 TTFT = 194 ms**(C=1),**p99 = 46.94 ms** —— 这是"小请求端到端往返"的基线 ✓
+* ⚠️ **`bench_lat.sh` 的 TPOT 与 `bench_agent_throughput.py` 的 TPOT 不同口径** ✗
+  (本节 C=1 TPOT 41.91 ms vs B610 的 19.6 ms ✓)⇒ ⛔ **两者不可混用** ✓
+* ⚠️ **陷阱**:`bench_lat.sh` 的 `TOKENIZER` 默认指向 **V4**-Flash 快照 ✗
+  ⇒ 对 V4.1 必须显式传 `TOKENIZER=…/deepseek-ai--DeepSeek-V4.1-Flash/snapshots/master` ✓
+  (否则 `OSError: Repo id must be in the form …` ✓)
+
+## §4.8 GLM-5.3-Flash 微负载基线(微 ping/pong)
+
+### 口径(R43)
+
+模型 **GLM-5.3-Flash**(官方量化);`serve_glm53_mainline.sh`;
+`TP=2 / GPUS=1,2` · `PORT=8141` · **`EAGER=1`(无图)** · `COMPILE=0` · **`SPEC_K=0`(关)** ·
+`MAXLEN=262144` · `MBT=8192` · `SEQS=4` · `GPU_UTIL=0.90` · `THREADS=60` ·
+`XIAOTU_GPF_STAGE_TILE_E=96` · `GPF_MIN=1500`;
+**驻留**:`XIAOTU_PIN=1` + `expert_pin.glm.seed8.bin` + `WINDOW=200` + `HYST=0.25` + `BUDGET=6.3 GiB` ✓;
+池 **80 行**(40 MoE 层 × 2 rank ✓),**KV = 671,491 tokens / 2.56×** ✓;
+协议 = `scripts/bench_lat.sh`(`--dataset-name random`,固定 L/OUT/N ✓);APC 默认;Engram 未开
+
+### ★ 协议① 文档固定协议:L=512 / OUT=128 / N=8(实测)
+
+| C | agg 解码 tok/s | 每流 tok/s | **TPOT** | p99 | **TTFT** | 完成 |
+|---|---|---|---|---|---|---|
+| 1 | 6.69 | 6.69 | 124.2 ms | 126.1 ms | **3376 ms** | **8/8** ✓ |
+| 2 | 10.95 | 5.47 | 142.8 ms | 157.7 ms | 5224 ms | **8/8** ✓ |
+| 4 | 16.52 | 4.13 | 170.4 ms | 215.2 ms | 9310 ms | **8/8** ✓ |
+
+### ★ 协议② 微 ping/pong:L=16 / OUT=16 / N=8(实测)
+
+| C | agg 解码 tok/s | 每流 tok/s | **TPOT** | p99 | **TTFT** | 完成 |
+|---|---|---|---|---|---|---|
+| 1 | **7.51** | 7.51 | **121.8 ms** | 123.5 ms | ⭐ **302 ms** | **8/8** ✓ |
+| 2 | 13.31 | 6.66 | 129.2 ms | 132.6 ms | 465 ms | **8/8** ✓ |
+| 4 | **19.71** | 4.93 | 158.0 ms | 182.9 ms | 827 ms | **8/8** ✓ |
+
+### ⭐ 与 ds41f 并列对照(同一 ping/pong 协议 16/16/8)
+
+| 模型 | C=1 agg | C=1 TPOT | C=1 TTFT | C=4 agg | 口径 |
+|---|---|---|---|---|---|
+| **ds41f**(B611) | **20.28** | **39.6 ms** | **194 ms** | 35.84 | 生产口径 + `PIN=1` + 图 |
+| **glm**(本节) | **7.51** | 121.8 ms | 302 ms | 19.71 | `EAGER=1` + `PIN=1`(无图) |
+
+* ⇒ ⭐ **GLM 的 C=1 往返比 ds41f 慢 2.1×**(7.51 vs 20.28 ✓);TPOT 慢 **3.1×**(121.8 vs 39.6 ms ✓)
+* ⚠️ **不可直接归因于模型**:两臂的**图模式不同**(ds41f 有图 ✗ / GLM 无图 ✓)⇒
+  ⭐ 这是**当前口径下的可比数字**,不是"GLM 比 ds41f 差 2.1×"的因果结论 ✓
+* ⭐ **副产物**:微流量期间 `xtu-pin-adapt` 由 **2866 → 3320**(+454 ✓)
+  ⇒ **动态换入在微协议下持续工作** ✓(不是只有长 prefill 才触发 ✓)
+
+## §4.9 qfn 微负载基线(微 ping/pong)
+
+### 口径(R43)
+
+模型 **qfn**(官方量化 Qwen3.8-Flash-Next,FP8);`scripts/serve_qwen38.sh` + `EXTRA_ARGS`;
+`TP=2 / GPUS=1,2` · `PORT=8140` · **`EAGER=0`(图 ON,`FULL_DECODE_ONLY`)** · `SPEC_K=0` ·
+`MAXLEN=131072` · `MBT=8192` · `SEQS=4` · `GPU_UTIL=0.90` · `THREADS=60` ·
+`XIAOTU_GPF_STAGE_TILE_E=96`;K **=0** · **`PIN=0`(无驻留池)** ✓;
+**KV = 1,564,407 tokens / 11.94×** ✓;tile 环 `tile=96 nslots=2 每槽=270 MiB 合计=0.53 GiB` ✓;
+⚠️ 微输入低于 GPU 预填阈值 ⇒ 本轮 `GPU prefill ACTIVE = 0` ✓、`staging max need = 0.59 GiB` ✓;
+协议 = `scripts/bench_lat.sh`(`--dataset-name random` ✓);APC 默认;Engram 未开
+
+### ★ 协议① 文档固定协议:L=512 / OUT=128 / N=8(实测)
+
+| C | agg 解码 tok/s | 每流 tok/s | **TPOT** | p99 | **TTFT** | 完成 |
+|---|---|---|---|---|---|---|
+| 1 | **30.01** | 30.01 | **22.93 ms** | 23.93 ms | **1352 ms** | **8/8** ✓ |
+| 2 | 40.90 | 20.45 | 34.43 ms | 39.37 ms | 1880 ms | **8/8** ✓ |
+| 4 | **45.96** | 11.49 | 60.72 ms | 78.82 ms | 3413 ms | **8/8** ✓ |
+
+### ★ 协议② 微 ping/pong:L=16 / OUT=16 / N=8(实测)
+
+| C | agg 解码 tok/s | 每流 tok/s | **TPOT** | p99 | **TTFT** | 完成 |
+|---|---|---|---|---|---|---|
+| 1 | **33.63** | 33.63 | **23.85 ms** | 29.80 ms | ⭐ **118 ms** | **8/8** ✓ |
+| 2 | 47.48 | 23.74 | 32.80 ms | 39.44 ms | 176 ms | **8/8** ✓ |
+| 4 | **62.71** | 15.68 | 47.97 ms | 55.20 ms | 290 ms | **8/8** ✓ |
+
+### ⭐ 三模型微 ping/pong 并列(C=1,协议 16/16/8)
+
+| 模型 | agg 解码 | TPOT | p99 | TTFT | 口径 |
+|---|---|---|---|---|---|
+| **qfn** | ⭐ **33.63** | **23.85 ms** | 29.80 ms | ⭐ **118 ms** | 图 ON + `PIN=0` |
+| **ds41f**(B611) | 20.28 | 39.6 ms | 46.9 ms | 194 ms | 生产口径 + `PIN=1` + 图 |
+| **glm**(§4.8) | 7.51 | 121.8 ms | 123.5 ms | 302 ms | `EAGER=1` + `PIN=1`(无图)|
+
+* ⚠️ **三臂口径不同**(图/池/模型皆不同)⇒ ⭐ 只能读作"各自口径下的当前水平" ✓,
+  **不得**读作"qfn 比 glm 快 4.5×"的因果结论 ✗
+* ⭐ 全程 **8/8 完成、0 失败** ✓,输出非退化 ✓(并发 1→4 时 TTFT 由 118→290 ms 单调上升 ✓ 合理)

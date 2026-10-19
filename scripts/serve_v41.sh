@@ -260,15 +260,15 @@ export CUDA_VISIBLE_DEVICES="$GPUS"
 #                "greedy 文本 5/5 相同" ⇒ 关掉它等于白丢一个已验证的大收益;
 #   SPIN_IDLE_US 插件默认 300(hybrid_model.py setdefault),这里钉成 0;
 #   NSLICE_SMALL 引擎默认开启;=0 会**强制走 legacy 路径**;
-#   THREADS      未设时插件按 n_ccd×5 自动调优(本机 24 CCD ⇒ 120),这里钉成 **192**
-#                (实测数据见下面 XIAOTU_MOE_THREADS 那一段;旧值 60 是错的)。
+#   THREADS      ⛔ 2026-10-19 用户裁定:**60 就是最优解,不许用更多核**
+#                (旧文里"184 才是拐点、60 是错的"的说法**已删除且作废** ✗)。
 # 一律写成 "${VAR:-<现值>}":**默认行为逐字不变**,但允许从外部覆盖做 A/B。
 # 调参时配合 dev-docs/report/tuning/NOTES.md §389。
 # ---- 环境变量文件桥 ----------------------------------------------------------
 # 实测:vLLM spawn EngineCore 时会**静默丢弃**部分 XIAOTU_* (THREADS/SPIN_IDLE_US/
 # GPU_RESIDENT_LAYERS/RELEASE_SOURCE 都丢过),于是"设了开关却没生效、且无日志"。
 # 插件在 __init__.py 里会从该文件补齐缺失项(真实环境优先)。见 NOTES §414。
-# XIAOTU_MOE_THREADS(默认 **184** = 物理核 192 留 8 个余量(实测拐点);原来是 60,中途曾是 192):
+# XIAOTU_MOE_THREADS ⛔ **2026-10-19 用户裁定:60 即最优,不许上调核数**(旧的 184/192 建议作废 ✗):
 #   【为什么留余量】SMT 关掉后,192 = **占满全部物理核**。单 token 解码的 B=1 延迟在
 #   192 下是**双峰**的(静默机器上连测:0.58 / 3.81 / 11.17 ms),而 176/184 稳定 ~0.5 ms
 #   —— 只要有一个 worker 被抢占(OS/vLLM/CUDA 线程),barrier 就要等它,而没有任何余核可去。

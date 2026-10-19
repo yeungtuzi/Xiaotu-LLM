@@ -33935,3 +33935,7 @@ cudaErrorStreamCaptureUnjoined
 * 机理:任何 device→host 读取(`.item()`/`int(t)`/`.cuda()`/`bool(t.all())`/`synchronize`)
   在捕获窗口内都会作废捕获;错误**延迟**到下一个无关 CUDA 调用才抛,极易误判 ✗
 * 纪律:R65 增补④;**心跳/统计打印只允许 host 侧数据**;守卫必须用 `_in_capture_window()` ✓
+
+**结案(用户 2026-10-19)**:「若变化不大就不测了,MTP 接受率本身就是随机浮动的」
+⇒ GLM 记为**持平**(C=1 28.7 vs 29.8 在 MTP 接受率噪声内;C=2/4 34.2/37.6 略高),
+**README 的 GLM 行保持不动**;不再为这 3.7% 追加实验 ✓

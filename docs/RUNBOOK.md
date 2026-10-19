@@ -21,7 +21,7 @@ NVIDIA A100-PCIE-40GB(SM 8.0)· AMD EPYC 9654(无 AMX)。
 
 | 模型 | 推荐命令(关键参数) | 实测 |
 |---|---|---|
-| **qfn**(Qwen3.8-Flash-Next FP8) | `bash scripts/serve_qwen38.sh`,**显式加** `XIAOTU_MOE_GPU_RESIDENT_LAYERS=15,9,11,16,31,3,39,25,7,23,24,13`(**12 层精选常驻**;池保持 `XIAOTU_PIN=0`) | 15K/自然结束:**prefill 1,517/1,538/1,529 tok/s;decode 46.0/43.8/44.0 tok/s(C=1/2/4)**;步时 22.4/33.6/78.2 ms ⚠️ 旧 45.6/95.7 与 38.6/108.4 作废 |
+| **qfn**(Qwen3.8-Flash-Next FP8) | `bash scripts/serve_qwen38.sh`,**显式加** `XIAOTU_MOE_GPU_RESIDENT_LAYERS=15,9,11,16,31,3,39,25,7,23,24,13`(**12 层精选常驻**;池保持 `XIAOTU_PIN=0`) | 15K:**prefill 1,517/1,538/1,529 tok/s;decode(稳态窗口)46.3/92.9/127.3 tok/s**(C=1/2/4);步时 21.6/21.5/31.4 ms ⚠️ 旧 45.6/95.7、38.6/108.4 与"44.0"作废 |
 | **ds41f**(DeepSeek-V4.1-Flash FP8+FP4) | `bash scripts/serve_v41.sh`(脚本默认 = dspark 开、`EAGER=0`、`COMPILE=1`) | **单流 ~50 / C=4 ~100 tok/s** |
 | **glm**(GLM-5.3-Flash) | `bash scripts/serve_glm53_mainline.sh`(脚本默认 = MTP 关、`EAGER=0`、`THREADS=60`) | prefill **1,477/1,441/1,394 tok/s**(B1040 系列) |
 

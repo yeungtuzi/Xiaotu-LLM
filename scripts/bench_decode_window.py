@@ -33,8 +33,7 @@ def stream_request(prompt, port, model, max_tokens, out):
         data=json.dumps(body).encode(),
         headers={"content-type": "application/json"})
     t0 = time.time()
-    first = None
-    times = []
+    times = out.setdefault("times", [])
     try:
         with urllib.request.urlopen(req, timeout=900) as r:
             for raw in r:
@@ -50,13 +49,13 @@ def stream_request(prompt, port, model, max_tokens, out):
                     continue
                 if ch[0].get("text"):
                     now = time.time()
-                    if first is None:
-                        first = now
+                    if "first" not in out:
+                        out["first"] = now      # ⭐ 必须**实时**写:轮询线程靠它判"已首 token"
                     times.append(now)
     except Exception as exc:  # noqa: BLE001
         out["err"] = f"{type(exc).__name__}: {exc}"
         return
-    out.update(first=first, times=times, t0=t0)
+    out["t0"] = t0
 
 
 def main():
@@ -99,7 +98,8 @@ def main():
         if len(ts) >= 2:
             steps.append(st.median([b - a for a, b in zip(ts, ts[1:])]) * 1000.0)
     if not steps:
-        print(f"并发={a.conc} ⚠️ 窗口内样本不足"); return 1
+        diag = [(len(o.get("times", [])), o.get("err", "")) for o in outs]
+        print(f"并发={a.conc} ⚠️ 窗口内样本不足 diag={diag}"); return 1
     step = st.median(steps)
     print(f"并发={a.conc} 就绪耗时={t_ready - t_wait:.1f}s 步时中位={step:.1f} ms "
           f"⇒ 每请求 {1000 / step:.1f} tok/s,聚合 {a.conc * 1000 / step:.1f} tok/s")

@@ -7,7 +7,7 @@
 
 用法:
   python scripts/bench_fixed_protocol.py --port 8140 --model Qwen3.8-Flash-Next \
-      --conc 1 --n 16 --outlen 1024 --dataset /home/user/lvllm/process_data/data/dsh_assembled_bench_15k.jsonl
+      --conc 1 --n 16 --outlen 1024 --dataset /home/user/lvllm/process_data/data/dsh_15k_v2.jsonl
 输出一行 JSON(便于入库)+ 人读摘要。
 """
 import argparse
@@ -18,7 +18,12 @@ import time
 import urllib.request
 
 
-def one(prompt, outlen, port, model, timeout):
+def one(prompt, outlen, port, model, timeout, t0=None):
+    # ⭐ 2026-10-19:ttft 必须从【提交时刻】算,而不是从拿到并发槽位之后算。
+    #   旧实现把 t0 放在 one() 内 ⇒ C=1/2 时排队等待被排除,`Σprompt / max(ttft)` 会虚高数倍
+    #   (实测 20 条串行时报 20,282 tok/s,而真实约 1,050)。C 路并发时由调用方传入同一/各自提交时刻。
+    if t0 is None:
+        t0 = time.time()
     body = {
         "model": model, "prompt": prompt,
         "max_tokens": outlen, "min_tokens": outlen, "ignore_eos": True,
@@ -29,7 +34,6 @@ def one(prompt, outlen, port, model, timeout):
         "http://127.0.0.1:%d/v1/completions" % port,
         data=json.dumps(body).encode(),
         headers={"content-type": "application/json"})
-    t0 = time.time()
     first = None
     last = None
     gaps = []
@@ -83,16 +87,16 @@ def main():
     rows = [json.loads(x) for x in open(a.dataset, encoding="utf-8") if x.strip()][: a.n]
     out = [None] * len(rows)
     slots = threading.Semaphore(a.conc)
+    t0 = time.time()   # ⭐ 批次起点:所有 16 条的 ttft 都从这里算(含排队)
 
     def work(i, prompt):
         with slots:
             try:
-                out[i] = one(prompt, a.outlen, a.port, a.model, a.timeout)
+                out[i] = one(prompt, a.outlen, a.port, a.model, a.timeout, t0=t0)
             except Exception as exc:  # noqa: BLE001
                 out[i] = {"err": f"{type(exc).__name__}: {exc}"}
 
     ths = [threading.Thread(target=work, args=(i, r["prompt"])) for i, r in enumerate(rows)]
-    t0 = time.time()
     for t in ths:
         t.start()
     for t in ths:
@@ -100,6 +104,11 @@ def main():
     wall = time.time() - t0
 
     ok = [r for r in out if r and "err" not in r and r.get("toks")]
+    errs = [r for r in out if r and "err" in r]
+    if errs:
+        # ⭐ 2026-10-19:旧版把失败请求默默丢掉 ⇒ n_ok<n 时 prefill 仍会输出一个"偏高"的数
+        #   (只除以成功样本的 last_start)⇒ 必须显式报错,且把 n_err 写进 JSON。
+        print(f"⚠️ 失败 {len(errs)}/{len(out)} 条;前 3 条: {errs[:3]}", flush=True)
     if not ok:
         print("== 全失败 ==", [r for r in out][:2])
         return 1
@@ -112,12 +121,13 @@ def main():
     agg = per_stream * a.conc
     gaps = [g for r in ok for g in r["gaps"]]
     res = {
-        "conc": a.conc, "n_ok": len(ok), "wall_s": round(wall, 1),
+        "conc": a.conc, "n_ok": len(ok), "n_err": len(errs), "wall_s": round(wall, 1),
         "prefill_tok_s": round(prefill, 0),
         "decode_tok_s": round(agg, 1),
         "decode_per_stream": round(per_stream, 1),
         "step_ms_median": round(1000 * st.median(gaps), 2) if gaps else None,
         "prompt_tokens_sum": sum_pre, "out_tokens_sum": sum_tok,
+        "prefill_valid": len(errs) == 0,
     }
     print(json.dumps(res, ensure_ascii=False))
     if a.jsonl:

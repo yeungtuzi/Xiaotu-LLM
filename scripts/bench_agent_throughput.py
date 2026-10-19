@@ -19,7 +19,9 @@ v1 的三个口径缺陷(2026-10-15 用户指出"比 README 差一些"后定位)
   PY=/home/user/anaconda3/envs/vllm-xiaotu-moe/bin/python
   $PY scripts/bench_agent_throughput.py --conc 4 --limit 16 --outlen 1024 --tag pin0 --jsonl /tmp/x.jsonl
   $PY scripts/bench_agent_throughput.py --port 8070 --model GLM-5.3-Flash --tag glm53 …
-数据集:`process_data/data/dsh_assembled_bench.jsonl`(真实 DSH 载荷,预装配 `<|im_start|>`)
+数据集:默认 **`process_data/data/dsh_15k_v2.jsonl`**
+(⭐ 2026-10-19 起唯一载荷:32 条 / 24 个不同真实 DSH 会话 / token 中位 15,000;
+旧 `dsh_assembled_bench.jsonl`≈9K、旧 8 条 `dsh_assembled_bench_15k.jsonl` 均已退役 ⇒ 见 BENCH_PROTOCOL §6)
 """
 from __future__ import annotations
 
@@ -31,7 +33,7 @@ import threading
 import time
 import urllib.request
 
-DS = "/home/user/lvllm/process_data/data/dsh_assembled_bench.jsonl"
+DS = "/home/user/lvllm/process_data/data/dsh_15k_v2.jsonl"
 
 
 def deg(t, n=8):

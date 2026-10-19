@@ -85,7 +85,16 @@ ROOT="$(cd "$(dirname "${BASH_SOURCE[0]}")/.." && pwd)"
 
 ENV="${ENV:-/home/user/anaconda3/envs/vllm-xiaotu-moe}"
 PY="$ENV/bin/python"
-CKPT="${CKPT:-/home/user/.cache/modelscope/models/deepseek-ai--DeepSeek-V4.1-Flash/snapshots/master}"
+# ⭐ 2026-10-19:官方权重更新为 **DeepSeek-V4.1-Flash-1017**(小版本,架构/权重布局与 0917 版一致;
+#   见 dev-docs/HANDOFF_V41_1017_2026-10-19.md)。默认取 1017;若本机还没下,再回落到旧目录。
+if [ -z "${CKPT:-}" ]; then
+  for _c in \
+    /home/user/.cache/modelscope/models/deepseek-ai--DeepSeek-V4.1-Flash-1017/snapshots/master \
+    /home/user/.cache/modelscope/models/deepseek-ai--DeepSeek-V4.1-Flash-1017/snapshots/master; do
+    [ -f "$_c/config.json" ] && CKPT="$_c" && break
+  done
+  CKPT="${CKPT:-/home/user/.cache/modelscope/models/deepseek-ai--DeepSeek-V4.1-Flash-1017/snapshots/master}"
+fi
 TAG="${TAG:-v41}"
 PORT="${PORT:-8070}"           # 【生产约定】生产端口固定 8070,不随模型漂移(2026-09-23 用户规则)
 GPUS="${GPUS:-1,2}"            # 【2026-10-03 用户明令】TP=2 **一律用 GPU1+GPU2**;GPU0 只做单卡调试。
@@ -331,7 +340,10 @@ XTU_ENV_FILE="${XIAOTU_ENV_FILE:-/tmp/xiaotu_env}"
   #   只有 `$XTU_ENV_FILE` 这条通道可靠 ✓
   #   实测证据(B600):`XIAOTU_PIN*` 未进白名单时,`ds41f_b600.log` 里这三个变量
   #   **出现 0 次** ✗ ⇒ 池根本没建 ⇒ 动态换入恒不生效,**且无任何报错**(静默失效)✗
-  for _pv in XIAOTU_PIN XIAOTU_PIN_TABLE XIAOTU_PIN_WINDOW XIAOTU_PIN_HYST XIAOTU_PIN_HITSTAT; do
+  # ⭐ 2026-10-19:新增 XIAOTU_ROUTING_DUMP(1017 换权重后必须**重新采路由**再生成 PIN 表;
+  #   不写进本白名单会被 EngineCore 静默丢掉 ⇒ dump 文件 0 字节,和 QFN 那次同型)。
+  for _pv in XIAOTU_PIN XIAOTU_PIN_TABLE XIAOTU_PIN_WINDOW XIAOTU_PIN_HYST XIAOTU_PIN_HITSTAT \
+             XIAOTU_PIN_MAXSWAP XIAOTU_ROUTING_DUMP; do
     if [ -n "${!_pv:-}" ]; then echo "$_pv=${!_pv}"; fi
   done
   # 【§565】**R11 的"Engram 最后加载"从本节起默认开启(=1)** —— §562d 的正确性疑虑已在 §563/§564 证伪并闭环:

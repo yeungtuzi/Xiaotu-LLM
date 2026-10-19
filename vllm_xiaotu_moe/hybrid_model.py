@@ -301,6 +301,9 @@ def _ep_shm_attach(layer_idx: int, tokens: int, hidden: int, world: int,
     return mm, stride
 
 
+_EP_REQUESTED: "bool | None" = None
+
+
 def ep_enabled() -> bool:
     """Expert-parallel CPU decode for TP>1 (default on; `XIAOTU_MOE_EP=0` off).
 
@@ -311,8 +314,12 @@ def ep_enabled() -> bool:
     `forward_many`'s `weights[ai] != 0.f` filter), and the partial MoE outputs are
     summed by one TP all-reduce.
 
-    Set `XIAOTU_MOE_REDUNDANT=1` to force the old redundant behaviour.
+    `vllm --enable-expert-parallel` sets the module-level `_EP_REQUESTED=True`
+    from `CpuXiaotuMoE.__init__` (see `[xtu-ep]` log); `XIAOTU_MOE_REDUNDANT=1`
+    still forces the old redundant behaviour.
     """
+    if _EP_REQUESTED is not None:
+        return _EP_REQUESTED
     if os.environ.get("XIAOTU_MOE_REDUNDANT", "0") == "1":
         return False
     return os.environ.get("XIAOTU_MOE_EP", "1") != "0"
@@ -585,6 +592,19 @@ class CpuXiaotuMoE(nn.Module):
         super().__init__()
         config = vllm_config.model_config.hf_config
         self._vllm_config = vllm_config
+        # ⭐ 2026-10-19:把 vLLM 的 --enable-expert-parallel 接到 CPU 专家分片。
+        #   CPU 引擎本来就默认按 TP 分片;此前这个 flag 不影响插件 ⇒ 用户无法从
+        #   服务参数上确认"EP 是否真的开了"。这里显式记录并强制打开。
+        try:
+            _pc = getattr(vllm_config, "parallel_config", None)
+            if _pc is not None and bool(getattr(_pc, "enable_expert_parallel", False)):
+                global _EP_REQUESTED
+                _EP_REQUESTED = True
+                print("[xtu-ep] vLLM enable_expert_parallel=True -> CPU expert sharding ON "
+                      f"(tp={getattr(_pc, 'tensor_parallel_size', '?')}, "
+                      f"ep={getattr(_pc, 'expert_parallel_size', '?')})", flush=True)
+        except Exception:  # noqa: BLE001
+            pass
         self.prefix = prefix
         self.use_sequence_parallel = bool(use_sequence_parallel)
         # 关键:让主线的 get_expert_mapping() 走 mega mapping(绑定原始 fp4 进下面的 CPU 参数)。
@@ -1322,6 +1342,7 @@ class CpuXiaotuMoE(nn.Module):
                     hidden_states, ids_l, wts_l, w13, s13, w2, s2,
                     H=self.hidden_size, I=self.moe_intermediate_size,
                     K=self.top_k, device=hidden_states.device, slot=slot,
+                    swiglu_limit=float(self.swiglu_limit or 0.0),
                 )
                 if os.environ.get("XIAOTU_SKIP_AR", "0") != "1":
                     gpu_out = tensor_model_parallel_all_reduce(gpu_out)
@@ -1334,6 +1355,7 @@ class CpuXiaotuMoE(nn.Module):
                     w13, s13, w2, s2,
                     H=self.hidden_size, I=self.moe_intermediate_size,
                     K=self.top_k, device=hidden_states.device, slot=slot,
+                    swiglu_limit=float(self.swiglu_limit or 0.0),
                 )
             if _nvtx:
                 torch.cuda.nvtx.range_pop()

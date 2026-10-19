@@ -87,7 +87,7 @@ MAXSEQS=2
 
 CKPT_G=/home/user/.cache/modelscope/models/ZhipuAI--GLM-5.3-Flash/snapshots/master
 CKPT_M=/home/user/.cache/modelscope/models/XiaomiMiMo--MiMo-V2.5/snapshots/master
-CKPT_V=/home/user/.cache/modelscope/models/deepseek-ai--DeepSeek-V4.1-Flash/snapshots/master
+CKPT_V=/home/user/.cache/modelscope/models/deepseek-ai--DeepSeek-V4.1-Flash-1017/snapshots/master
 MAXLEN_G=32768; MAXLEN_M=20480; MAXLEN_V=32768
 
 # ---- 实测 KV 标尺(tokens per GiB)------------------------------------------

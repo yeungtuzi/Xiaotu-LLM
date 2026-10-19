@@ -2,7 +2,8 @@
 
 > 本文件定义 **README 性能表**所用的口径。凡本文与别处冲突,**以本文为准**;
 > 口径一旦变更必须在此追加**带日期的修订条目**,并同步更新 `docs/BENCH_HISTORY.md` 的归档。
-> 最后修订:**2026-10-15(v0.2.8:decode 口径改为行业标准固定长度口径)**。
+> 最后修订:**2026-10-19(§6:用户统一口径——自然结束 + 15K `dsh_15k_v2.jsonl`;§6.1 稳态解码窗口;§6.2 充分预热)**。
+> ⚠️ 历史路径:2026-10-15(v0.2.8)曾把 decode 改为"固定输出长度";该要求在 2026-10-19 已被 §6 **废止** ✓
 
 ## 0. 一句话
 
@@ -141,7 +142,7 @@ $PY scripts/bench_agent_throughput.py --port 8073 --model GLM-5.3-Flash --conc 1
 
 | 项 | 固定值 | 理由 |
 |---|---|---|
-| **载荷** | `process_data/data/dsh_assembled_bench_15k.jsonl`(**≈15K token 拟真 prompt**) | §2.5/§2.6 的 15K 档;真实 harness 会话量级 ✓ |
+| **载荷** | `process_data/data/dsh_15k_v2.jsonl`(**≈15K token;32 条/24 会话**) | §6 的载荷版本;旧 8 条 `dsh_assembled_bench_15k.jsonl` 已退役(见 §6) ✓ |
 | **并发 C** | **只测 1 / 2 / 4** ⛔ 更高档不再测 | 用户裁定:"**再多对本架构无意义**" ✓ —— 本架构瓶颈是 **CPU 侧权重流量**,并发升高只是把它**排队** ⇒ 高 C 不提供新信息 ✓ |
 | **输出长度 N** | `1024`(另有 N=256 档可选) | §2.6 |
 | **每档请求数 n** | ⭐ **≥ 4×C**(C=1⇒4,C=2⇒8,C=4⇒16) | §2.4 的**下限**;固定长度口径下 n 越大噪声越小 ✓ |
@@ -189,7 +190,7 @@ TAG=glm53_bXXX GPUS=1,2 TP=2 SPEC_K=1 MBT=8192 GP_PREFILL=1 \
 # 三档(注意 --rounds 满足 n≥4C,--wall 必给)
 for spec in "1 4" "2 8" "4 16"; do set -- $spec
   python scripts/bench_agent_throughput.py --conc $1 --rounds $2 --limit 1 --outlen 1024 \
-    --dataset $D/dsh_assembled_bench_15k.jsonl --port 8070 --model GLM-5.3-Flash \
+    --dataset $D/dsh_15k_v2.jsonl --port 8070 --model GLM-5.3-Flash \
     --tag glm15k_c$1 --wall --jsonl /tmp/v2json/glm15k_c$1.jsonl
   python scripts/bench_protocol_check.py --jsonl /tmp/v2json/glm15k_c$1.jsonl --outlen 1024 --conc $1 --wall <墙钟秒>
 done
@@ -301,7 +302,7 @@ README 的 GLM 行(**本身就带 `MTP k=1`**)给出 decode **23.1 / 27.1 / 32.2
 ### 8.12 ✅ **GLM-5.3-Flash 固定矩阵(15K)已取得,三项全部过校验**(2026-10-16)
 
 口径:GLM-5.3-Flash / `SPEC_K=0` / APC 关 / MBT 8192 / outlen 1024 /
-`dsh_assembled_bench_15k.jsonl`(`prompt≈14474`) / tile 96 / 池 6.3 GiB + PIN seed8 /
+⛔ **旧 8 条载荷** `dsh_assembled_bench_15k.jsonl`(`prompt≈14474`;**2026-10-19 已退役,仅作历史复现,不得与新载荷混比**) / tile 96 / 池 6.3 GiB + PIN seed8 /
 层驻留空 / 无 Engram / **EAGER=0**(图开 + 动态换入 558 次)
 
 | C | ① 聚合输出(含预填) | ② 聚合解码 | ×C 外推 | TPOT 中位 | TTFT 中位 | 步时中位 | deg 中位 | 校验 |
@@ -392,13 +393,20 @@ README 的 GLM 行(**本身就带 `MTP k=1`**)给出 decode **23.1 / 27.1 / 32.2
 
 | 项 | 值 |
 |---|---|
-| Prompt | **15K**(`dsh_assembled_bench_15k.jsonl`,真实 DSH 载荷) |
+| Prompt | **15K**(`dsh_15k_v2.jsonl` —— **32 条 / 24 个不同 DSH 会话切片**,token 中位 **15,000**) |
 | `MBT` | **8192** |
 | MTP | **按模型**:ds(ds41f)=**开**(dspark);qfn=**关**;GLM 待复测后定 |
 | 输出 | **`max_tokens=1024`,允许自然结束** ⛔ **禁止 `min_tokens`/`ignore_eos` 强制长度** |
 | `TP` | **2(GPU1+GPU2)** |
 | GPU prefill | **开** |
 | 每档请求数 | 16 条(与 README 表一致) |
+
+⭐⭐ **载荷版本(2026-10-19 更新,覆盖本表旧写法)**:当前唯一基准载荷 = **`dsh_15k_v2.jsonl`**
+(`process_data/data/dsh_15k_v2.jsonl`;32 条 / **24 个不同真实 DSH 会话**;token 中位 **15,000**;
+md5 `ee65c044db393af838dd2d5bbf501637`;构建器 `scripts/build_dsh15k_dataset.py`)✓
+⛔ **旧 `dsh_assembled_bench_15k.jsonl`(8 条、同一条 63,853 字符 prompt)已退役** ——
+只用于复现 **2026-10-19 之前**的数字;引用旧数字必须显式标注"旧 8 条载荷",
+⛔ **不得与新载荷数字混比** ✓
 
 ⭐ **必须同时报**(缺一不可):主判据**步时中位**;`实际输出长度中位`;`被上限截断比例`;`deg`。
 ⛔ **旧口径作废**:`BENCH_PROTOCOL` §2 之前的"固定输出长度"要求不再使用(强制长度会把生成推进复制循环,
@@ -436,3 +444,14 @@ AL 与 tok/s 虚高,见 QA #264);本文件里与此冲突的段落一律以本�
 * ⭐ 报数时必须写明"**预热请求数**";未写 = 视为未预热,数据不入表 ✗
 * ⚠️ 来由:2026-10-19 我测 GLM 时**第一条请求就是冷启**(首个 15K prompt 要触达几十 GB 权重页),
   测出 22.0 tok/s,而 README 的 29.8 是"充分预热后取数"——**同配置差 26% 全是冷启** ✓
+
+### 6.3 ⭐⭐ 两个基准工具的机械口径(2026-10-19 实测修正)
+
+1. **prefill(`bench_fixed_protocol.py`)**:`t0` 必须是**批次提交时刻**(在信号量之前),
+   `ttft` 要**包含排队等待**;`prefill = Σ prompt_tokens ÷ max(ttft)`。
+   ⛔ 旧实现把 `t0` 放在拿到并发槽之后 ⇒ C=1 串行 20 条时报 **20,282 tok/s**,
+   而真实约 **1,050 tok/s**(虚高 19×)。已修,2026-10-19 起所有 prefill 数字用修正版 ✓
+2. **decode(`bench_decode_window.py`)**:DSH 的 DSpark 一次 step 可能在一个 SSE chunk 里带**多个 token**,
+   只数 chunk 会把 decode 低估 **AL 倍**(实测 C=1:5.4 vs **42.6 tok/s**)。
+   ⇒ 必须传 **`--tokenizer <model_dir>`**,按窗口内文本的 token 数计;**步时**仍按 chunk 间隔(≈step)✓
+3. 报 decode 时必须同时给 **`--tokenizer`、窗口内 token 数、步时**;缺任一项视为口径不完整 ✗

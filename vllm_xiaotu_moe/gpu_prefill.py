@@ -275,6 +275,7 @@ def _down_kernel(
     BK: tl.constexpr,
     NS: tl.constexpr,
     LUT: tl.constexpr,
+    LIMIT: tl.constexpr = 0.0,
 ):
     pid_e = tl.program_id(0)
     pid_h = tl.program_id(1)
@@ -301,6 +302,9 @@ def _down_kernel(
             up = tl.load(
                 inter_ptr + g_rows[:, None] * inter_ld + (I + kk + tl.arange(0, BK))[None, :],
                 mask=rmask[:, None], other=0.0).to(tl.float32)
+            if LIMIT > 0.0:
+                gate = tl.minimum(gate, LIMIT)
+                up = tl.minimum(tl.maximum(up, -LIMIT), LIMIT)
             sig = 1.0 / (1.0 + tl.math.exp(-gate))
             act = (gate * sig) * up
             b_lo = tl.load(
@@ -347,6 +351,7 @@ def _down_kernel_split(
     BK: tl.constexpr,
     NS: tl.constexpr,
     LUT: tl.constexpr,
+    LIMIT: tl.constexpr = 0.0,
 ):
     """down projection, even/odd-k split (see _gate_up_kernel_split)."""
     pid_e = tl.program_id(0)
@@ -374,6 +379,9 @@ def _down_kernel_split(
             up = tl.load(
                 inter_ptr + g_rows[:, None] * inter_ld + (I + kk + tl.arange(0, BK))[None, :],
                 mask=rmask[:, None], other=0.0).to(tl.float32)
+            if LIMIT > 0.0:
+                gate = tl.minimum(gate, LIMIT)
+                up = tl.minimum(tl.maximum(up, -LIMIT), LIMIT)
             sig = 1.0 / (1.0 + tl.math.exp(-gate))
             act = (gate * sig) * up
             act_e, act_o = tl.split(tl.reshape(act, (BM, BK // 2, 2)))
@@ -1908,6 +1916,7 @@ def gpu_moe_layer(
     device: torch.device,
     slot: "PrefetchSlot | None" = None,
     out_dtype=None,
+    swiglu_limit: float = 0.0,
 ):
     """One layer's routed MoE on GPU (K-major raw bytes, in-kernel fp4 dequant).
 
@@ -1994,7 +2003,8 @@ def gpu_moe_layer(
             inter, inter.stride(0), tok, wts, seg_start,
             w2_t, w2_t.stride(1), s2_t, s2_t.stride(1),
             out, out.stride(0), W2_E, S2_E,
-            H=H, I=I, BM=BM, BH=BH, BK=BK, NS=NS, LUT=_lut, num_warps=NW,
+            H=H, I=I, BM=BM, BH=BH, BK=BK, NS=NS, LUT=_lut,
+            LIMIT=float(swiglu_limit), num_warps=NW,
         )
     else:
         _gate_up_kernel[(E, triton.cdiv(2 * I, BN))](
@@ -2007,7 +2017,8 @@ def gpu_moe_layer(
             inter, inter.stride(0), tok, wts, seg_start,
             w2_t, w2_t.stride(1), s2_t, s2_t.stride(1),
             out, out.stride(0), W2_E, S2_E, lut_t,
-            H=H, I=I, BM=BM, BH=BH, BK=BK, NS=NS, LUT=_lut, num_warps=NW,
+            H=H, I=I, BM=BM, BH=BH, BK=BK, NS=NS, LUT=_lut,
+            LIMIT=float(swiglu_limit), num_warps=NW,
         )
     if _GP_TIMING:
         _gp_add(T, A, _t1 - _t0, time.perf_counter() - _t1)

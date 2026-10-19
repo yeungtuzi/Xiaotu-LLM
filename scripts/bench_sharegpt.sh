@@ -25,7 +25,7 @@ OUT="${OUT:-128}"
 N="${N:-16}"
 CS="${CS:-${C:-1}}"
 SERVER_TAG="${SERVER_TAG:-unknown}"
-TOKENIZER="${TOKENIZER:-/home/user/.cache/modelscope/models/deepseek-ai--DeepSeek-V4.1-Flash/snapshots/master}"
+TOKENIZER="${TOKENIZER:-/home/user/.cache/modelscope/models/deepseek-ai--DeepSeek-V4.1-Flash-1017/snapshots/master}"
 export HF_HUB_OFFLINE=1
 export PATH="${BENCH_ENV:-/home/user/anaconda3/envs/vllm-xiaotu-moe}/bin:$PATH"
 

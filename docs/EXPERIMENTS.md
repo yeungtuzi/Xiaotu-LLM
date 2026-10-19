@@ -33939,3 +33939,53 @@ cudaErrorStreamCaptureUnjoined
 **结案(用户 2026-10-19)**:「若变化不大就不测了,MTP 接受率本身就是随机浮动的」
 ⇒ GLM 记为**持平**(C=1 28.7 vs 29.8 在 MTP 接受率噪声内;C=2/4 34.2/37.6 略高),
 **README 的 GLM 行保持不动**;不再为这 3.7% 追加实验 ✓
+
+### B1058【1017 适配 + TP=2 稳定基准:prefill 1,190/1,197/1,206;decode 42.6/69.7/72.0(C=1/2/4)】
+
+**模型**:`DeepSeek-V4.1-Flash-1017`(**自 2026-10-19 起即 ds41f**)。
+**结论**:架构/权重与 0917 逐字段一致(40 层、384 routed experts top-6、hidden 5120、moe I 2304、
+FP8 32×32 + expert FP4、48 分片/475.3 GiB/96,085 tensors);适配 = 换路径 + 重测,不改模型代码。
+
+**稳定配置**(唯一通过 20 条 15K 压力 + C=4 的配置):
+`TP=2` / `MAXLEN 524288` / `MBT 8192` / `max-num-seqs 4` / `GPU_UTIL 0.70` /
+`DSpark k=5` / `GPU prefill on(2560)` / `PREFIX_CACHE=0` / **PIN off**。
+
+| 并发 | prefill (tok/s) | decode (tok/s, token 计数窗口) | 步时中位 (ms) |
+|---|---|---|---|
+| 1 | **1,190** | **42.6** | 82.3 |
+| 2 | **1,197** | **69.7** | 116.1 |
+| 4 | **1,206** | **72.0** | 190.1 |
+
+* 载荷 `dsh_15k_v2.jsonl`(32 条,24 个 DSH 会话,token 中位 15,000);每档 16 请求。
+* 20 条串行压力:prefill **1,188**,步时 **80.8 ms**,`n_err=0`;峰值 GPU 33.3 GiB。
+* `GPU_UTIL=0.90/0.85/0.75` 均复现 `aten::new_empty` 谷底 OOM(详见 **BUG A68**);
+  `0.70` 首次 prefill free 19.84 GiB,稳定。
+* ⭐ **口径修正**:旧 `bench_fixed_protocol` 的 `t0` 在并发槽之后 ⇒ 串行 20 条报 20,282 tok/s
+  (真实 1,050);已改成批次提交时刻。DSH/DSpark 的 SSE chunk 可能含多个 token,
+  `bench_decode_window` 必须传 `--tokenizer`,否则 decode 低估 AL 倍(5.4 vs 42.6)。见 BENCH_PROTOCOL §6.3。
+* **PIN**:已修 `gpu_prefill.gpu_moe_layer` 缺 `swiglu_limit` 的崩溃,并在 MXFP4 down kernel 补 clamp;
+  但 700 槽在 524K 下即使 `GPU_UTIL=0.85` 仍会在 C=4/持续 prefill 后 OOM(池+KV 太贴顶)⇒ 本行 **PIN off**。
+* README 的 ds41f 行已替换为 1017 数据(util 0.70 / PIN off / 15K v2),并注明与固定 1024 口径不可跨行比较。
+
+**证据**:`logs/v41_1017_p070*.log`、`/tmp/1017_p070_*.log`、`/tmp/1017_p070_stress20.log`。
+
+### B1059【EP vs TP(1017):步时等价(<1%),decode 差异是 AL 噪声;EP 不带来吞吐收益】
+
+**配置**:TP=2 / util 0.70 / MAXLEN 524288 / MBT 8192 / DSpark k=5 / PIN off / 15K v2 / 16 请求每档。
+**两臂**:
+* **EP=1**:默认 CPU 专家分片,每 rank 192 专家,`XIAOTU_MOE_EP=1`(默认);
+* **TP full**:`XIAOTU_MOE_EP=0 XIAOTU_MOE_EP_SHARD_STORAGE=0`,每 rank 384 专家,
+  `[xtu-eng-shape]` 确认 `E=384`,无 EP 分片。
+
+| C | EP=1 步时 ms | TP full 步时 ms | EP=1 decode | TP full decode |
+|---|---|---|---|---|
+| 1 | 82.3 | 82.0 | 42.6 | 42.6 |
+| 2 | 116.1 | 115.6 | 69.7 | 74.9 |
+| 4 | 190.1 | 191.6 | 72.0 | 79.5 |
+
+* **判据用步时**:两臂差 <1% ⇒ **EP 没有让引擎更快**;decode 列差异是 acceptance length 抽样。
+* 宿主 RSS 两臂均约 311 GiB/rank(权重页共享)⇒ 即使 TP full 也没翻倍。
+* **实现**:`enable_expert_parallel` 已桥接到 `_EP_REQUESTED` 并打印 `[xtu-ep]`;
+  1017 PIN 路径补 `swiglu_limit` + MXFP4 clamp(见 A68 同批改动)。
+* **决策**:保持 EP 默认;不投入 DP+EP(需 all-to-all、40GB 显存放不下 attention 复制,且无 ≥5% 证据)。
+  详见 `dev-docs/PLAN_EP_VS_TP_2026-10-19.md` §7。

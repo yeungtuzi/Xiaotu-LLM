@@ -101,8 +101,18 @@ def _dims_from_ckpt() -> tuple[int, int, int] | None:
     **目的是让用户什么都不用填** —— 策略按当前模型自己算预留。
     """
     import json
-    p = os.environ.get("XIAOTU_VRAM_MODEL") or (
-        "/home/user/.cache/modelscope/models/deepseek-ai--DeepSeek-V4.1-Flash/snapshots/master")
+    p = os.environ.get("XIAOTU_VRAM_MODEL")
+    if not p:
+        # ⭐ 2026-10-19:官方权重更新为 1017;旧目录可能已不存在 ⇒ 按优先级探测。
+        for cand in (
+            "/home/user/.cache/modelscope/models/deepseek-ai--DeepSeek-V4.1-Flash-1017/snapshots/master",
+            "/home/user/.cache/modelscope/models/deepseek-ai--DeepSeek-V4.1-Flash/snapshots/master",
+        ):
+            if os.path.exists(os.path.join(cand, "config.json")):
+                p = cand
+                break
+    if not p:
+        return None
     try:
         with open(os.path.join(p, "config.json")) as fh:
             c = json.load(fh)

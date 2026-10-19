@@ -18,7 +18,7 @@ ENV="${ENV:-/home/user/anaconda3/envs/vllm-xiaotu-moe}"
 PORT="${PORT:-8700}"
 TAG="${TAG:-acc}"
 HOST="${HOST:-127.0.0.1}"
-MODEL="${MODEL:-/home/user/.cache/modelscope/models/deepseek-ai--DeepSeek-V4.1-Flash/snapshots/master}"
+MODEL="${MODEL:-/home/user/.cache/modelscope/models/deepseek-ai--DeepSeek-V4.1-Flash-1017/snapshots/master}"
 SERVED="${SERVED:-DeepSeek-V4.1-Flash}"   # ⚠️ 必须与服务的 --served-model-name 一致,否则全部请求 4xx(Successful=0)
 LENS="${LENS:-32,256,1024,4096,16384,32768}"
 CONC="${CONC:-1,2,4,8}"

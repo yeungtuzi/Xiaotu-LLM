@@ -52,6 +52,9 @@ def stream_request(prompt, port, model, max_tokens, out):
                     if "first" not in out:
                         out["first"] = now      # ⭐ 必须**实时**写:轮询线程靠它判"已首 token"
                     times.append(now)
+                    # ⭐ 2026-10-19:DSH 的 DSpark 一次 step 可能在一个 SSE chunk 里带多个 token;
+                    #   只数 chunk 会把 decode 低估 AL 倍。保存文本,窗口结束后用 tokenizer 精确计数。
+                    out.setdefault("texts", []).append((now, ch[0]["text"]))
     except Exception as exc:  # noqa: BLE001
         out["err"] = f"{type(exc).__name__}: {exc}"
         return
@@ -67,6 +70,8 @@ def main():
     ap.add_argument("--window", type=float, default=12.0, help="解码窗口秒数")
     ap.add_argument("--max-tokens", type=int, default=512)
     ap.add_argument("--n", type=int, default=0, help="用前 n 条(默认=conc)")
+    ap.add_argument("--tokenizer", default="",
+                    help="模型目录/tokenizer 路径;给了就按【token 数】算 decode(推荐,DSH/DSpark 必给)")
     a = ap.parse_args()
 
     rows = [json.loads(x) for x in open(a.dataset, encoding="utf-8") if x.strip()]
@@ -101,8 +106,32 @@ def main():
         diag = [(len(o.get("times", [])), o.get("err", "")) for o in outs]
         print(f"并发={a.conc} ⚠️ 窗口内样本不足 diag={diag}"); return 1
     step = st.median(steps)
-    print(f"并发={a.conc} 就绪耗时={t_ready - t_wait:.1f}s 步时中位={step:.1f} ms "
-          f"⇒ 每请求 {1000 / step:.1f} tok/s,聚合 {a.conc * 1000 / step:.1f} tok/s")
+
+    # ⭐ token 口径(主判据):窗口内文本用 tokenizer 重新计数;没有 tokenizer 才退回 chunk 数。
+    tok = None
+    if a.tokenizer:
+        try:
+            from transformers import AutoTokenizer
+            tok = AutoTokenizer.from_pretrained(a.tokenizer, trust_remote_code=True)
+            print(f"[decode-window] tokenizer={a.tokenizer}")
+        except Exception as exc:  # noqa: BLE001
+            print(f"[decode-window] ⚠️ tokenizer 加载失败,退回 chunk 口径: {exc}")
+    rates, ntok_sum = [], 0
+    for o in outs:
+        pairs = [(t, x) for (t, x) in o.get("texts", []) if t_ready <= t <= t_end]
+        txt = "".join(x for _, x in pairs)
+        nt = len(tok.encode(txt, add_special_tokens=False)) if tok is not None else len(pairs)
+        if nt > 0:
+            rates.append(nt / a.window)
+            ntok_sum += nt
+    if rates:
+        print(f"并发={a.conc} 就绪耗时={t_ready - t_wait:.1f}s 步时中位={step:.1f} ms "
+              f"⇒ **每请求 {st.median(rates):.1f} tok/s,聚合 {ntok_sum / a.window:.1f} tok/s** "
+              f"(token 口径;窗口内 tokens={ntok_sum})")
+    else:
+        print(f"并发={a.conc} 就绪耗时={t_ready - t_wait:.1f}s 步时中位={step:.1f} ms "
+              f"⇒ 每请求 {1000 / step:.1f} tok/s,聚合 {a.conc * 1000 / step:.1f} tok/s "
+              f"(chunk 口径;⚠️ 未给 --tokenizer,DSH/DSpark 会低估 AL 倍)")
     return 0
 
 

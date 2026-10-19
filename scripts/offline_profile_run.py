@@ -17,7 +17,7 @@ try:
 except Exception as e:
     print("oom adj failed:", e)
 
-MODEL = "/home/user/.cache/modelscope/models/deepseek-ai--DeepSeek-V4.1-Flash/snapshots/master"
+MODEL = "/home/user/.cache/modelscope/models/deepseek-ai--DeepSeek-V4.1-Flash-1017/snapshots/master"
 DATA = os.environ.get("PROMPT_FILE", "/home/user/tmp/c4rerun_20261012/f_r11.jsonl")
 TRACE_DIR = os.environ.get("TRACE_DIR", "/home/user/lvllm-tmp/p0/proftraces")
 os.makedirs(TRACE_DIR, exist_ok=True)

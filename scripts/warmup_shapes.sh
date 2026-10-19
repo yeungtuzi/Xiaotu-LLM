@@ -13,7 +13,7 @@ set -uo pipefail
 PORT="${PORT:-8077}"
 LENS="${LENS:-8192 32768}"
 MODEL="${MODEL:-DeepSeek-V4.1-Flash}"
-CKPT="${CKPT:-/home/user/.cache/modelscope/models/deepseek-ai--DeepSeek-V4.1-Flash/snapshots/master}"
+CKPT="${CKPT:-/home/user/.cache/modelscope/models/deepseek-ai--DeepSeek-V4.1-Flash-1017/snapshots/master}"
 export PATH="${BENCH_ENV:-/home/user/anaconda3/envs/vllm-xiaotu-moe}/bin:$PATH"
 export HF_HUB_OFFLINE=1
 [ "${WARMUP:-1}" = "1" ] || { echo "[warmup] 跳过(WARMUP=0)"; exit 0; }

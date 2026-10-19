@@ -14,6 +14,38 @@ NVIDIA A100-PCIE-40GB(SM 8.0)· AMD EPYC 9654(无 AMX)。
 
 ---
 
+## 0. ⭐ 0.2.9 各模型最优启动参数(2026-10-19 实测;旧推荐**一律作废**)
+
+> **用户裁定(2026-10-19)**:每个模型的启动脚本按**实测最优**设置,RUNBOOK 同步更新,
+> **旧版本的推荐运行参数一概作废**(包括 `THREADS=120/184`、qfn/GLM 开 MTP、`EAGER=1` 等)。
+
+| 模型 | 推荐命令(关键参数) | 实测 |
+|---|---|---|
+| **qfn**(Qwen3.8-Flash-Next FP8) | `bash scripts/serve_qwen38.sh`(脚本默认即最优;TP=2 需按下方步骤显式给 `GPUS=1,2`) | **bs1 45.6 / C=4 95.7 tok/s**(PIN=0);`XIAOTU_PIN=1` + 64 槽时 **38.6 / 108.4** |
+| **ds41f**(DeepSeek-V4.1-Flash FP8+FP4) | `bash scripts/serve_v41.sh`(脚本默认 = dspark 开、`EAGER=0`、`COMPILE=1`) | **单流 ~50 / C=4 ~100 tok/s** |
+| **glm**(GLM-5.3-Flash) | `bash scripts/serve_glm53_mainline.sh`(脚本默认 = MTP 关、`EAGER=0`、`THREADS=60`) | prefill **1,477/1,441/1,394 tok/s**(B1040 系列) |
+
+⭐ **qfn 的两个硬结论**(B1050):
+1. **必须关 MTP**:开 MTP 40.5 ms/token、关掉 16.3 ms/token(**2.5×**),因为 CPU verify 成本随 qlen 近似线性;
+2. **必须用 `--compilation-config {"cudagraph_mode":"FULL_DECODE_ONLY","mode":"VLLM_COMPILE"}`**
+   (脚本已默认),默认 `FULL_AND_PIECEWISE` 会多抓无用图并挤占显存。
+
+**qfn 的完整启动步骤(TP=2 用 GPU1+2 必须先取得用户当次许可并停生产)**:
+
+```bash
+cd /home/user/lvllm/vllm-xiaotu-moe
+bash scripts/prelaunch_mem_gate.sh --need-gib 900 --gpus 1,2 --tag qfn_029   # 退出码 0 才许启动
+setsid env GPUS=1,2 TP=2 ALLOW_PROD_GPU=1 TAG=qfn_029 \
+  bash scripts/serve_qwen38.sh > /tmp/qfn_029.out 2>&1 < /dev/null &
+setsid nohup bash scripts/host_rss_watchdog.sh --tag qfn_029 --limit-gib 620 \
+  > /tmp/wd_qfn_029.out 2>&1 < /dev/null &
+```
+
+⚠️ **`THREADS=60` 的含义**:TP=2 下 = 每 rank 60、合计 **120 线程 = 5 核/CCD**(本机 SMT 关),
+是"吃满带宽且无争用"的最优点;⛔ **不许上调**。
+
+---
+
 ## 1. 安装主线 vLLM
 
 本插件通过官方 `vllm.general_plugins` 入口加载,**不需要 fork**。混合模式所需的
@@ -1015,7 +1047,10 @@ gh release list --limit 5        # 复核 Latest 是否已切到新版本
 git tag -l        # 复核:v0.1.0 / v0.2.0(0.2pre 的历史 tag)/ v0.2 / v0.2.1
 ```
 
-### 5.9 ⭐ 推荐的生产/挂 harness 配置(最稳定且高效;2026-09-17 定稿)
+### 5.9 ⭐ 推荐的生产/挂 harness 配置(2026-09-17 定稿)
+
+> ⛔ **本节为历史存档,其中"编译关 / 常驻层负收益 / 1M KV"等结论已被 §0(2026-10-19)取代**;
+> 现在各模型请**一律以 §0 的最优参数为准**,本节只保留当时的测量背景 ✓
 
 **一句话:TP=2 / 1M 上下文 / 显式 12 GiB KV / 投机开 / **GPU 预填充关** / 常驻层 0 / 编译关。**
 
@@ -1043,7 +1078,7 @@ curl -s localhost:8700/v1/chat/completions -H 'Content-Type: application/json' \
 | **`GPU_PREFILL_MIN_TOKENS=0`** | **关** | §592/§593/§594:MBT=8192 以下 GPU 预填充的**每 chunk 固定成本 ~11.6 s**(80% 是 staging),默认 chunk(~2048)下只有 **155 tok/s vs CPU 258 tok/s**;要赢需 chunk ≥3000 且先修 §594 的 4 条。**先保证稳定** |
 | `SEQS=8` | 8 | 挂 harness 要并发;KV 12 GiB 足够(短 prompt 下容量以 Mtoken 计) |
 | `MBT=8192` | 8192 | 与 §570 一致;⚠️ **别用 32768**(§593(f) 会 hang) |
-| `COMPILE=0` | 关 | 实测 CUDA graph 无收益(43.19 → 44.73 ms;我们的 step 被 CPU↔GPU 边界切成 41 段) |
+| ~~`COMPILE=0`~~ | ⛔ 作废 | §0 已改为 `COMPILE=1 + FULL_DECODE_ONLY`(2026-10-19 实测图对 decode 是数倍收益) |
 | `GPU_RESIDENT_LAYERS`(空) | 0 层 | §584 实测**负收益**(TPOT 43.19 vs 42.86;C=4 −12%);这块显存改投 KV 收益确定 |
 | `THREADS=60` | 每 rank 60 | 本机 24 CCD 拐点;TP=2 下 184/rank 会 368 线程超订 |
 | `SPIN=300` | 300 | SPIN=0 时每层白付 ~0.5 ms futex(0.94-1.00 vs 0.44 ms/层) |

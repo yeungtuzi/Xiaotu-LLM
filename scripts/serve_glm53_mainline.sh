@@ -75,7 +75,7 @@ GPU_UTIL="${GPU_UTIL:-0.90}"
 # ⭐【2026-10-15 用户定案】默认上下文 512K → **256K**:512K 下 KV 池连一路都装不满
 #   (实测池 416,228 token < 524,288 ⇒ 0.79x);256K 下同一池有 1.59x,再叠加其它显存优化后目标是 **3 路 256K**(SEQS 仍 4)✓
 MAXLEN="${MAXLEN:-262144}"
-MBT="${MBT:-4096}"
+MBT="${MBT:-8192}"  # ⭐ 0.2.9 实测最优(与 qfn/ds41f 对齐;旧 4096 作废)
 # Admission limit. 256K context x 2 concurrent sequences = 524,288 tokens, and the
 # KV pool at this maxlen is 919,520 tokens (measured, util 0.88) => two full-length
 # sequences are guaranteed by construction, with ~40% of the pool left as headroom

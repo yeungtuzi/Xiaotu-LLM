@@ -192,7 +192,7 @@ CED="${CED:-1}"
 #   注意:一旦走 VLLM_COMPILE,vLLM 就会把 TRITON_CACHE_DIR 重定向进它自己按 hash
 #   算出来的目录 ⇒ 换旗标/改我们一行代码都要**逐形状重新 JIT**。下面 source 的
 #   lib_jitcache.sh 就是把那个目录钉死(JITCACHE=1,默认)。见 docs/RUNBOOK.md。
-COMPILE="${COMPILE:-0}"
+COMPILE="${COMPILE:-1}"   # ⭐ 0.2.9 实测最优:编译+全解码图(旧默认 0 → 作废)
 
 # ---- JIT 固定缓存目录(scripts/lib_jitcache.sh 有完整原理)--------------------
 JITCACHE_MODEL="$(basename "$CKPT")"
@@ -455,7 +455,7 @@ fi
     $( [ -n "$DEFAULT_CHAT_KWARGS" ] && printf -- '--default-chat-template-kwargs %s' "${DEFAULT_CHAT_KWARGS// /}" ) \
     $( [ "$KV_DTYPE" != "auto" ] && printf -- '--kv-cache-dtype %s' "$KV_DTYPE" ) \
     $( [ "${PROMPT_TOKENS_DETAILS:-1}" = "1" ] && echo --enable-prompt-tokens-details ) \
-    $( [ "${EAGER:-1}" = "1" ] && echo --enforce-eager )  \
+    $( [ "${EAGER:-0}" = "1" ] && echo --enforce-eager )  \
     $( [ "${CED:-1}" = "0" ] && echo --no-swa-bounded-replay ) \
     $( [ "${SPEC:-1}" = "1" ] && echo --speculative-config "$SPEC_CONFIG" )  \
     $( [ -n "$CC_JSON" ] && printf -- '--compilation-config %s' "$CC_JSON" ) \

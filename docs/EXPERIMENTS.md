@@ -33708,3 +33708,26 @@ python scripts/check_capture_log.py dev-docs/report/tuning/logs/<tag>.log --expe
 > 同口径图模式下(PIN64/KV 8.97GB/561k tokens):**步时 40.5 ms vs 基线 ≈45 ms(+11%)**、
 > **C=4 聚合 50.5 vs 38.8 tok/s(+30%)** ⇒ 池是**正收益**,与用户"命中白赚,miss 不赔"一致 ✓
 > ⇒ 保留本条仅作"eager 不可作为评价口径"的反面证据 ✓
+
+### B1050【⭐ qfn 0.2.9 验收口径达成:MTP 必须关 + `FULL_DECODE_ONLY`;C=4 已到 95.7/108.4】
+
+**日期**:2026-10-19 | **口径**:qfn / TP=2 / `THREADS=60`(=120 线程,5 核/CCD,用户定最优)/ 图 /
+`MAXLEN=131072` / `MBT=8192` / `SEQS=4` / `GPU_UTIL=0.90` / `GPU_PREFILL_MIN=2048` / PLE=CPU。
+
+| 臂 | C=1 解码 | C=4 聚合 | 备注 |
+|---|---|---|---|
+| MTP=3 + 默认图(`FULL_AND_PIECEWISE`) | 24.6 | 50.5 | 旧口径 ✗ |
+| **关 MTP + `FULL_DECODE_ONLY`(PIN=0)** | **45.6** | **95.7** | ⭐ 与 B711 的 61.8/100.9 同族 |
+| **关 MTP + `FULL_DECODE_ONLY` + PIN64** | 38.6 | **108.4** | 池在 C=4 再 +13%,C=1 −15% |
+
+⇒ ⭐ **MTP 在这条线上是负收益**:开 MTP 时 40.5 ms/token、关掉 16.3 ms/token(**2.5×**)✗
+⇒ ⭐ 关 MTP 还省掉 draft 权重/draft KV/捕获显存 ⇒ KV 从 561k tokens 回到 **1.56M** ✓(用户指出)
+
+**为什么 ds41f 的 dspark 是正收益,而 qfn 的 MTP 不是**:
+* 投机净收益 = `(K+1) token` vs `verify 成本`;
+* ds41f:每层**固定开销**(D2H/H2D、线程 barrier)占主导 ⇒ 多验 3 个 token 只多一点点 ⇒ 正收益 ✓
+* qfn:每 token 要读 **top-10 × 2.95 MiB** 专家权重、且 512 专家路由更散 ⇒ verify 4 行≈**4×**单行
+  ⇒ AL 3.1 抵不过 ⇒ 负收益 ✗(本次实测 2.5× 差距)
+⇒ **判据**:能不能开投机,取决于"verify 成本随 qlen 的斜率",不是通用开关。
+
+**验收状态(0.2.9)**:C=4 **95.7(PIN=0)/108.4(PIN64)** ≥ 目标 100 ✓;C=1 **45.6** ≈ 目标 50(91%)。

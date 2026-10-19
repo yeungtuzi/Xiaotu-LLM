@@ -45,15 +45,15 @@ PORT="${PORT:-8140}"        # ⚠️ 不能是 8070(生产)
 #      ⇒ 默认改 **0**;并显式拒绝踩生产的 1/2(除非当次显式 ALLOW_PROD_GPU=1)✗
 GPUS="${GPUS:-0}"           # 【纪律】调试只用 GPU0(生产占 GPU1+GPU2)
 TP="${TP:-1}"               # 【纪律】TP=1
-MAXLEN="${MAXLEN:-8192}"    # 【纪律】上下文尽量短
-MBT="${MBT:-2048}"
-SEQS="${SEQS:-1}"
+MAXLEN="${MAXLEN:-262144}"  # ⭐ 0.2.9 实测最优:256K 上下文(KV 足够大)
+MBT="${MBT:-8192}"   # ⭐ 0.2.9 实测最优
+SEQS="${SEQS:-4}"     # ⭐ 0.2.9 实测最优(ds/glm 同为 4)
 GPU_UTIL="${GPU_UTIL:-0.90}"
 THREADS="${THREADS:-60}"    # ⭐⭐【2026-10-19 用户裁定】60 = 最优解,不许上调;旧 48/120 口径均作废 ✗
 LOAD="${LOAD:-auto}"        # auto=读真权重;dummy=不读盘,只验架构与显存
-EAGER="${EAGER:-1}"         # 单卡调试先从全 eager 起,稳了再上图
+EAGER="${EAGER:-0}"         # ⭐ 0.2.9 实测最优:必须上图(R64;eager 只有图上 1/4~1/2)
 PLE_CPU="${XIAOTU_PLE_CPU:-1}"   # 必须有:PLE 47.8GiB 走主机内存(UVA)
-GPU_PREFILL_MIN="${GPU_PREFILL_MIN:-0}"  # 单卡调试先关 GPU 预填
+GPU_PREFILL_MIN="${GPU_PREFILL_MIN:-2048}"  # ⭐ 0.2.9 实测最优:>0 才启用 tile 环(0=关!)
 KV_DTYPE="${KV_DTYPE:-auto}"
 TOOL_PARSER="${TOOL_PARSER:-}"
 REASONING_PARSER="${REASONING_PARSER:-}"
@@ -95,6 +95,9 @@ NCTL=(); [ -n "$NUMA_CMD" ] && NCTL=($NUMA_CMD)
   #    同一 idiom:未设 ⇒ 不写行 ⇒ 行为逐字不变 ✓
   if [ -n "${XIAOTU_ROUTING_DUMP:-}" ]; then echo "XIAOTU_ROUTING_DUMP=$XIAOTU_ROUTING_DUMP"; fi
   if [ -n "${XIAOTU_PIN_MAXSWAP:-}" ]; then echo "XIAOTU_PIN_MAXSWAP=$XIAOTU_PIN_MAXSWAP"; fi
+  # ⭐ 2026-10-19:异步 CPU 解码是"每层一次 D2H 同步"的既有解药(ds41f: 6.53→1.80 ms/token),
+  #    同样必须经 env 桥(EngineCore 重建 environ)。未设 ⇒ 不写行 ⇒ 行为逐字不变 ✓
+  if [ -n "${XIAOTU_MOE_ASYNC:-}" ]; then echo "XIAOTU_MOE_ASYNC=$XIAOTU_MOE_ASYNC"; fi
 } > "$XTU_ENV_FILE"
 export XIAOTU_ENV_FILE
 
@@ -129,6 +132,14 @@ ARGS=(
 #   【跳过显存剖析】⇒ --gpu-memory-utilization 失效(R24 第 8 条)⇒ 剩下的显存留给
 #   GPU-prefill 的 staging。QFN 实测 ≈72,368 B/token ⇒ 预算 = 目标 token 数 × 该值。
 [ -n "${KV_CACHE_BYTES:-}" ] && ARGS+=(--kv-cache-memory "$KV_CACHE_BYTES")
+# ⭐⭐ 0.2.9 实测最优:全解码图(FULL_DECODE_ONLY)+ 编译模式;
+#   默认 `FULL_AND_PIECEWISE` 在 qfn 上会多抓一份无用图并挤占显存 ✓
+# ⚠️ EAGER=1 是"图捕获崩溃时的回退档" ⇒ 此时**不能**再塞 compilation-config(否则两项自相矛盾)
+if [ "$EAGER" != "1" ] && [[ "${EXTRA_ARGS:-}" != *compilation-config* ]]; then
+  ARGS+=(--compilation-config '{"cudagraph_mode":"FULL_DECODE_ONLY","mode":"VLLM_COMPILE"}')
+elif [ "$EAGER" = "1" ]; then
+  echo "[qwen38] EAGER=1 ⇒ 不注入 compilation-config(回退档保持纯 eager)"
+fi
 [ -n "${EXTRA_ARGS:-}" ] && ARGS+=($EXTRA_ARGS)
 
 echo "[qwen38] tag=$TAG port=$PORT gpus=$GPUS tp=$TP maxlen=$MAXLEN mbt=$MBT load=$LOAD"
@@ -202,7 +213,7 @@ if printf '%s\n' "${TAG}.pid" | grep -qE "$PROD_PIDFILES_RE"; then
   exit 3
 fi
 
-MEM_GATE_GIB="${MEM_GATE_GIB:-250}"  # QFN 实测宿主 ~163 GiB(FP8)/~107 GiB(MXFP4)
+MEM_GATE_GIB="${MEM_GATE_GIB:-500}"  # ⭐ AGENTS 2026-10-19:A.2 qfn TP=2 = 500 GiB(旧 250 过松,作废)
 _avail="$(LC_ALL=C awk '/MemAvailable/{printf "%d", $2/1048576}' /proc/meminfo 2>/dev/null || true)"
 # ⭐ 审计 MAJOR 修复:两个数都必须校验成整数 —— 否则 `[ "$_avail" -lt "$MEM_GATE_GIB" ]` 报错,
 #   在 set -e 下**直接退出**或(视写位置)被吞掉 ⇒ 共存内存门 **fail-open** ✗

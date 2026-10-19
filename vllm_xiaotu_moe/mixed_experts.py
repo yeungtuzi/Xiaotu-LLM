@@ -2558,17 +2558,21 @@ class _XiaotuExpertsMixin:
             #    区别只在 `qlen`(预填时 qlen 很大 ✓)⇒ 找它不能用 `cpu_prefill`(引擎里另有一套 ✗,
             #    本路径根本不调用 ✓)。我第一次就是搜错了名字,才误判"生产不走 CPU 预填" ✗。
             # 目的与 GPU 侧一致:长预填期间每 ~10s 报一次,带 qlen ⇒ 卡死时知道停在哪层、多少 token ✓
-            if os.environ.get("XIAOTU_PF_PROGRESS", "1") == "1":
+            # ⛔⛔ 2026-10-19【捕获作废真凶 · 第二处】这里原来打印 `int(ids_i32[0,0])`
+            #   —— 对 GPU 张量取 int() 就是 `.item()`(**同步设备**)⇒ 落在 CUDA capture
+            #   窗口内即作废捕获(error 在后续 `out.to(dtype)` 才抛,容易误判位置)✗
+            #   ⇒ 心跳只保留 host 侧信息;并且再加 `_in_capture_window()` 守卫(双保险)✓
+            if (os.environ.get("XIAOTU_PF_PROGRESS", "1") == "1"
+                    and not _in_capture_window()):
                 try:
                     _nowc = time.perf_counter()
                     if _nowc - _PF_HB.get("tc", 0.0) >= float(os.environ.get("XIAOTU_PF_PROGRESS_SEC", "2")):
                         _PF_HB["tc"] = _nowc
                         _PF_HB["nc"] = int(_PF_HB.get("nc", 0)) + 1
                         _PF_CALL["n"] = int(_PF_CALL.get("n", 0)) + 1
-                        print("[xtu-pf-progress] %s device=cpu layer=%s qlen=%d call=%d ids0=%s"
+                        print("[xtu-pf-progress] %s device=cpu layer=%s qlen=%d call=%d"
                               % (time.strftime("%H:%M:%S"),
-                                 getattr(layer, "layer_name", "?"), qlen, _PF_CALL["n"],
-                                 int(ids_i32[0, 0]) if ids_i32.numel() else -1),
+                                 getattr(layer, "layer_name", "?"), qlen, _PF_CALL["n"]),
                               flush=True)
                 except Exception:  # noqa: BLE001  心跳绝不影响主流程 ✓
                     pass

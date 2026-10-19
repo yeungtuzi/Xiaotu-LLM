@@ -339,6 +339,29 @@ def gp_capturing() -> bool:
         return False
 
 
+def _in_capture_window() -> bool:
+    """捕获/预热窗口判定 —— ⭐ **不要只用 `is_current_stream_capturing()`** ✗
+
+    实测(B1049,2026-10-19):vLLM 的 breakable cudagraph 在**捕获流**上捕获,而本插件的
+    Python 代码执行时"当前流"未必是捕获流 ⇒ `is_current_stream_capturing()` 返回 **False**
+    ⇒ 命中率打印里的 `.item()` 落在捕获窗口内 ⇒ 捕获作废/`device-side assert` ✗
+    (证据:日志里 `Capturing CUDA graphs (PIECEWISE): 14%` 那一行**紧跟**
+     `[xtu-pin][hit] ... calls=1` 打印 ⇒ 明明在捕获却打印了 ✓)
+
+    ⇒ 用**进程级窗口标志** `in_warmup_or_capture()`(由 `compile_or_warm_up_model` 设置,
+    进程内可靠 ✓)与流级判定**取或**;与 `gpu_prefill` 侧流守卫(:2086)同一判据 ✓
+    """
+    try:
+        from vllm_xiaotu_moe.gpu_prefill import gp_capturing, in_warmup_or_capture
+        return bool(gp_capturing() or in_warmup_or_capture()
+                    or torch.cuda.is_current_stream_capturing())
+    except Exception:  # noqa: BLE001
+        try:
+            return bool(torch.cuda.is_current_stream_capturing())
+        except Exception:  # noqa: BLE001
+            return False
+
+
 # --- ping/pong K-major + cross-layer prefetch -------------------------------
 # WHY (and its cost): the assembly of layer L is 135-200 ms of pure H2D while the
 # compute it can hide behind *within* layer L is only its attention (~80 ms) plus
@@ -2629,7 +2652,7 @@ class _XiaotuExpertsMixin:
                     _pinp.note_routing(ids_i32)
                 except Exception:  # noqa: BLE001  自适应绝不许影响主流程 ✓
                     pass
-                if not torch.cuda.is_current_stream_capturing():
+                if not _in_capture_window():
                     try:
                         _pinp.maybe_adapt(_gp_mod, staging_active=bool(_gpu_pf))
                     except Exception:  # noqa: BLE001  自适应绝不许影响主流程 ✓
@@ -2679,7 +2702,16 @@ class _XiaotuExpertsMixin:
                     #   实测(drive74):`[xtu-pin][hit] hits=0/65536=0.000%` × 1008 行 ✗
                     #   ⇒ 修:**比池自己的基址 `n_local`**,与 `_fp8_kmajor_tiled`
                     #      (`expert_pool.py:210/213` 用 `n_local` 作分片尺寸)语义一致 ✓
-                    _res = (_sl >= _pinp.n_local) & (ids_i32 >= 0)
+                    # ⛔⛔【2026-10-19 图捕获修复】profile/warmup 期 `ids=-1` 是哨兵 ✗
+                    #   实测(B1049):`Capturing CUDA graphs` 一开始就
+                    #   `device-side assert triggered`,日志逐字
+                    #   `[xtu-pf-progress] qlen=32 call=16 ids0=-1`;
+                    #   根因:`cpu_ids = where(_res, 0, ids_i32)` 对 -1 **原样透传**,
+                    #   引擎按 `uint32` 解释 ⇒ 0xFFFFFFFF 越界 ✗
+                    #   ⇒ 把无效 id 也并入"未命中"分支:CPU 收到 0 + 权重 0(安全),
+                    #      GPU 侧走 -1(内核对 -1 已有跳过语义)✓
+                    _bad = ids_i32 < 0
+                    _res = (_sl >= _pinp.n_local) & (~_bad)
                     # env 门的一次性命中率取证(默认关 ⇒ 逐字零行为变化)。
                     # 来由(2026-10-14):臂差为负时必须能区分"表太稀 ⇒ 命中率低"与
                     # "命中率够但 fork/join 固定开销吃掉收益",否则只能靠猜。
@@ -2737,7 +2769,7 @@ class _XiaotuExpertsMixin:
                         _hacc.add_(_res.sum())     # 命中数(设备端 ⇒ 可入图 ✓)
                         _tacc.add_(_res.numel())   # 分母(形状在捕获时定型 ✓)
                         _nacc.add_(1)              # 调用次数(含图重放 ✓)
-                        if not torch.cuda.is_current_stream_capturing():
+                        if not _in_capture_window():
                             _every = int(os.environ.get("XIAOTU_PIN_HITSTAT_EVERY", "1024") or 1024)
                             _hn = int(_nacc.item())    # ⭐ 全流程唯一一次同步 ✓
                             if _hn == 1 or _hn % max(1, _every) == 0:
@@ -2747,7 +2779,7 @@ class _XiaotuExpertsMixin:
                                     getattr(layer, "layer_name", "?").split(".")[-4],
                                     _hh, _tt, (100.0 * _hh / _tt) if _tt else 0.0, _hn,
                                     int(_pinp.planes[0].shape[0]), int(_E), int(qlen)), flush=True)
-                    cpu_ids = torch.where(_res, _zids, ids_i32)
+                    cpu_ids = torch.where(_res | _bad, _zids, ids_i32)
                     cpu_w = torch.where(_res, _zw, wts_f32)
                     _ev_mask = getattr(self, "_pin_ev_mask", None)
                     if _ev_mask is None:

@@ -265,7 +265,18 @@ class LayerPool:
         if self.nslots == 0 or self._hits is None or self._win_t is None:
             return
         idx = topk_ids.reshape(-1).to(torch.long)
-        self._hits.index_add_(0, idx, torch.ones_like(idx, dtype=torch.int32))
+        # ⛔⛔【2026-10-19 · 图捕获期 `device-side assert` 的**真凶**】
+        #   profile/warmup/捕获期的路由 id 是 **-1 哨兵**;本方法为了"图内也要计数"
+        #   被**移到捕获守卫之外**无条件调用 ⇒ `index_add_(idx=-1)` 越界 ✗
+        #   ⇒ `CUDA error: device-side assert triggered`(B1049 逐字复现)✗
+        #   ⭐ 修法与 B706/B889 同一族:**device 侧把无效 id 归零 + 权重 0**,
+        #     不删除、不改形状、不做 `.item()` ⇒ 仍可被 CUDA graph 捕获 ✓
+        _n = self._hits.numel()
+        _bad = (idx < 0) | (idx >= _n)
+        _safe = torch.where(_bad, torch.zeros_like(idx), idx)
+        _w = torch.where(_bad, torch.zeros_like(idx, dtype=torch.int32),
+                         torch.ones_like(idx, dtype=torch.int32))
+        self._hits.index_add_(0, _safe, _w)
         self._win_t += 1
 
     def swap_in(self, gp, new_expert: int, s: int):

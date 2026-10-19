@@ -33658,3 +33658,53 @@ tile 口径 / staging need·actual / KV 容量与并发表;⛔ 并**自我更正
   ①更大显存/更省槽的方案(如 FP8 槽再压缩、tile 级驻留),或 ②只对**极高集中度**的层开池。
 * ⛔ **证据等级**:步时/命中率/接受率/QA = **实测**(单实例、预热后、加盐);
   "128 槽需 16.9 GiB" = 算术(2.81 MiB/槽 ×128×48)。
+
+### B1049【⭐ 图模式下"热专家池"真赢了:eager 的负结论作废;顺带修掉图捕获的第 3 个 -1 与失效守卫】
+
+**日期**:2026-10-19 | **口径**:qfn / TP=2 / MTP=3 / `MAXLEN=262144` / `MBT=8192` / `KV_CACHE_BYTES=8.97GB`
+(561,129 tok)/ `SEQS=4` / `THREADS=60` / `GPU_UTIL=0.90` / **图(EAGER=0,`FULL_AND_PIECEWISE`)**。
+
+#### 1. 三臂对照(同机、单实例、预热后)
+
+| 臂 | 步时(单流) | 单流解码 | C=4 聚合解码 | MTP 接受率 |
+|---|---|---|---|---|
+| eager 基线(PIN=0) | 78.9 ms | 12.7 tok/s | — | 70.7% |
+| eager + PIN64 | 118.5 ms | 8.1 | — | 70.2% |
+| **图 基线(PIN=0)** | **≈45 ms**(22.1 tok/s) | **22.1** | **38.8** | 70.9% |
+| **图 + PIN64** | **40.5 ms** | **24.6** | **50.5** | 70.3% |
+
+⇒ ⭐ **图 + 池:单流 +11%、C=4 聚合 +30%**;而 eager 下同一个池是 −50% ✗
+⇒ **完全符合 R64**:eager 不是本架构工作点,eager 的"池不划算"结论**作废**(B1048 已加勘误)✓
+
+⚠️ **口径差异(必须记住)**:图基线捕获时 `GPU_PREFILL_MIN=2048` **2/2 崩**
+(`device-side assert` / `StreamCaptureInvalidated`),故基线改用 `GPU_PREFILL_MIN=0`(只关预填 tile 环,
+**decode 路径完全相同**)⇒ 上表 decode 可比;prefill 不可比。
+
+#### 2. 本轮修掉的两个图捕获真阻塞(属 R65)
+
+1. ⭐ **`note_routing` 的 `index_add_(-1)`**:profile/warmup/捕获期 id 是 `-1` 哨兵,
+   该方法为"图内也计数"被移到守卫外无条件调用 ⇒ 越界 ⇒ `device-side assert` ✓
+   ⇒ 修:device 侧 `bad = idx<0|idx>=N` → `safe=0, w=0`(不改形状、不删元素)✓
+2. ⭐ **守卫本身失效**:`torch.cuda.is_current_stream_capturing()` 在 vLLM 捕获流上返回 **False**,
+   导致命中率打印里的 `.item()` 落进捕获区;日志逐字证据 =
+   `Capturing CUDA graphs (PIECEWISE): 14%[xtu-pin][hit] ... calls=1`(同一物理行)✓
+   ⇒ 修:新增 `_in_capture_window()`(`gp_capturing() or in_warmup_or_capture() or 流级判断`)✓
+
+#### 3. 机械验收(新增,以后每图臂必跑)
+
+```bash
+python scripts/check_capture_log.py dev-docs/report/tuning/logs/<tag>.log --expect-capture
+```
+判据:有 `Capturing`、无 `device-side assert|StreamCaptureInvalidated|CUDA error`、
+**捕获未完成且进度条同行有插件打印 = FAIL;完成了 = WARN(仍需回炉守卫)**。
+
+#### 4. 仍待查
+* PIN=0 + `GPU_PREFILL_MIN=2048` 的图捕获为何 2/2 崩(池臂同配置却能过)⇒ 下一步用同一份日志
+  对比 `forward_fn` 栈,定位是 tile 环的 H2D 还是 `in_warmup_or_capture` 覆盖不全。
+* 图 + PIN64 的命中率/换入次数需在**重放**下再取一次(本次 384 次换入、命中窗口打印在捕获期被压掉)。
+
+> ⛔ **B1048 勘误(2026-10-19 当晚,见 B1049)**:上表及结论全部是 **eager** 口径,
+> 而 R64 明令"解码一律 CUDA Graph、不许 eager" ⇒ **"池是负优化"的结论作废** ✗。
+> 同口径图模式下(PIN64/KV 8.97GB/561k tokens):**步时 40.5 ms vs 基线 ≈45 ms(+11%)**、
+> **C=4 聚合 50.5 vs 38.8 tok/s(+30%)** ⇒ 池是**正收益**,与用户"命中白赚,miss 不赔"一致 ✓
+> ⇒ 保留本条仅作"eager 不可作为评价口径"的反面证据 ✓

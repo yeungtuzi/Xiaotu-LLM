@@ -214,9 +214,18 @@ class LayerPool:
             dst=dst, e0=int(e), e1=int(e) + 1)
 
     def _load_all(self, gp) -> None:
-        """槽加载 = 逐专家复用 noraw 子路径(e0..e1=单专家,dst=槽 view)。"""
+        """槽加载 = 逐专家复用 noraw 子路径(e0..e1=单专家,dst=槽 view)。
+
+        ⛔ **fail-closed**(2026-10-19 审计 MAJOR 修复):`_load_slot` 在引擎缺少
+        `copy_hostbuf_to_device_2d` 等情况下会**返回 None 且不抛**。原实现丢弃返回值
+        ⇒ `torch.empty` 的 planes 原样参与计算 ⇒ 输出是垃圾,而日志一个字都没有 ✗。
+        ⇒ 现在任一槽装载失败 ⇒ 直接抛错(建池失败 ⇒ 上层明确失败,绝不静默算错)。
+        """
         for e, s in self.slot_of.items():
-            self._load_slot(gp, e, s)
+            if self._load_slot(gp, e, s) is None:
+                raise RuntimeError(
+                    f"expert_pool: 槽装载失败(layer{self.layer_idx} expert={e} slot={s})"
+                    f" ⇒ 拒绝使用未初始化的 plane")
         torch.cuda.synchronize()
 
     def as_slot(self):
@@ -308,6 +317,18 @@ class LayerPool:
         self._hits.zero_()
         self._win_t.zero_()
         cd = {e: c for e, c in enumerate(counts) if c}
+        # ⭐ 2026-10-18 诊断(gated,默认关):把"热度到底有多集中"打成一行 ——
+        #    没有这个数,就无法判断"自适应 0 次"是【路由均匀】还是【策略/装载坏了】✗
+        #    只在窗口边界执行一次,且不碰任何 CUDA API ⇒ 对被测物零影响 ✓
+        if os.environ.get("XIAOTU_PIN_DEBUG", "0") == "1" and cd:
+            tot = sum(cd.values())
+            top = sorted(cd.values(), reverse=True)
+            cum = []
+            for n in (8, 16, 32, 64, 128, 256):
+                cum.append(f"top{n}={100.0 * sum(top[:n]) / tot:.1f}%")
+            print(f"[xtu-pin][dist] layer{self.layer_idx}: experts={len(cd)}/"
+                  f"{self.n_local} events={tot} slots={self.nslots} " + " ".join(cum),
+                  flush=True)
         evict, load = plan_swap(
             self.expert_of, cd, self.nslots,
             hyst=float(os.environ.get(_ENV_HYST, "0.25") or 0.25),
@@ -316,14 +337,29 @@ class LayerPool:
             #    置 1 ⇒ 平局时换出**最新**用过的(它们多是 prefill 的一次性路由),
             #    保住解码期建立的驻留集 ✓ 默认 0 = LRU(既有行为,逐字不变)✓
             preserve_oldest=(os.environ.get("XIAOTU_PIN_PRESERVE_OLDEST", "0") == "1"))
+        _dbg = os.environ.get("XIAOTU_PIN_DEBUG", "0") == "1"
+        if _dbg:
+            print(f"[xtu-pin][plan] layer{self.layer_idx}: evict={len(evict)} "
+                  f"load={len(load)} slots={self.nslots}", flush=True)
         n = 0
         for victim, e in zip(evict, load):
             if victim not in self.expert_of:
                 continue
             s = self.expert_of.index(victim)
             self.swap_out(s)
-            if self.swap_in(gp, e, s) is not None:
+            try:
+                _got = self.swap_in(gp, e, s)
+            except Exception as _se:  # noqa: BLE001
+                # ⛔ 原先此异常被调用方 `except: pass` 吞掉 ⇒ 现场只看到"0 次换入"
+                if _dbg:
+                    print(f"[xtu-pin][swap-err] layer{self.layer_idx} expert{e} slot{s}: "
+                          f"{type(_se).__name__}: {str(_se)[:160]}", flush=True)
+                raise
+            if _got is not None:
                 n += 1
+            elif _dbg:
+                print(f"[xtu-pin][swap-none] layer{self.layer_idx} expert{e} slot{s}: "
+                      f"loader returned None", flush=True)
         if n:
             print(f"[xtu-pin-adapt] layer{self.layer_idx}: swapped_in={n} "
                   f"total_in={self.swaps_in} total_out={self.swaps_out}", flush=True)

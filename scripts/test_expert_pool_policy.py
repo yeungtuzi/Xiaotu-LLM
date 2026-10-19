@@ -23,6 +23,10 @@ sys.path.insert(0, REPO)
 from vllm_xiaotu_moe import expert_pool as EP  # noqa: E402
 from vllm_xiaotu_moe.expert_pool import LayerPool, plan_swap  # noqa: E402
 
+# ⚠️ 插件 import 时可能从 env 桥(XIAOTU_ENV_FILE,默认 /tmp/xiaotu_env)回填环境变量
+# ⇒ 必须在 import **之后**再清一次,否则"默认关"的行为验证会被外部 envfile 污染 ✗
+os.environ.pop("XIAOTU_PIN_WINDOW", None)
+
 FAIL = []
 
 
@@ -90,14 +94,23 @@ def main() -> int:
        "§4.3 fail-closed:默认 staging_active=True(⇒ 默认什么都不做)")
 
     # ---------------- ③ 默认关闭 / fail-closed 的**行为**验证 ----------------
-    stub = types.SimpleNamespace(nslots=0, _hits=None, _win=0)
+    # ⭐ 2026-10-17:窗口计数已由 Python int `_win` 改为 device 标量 `_win_t`
+    #    (SPEC §9.1 图安全)⇒ 桩对象必须同步,否则行为验证会因为 **AttributeError** 假失败 ✗
+    import torch
+
+    def _stub(**kw):
+        base = dict(nslots=0, _hits=None, _win_t=torch.zeros((), dtype=torch.int64))
+        base.update(kw)
+        return types.SimpleNamespace(**base)
+
+    stub = _stub(nslots=0, _hits=None)
     ck(LayerPool.maybe_adapt(stub, None) == 0, "零槽 ⇒ 0")
-    stub2 = types.SimpleNamespace(nslots=4, _hits=None, _win=0)
+    stub2 = _stub(nslots=4, _hits=None)
     ck(LayerPool.maybe_adapt(stub2, None) == 0, "还没统计过 ⇒ 0")
-    stub3 = types.SimpleNamespace(nslots=4, _hits=object(), _win=999)
+    stub3 = _stub(nslots=4, _hits=object(), _win_t=torch.full((), 999, dtype=torch.int64))
     ck(LayerPool.maybe_adapt(stub3, None) == 0,
        "⛔ 默认 staging_active(无法判定安全性)⇒ 0(fail-closed)")
-    stub4 = types.SimpleNamespace(nslots=4, _hits=object(), _win=999)
+    stub4 = _stub(nslots=4, _hits=object(), _win_t=torch.full((), 999, dtype=torch.int64))
     ck(LayerPool.maybe_adapt(stub4, None, staging_active=False) == 0,
        "窗口开关未设(XIAOTU_PIN_WINDOW 缺省)⇒ 0(默认关)")
 

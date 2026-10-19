@@ -1176,6 +1176,53 @@ class _XiaotuExpertsMixin:
         )
         return slot
 
+    def _ensure_resident_fp8(self, layer: torch.nn.Module):
+        """FP8 常驻层:复用 `expert_pool.LayerPool` 的**满槽**形态 + `gpu_moe_layer_fp8`。
+
+        为什么复用池而不是新写一套:
+          * 池的 4-plane 布局与 `_fp8_tile_ring` **逐字节同构**(B918 实测 4/4 平面 0 字节差);
+          * 装载走 `_fp8_kmajor_tiled`;计算入口 `gpu_moe_layer_fp8` 的尺度视图 bug 已在
+            B923 修好(同缓冲双入口对拍 `rms_rel=4.4e-3`,B919/B917);
+          * ⛔ 原来的 `_resident` 分支调用的是 **MXFP4** 的 `gpu_prefill.gpu_moe_layer` +
+            `_pinned_kmajor`,对 FP8 布局/尺度不成立 ⇒ 只能给 ds41f 用;
+        控制流参考 lsglang 的层常驻(`is_lk_moe_gpu_resident_layer` / `layer.py:518-528`
+        角色在 __init__ 定死;`loader.py:150-156` 非驻留层不下发显存):
+        我们这里由 `XIAOTU_MOE_GPU_RESIDENT_LAYERS` 在**加载期**选层,常驻层把**全专家**
+        一次性搬上 GPU,之后 prefill/decode 都直接用,不再有任何 H2D。
+
+        槽序 == 专家号(`pinned=sorted(range(E))`)⇒ 传给内核的 id 就是**全局专家号**,
+        不需要 pool 的 slotmap 重映射,也不需要 mask/partial(命中率恒 100%)。
+        """
+        pool = getattr(self, "_resident_fp8_pool", None)
+        if pool is not None:
+            return pool
+        from vllm_xiaotu_moe import expert_pool as _xp
+
+        eng = self._ensure_engine(layer)
+        dev = torch.device("cuda", torch.cuda.current_device())
+        E = int(getattr(self, "_E_eng", 0))
+        H = int(getattr(self, "_H_eng", 0))
+        I = int(getattr(self, "_I_eng", 0))
+        if E <= 0 or H <= 0 or I <= 0:
+            raise RuntimeError(
+                f"resident(fp8): bad geometry E={E} H={H} I={I} (layer="
+                f"{getattr(layer, 'layer_name', '?')})")
+        import re as _re
+        _m = _re.search(r"layers\.(\d+)", getattr(layer, "layer_name", ""))
+        idx = int(_m.group(1)) if _m else -1
+        pool = _xp.LayerPool(
+            eng, dev, H, I, int(self._group_k), E, list(range(E)),
+            layer_idx=idx, layout="fp8",
+            topk=int(self.moe_config.experts_per_token))
+        _gib = sum(p.numel() * p.element_size() for p in pool.planes) / 2**30
+        print(
+            f"[vllm-xtu-moe] GPU-resident(fp8) layer{idx}: {E} experts, "
+            f"{_gib:.2f} GiB on {dev}; prefill/decode 均直接读 GPU plane,**无 H2D**",
+            flush=True,
+        )
+        self._resident_fp8_pool = pool
+        return pool
+
     def _ensure_engine(self, layer: torch.nn.Module):
         if self._xiaotu_engine is not None:
             return self._xiaotu_engine
@@ -1867,22 +1914,37 @@ class _XiaotuExpertsMixin:
         if _sync == "1" or (_sync == "pre") or (_sync == "first" and _is_first):
             torch.cuda.synchronize()
         if _resident:
-            # 常驻层:整层 MoE 在 GPU 上算(权重已在 GPU 且已转 K-major,无 H2D)。
-            from vllm_xiaotu_moe.gpu_prefill import gpu_moe_layer
+            # 常驻层:整层 MoE 在 GPU 上算(权重已在 GPU 且已转 K-major,**无 H2D**)。
+            # ⭐ 2026-10-19:FP8 走**独立的满槽池**路径(复用池的 4-plane + 已修好的
+            #    `gpu_moe_layer_fp8`);旧路径的 `gpu_moe_layer` + `_pinned_kmajor` 是
+            #    MXFP4 专用,对 FP8 的布局/尺度不成立 ⇒ 不能混用。
+            if getattr(self, "_engine_attr", "") == "MOE_FP8":
+                from vllm_xiaotu_moe.gpu_prefill_fp8 import gpu_moe_layer_fp8
 
-            # ⚠️ 必须先建槽位:`_resident_I` 是在 `_ensure_resident` 里设置的,
-            # 而 kwargs 从左到右求值 —— 写成 slot=... 在同一行会在 I= 之后被求值 ⇒ AttributeError。
-            _slot = self._ensure_resident(layer)
-            out = gpu_moe_layer(
-                h_bf16, ids_i32, wts_f32,
-                getattr(self, "_engine_w13", None) if getattr(self, "_engine_w13", None) is not None else layer.w13_weight,
-                None,
-                getattr(self, "_engine_w2", None) if getattr(self, "_engine_w2", None) is not None else layer.w2_weight,
-                None,
-                H=hidden_size, I=self._resident_I,
-                K=int(self.moe_config.experts_per_token),
-                device=h_bf16.device, slot=_slot,
-            )
+                _pool = self._ensure_resident_fp8(layer)
+                out = gpu_moe_layer_fp8(
+                    h_bf16, ids_i32, wts_f32, *_pool.planes,
+                    H=int(self._H_eng), I=int(self._I_eng),
+                    K=int(self.moe_config.experts_per_token),
+                    device=h_bf16.device,
+                    swiglu_limit=float(getattr(self, "swiglu_limit", 0.0) or 0.0),
+                )
+            else:
+                from vllm_xiaotu_moe.gpu_prefill import gpu_moe_layer
+
+                # ⚠️ 必须先建槽位:`_resident_I` 是在 `_ensure_resident` 里设置的,
+                # 而 kwargs 从左到右求值 —— 写成 slot=... 在同一行会在 I= 之后被求值 ⇒ AttributeError。
+                _slot = self._ensure_resident(layer)
+                out = gpu_moe_layer(
+                    h_bf16, ids_i32, wts_f32,
+                    getattr(self, "_engine_w13", None) if getattr(self, "_engine_w13", None) is not None else layer.w13_weight,
+                    None,
+                    getattr(self, "_engine_w2", None) if getattr(self, "_engine_w2", None) is not None else layer.w2_weight,
+                    None,
+                    H=hidden_size, I=self._resident_I,
+                    K=int(self.moe_config.experts_per_token),
+                    device=h_bf16.device, slot=_slot,
+                )
         elif _gpu_pf:
             # ---- 长 prefill:本层专家在 GPU 上算(逐层流式权重) ----------------
             # 权重来源优先用**引擎自有的紧凑分片**(NOTES §459):这些分片合起来正好

@@ -90,6 +90,11 @@ NCTL=(); [ -n "$NUMA_CMD" ] && NCTL=($NUMA_CMD)
   if [ -n "${XIAOTU_PIN_WINDOW:-}" ]; then echo "XIAOTU_PIN_WINDOW=$XIAOTU_PIN_WINDOW"; fi
   if [ -n "${XIAOTU_PIN_HYST:-}" ]; then echo "XIAOTU_PIN_HYST=$XIAOTU_PIN_HYST"; fi
   if [ -n "${XIAOTU_PIN_HITSTAT:-}" ]; then echo "XIAOTU_PIN_HITSTAT=$XIAOTU_PIN_HITSTAT"; fi
+  # ⭐ 2026-10-17:路由 dump 与换入限流也必须经 env 桥 —— EngineCore 会**重建 environ**
+  #    ⇒ 只 export 到 shell 的变量会被丢掉(实测:XIAOTU_ROUTING_DUMP 未生效,dump 文件 0 字节)✗
+  #    同一 idiom:未设 ⇒ 不写行 ⇒ 行为逐字不变 ✓
+  if [ -n "${XIAOTU_ROUTING_DUMP:-}" ]; then echo "XIAOTU_ROUTING_DUMP=$XIAOTU_ROUTING_DUMP"; fi
+  if [ -n "${XIAOTU_PIN_MAXSWAP:-}" ]; then echo "XIAOTU_PIN_MAXSWAP=$XIAOTU_PIN_MAXSWAP"; fi
 } > "$XTU_ENV_FILE"
 export XIAOTU_ENV_FILE
 

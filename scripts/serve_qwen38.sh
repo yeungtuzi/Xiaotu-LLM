@@ -53,7 +53,11 @@ THREADS="${THREADS:-60}"    # ⭐⭐【2026-10-19 用户裁定】60 = 最优解,
 LOAD="${LOAD:-auto}"        # auto=读真权重;dummy=不读盘,只验架构与显存
 EAGER="${EAGER:-0}"         # ⭐ 0.2.9 实测最优:必须上图(R64;eager 只有图上 1/4~1/2)
 PLE_CPU="${XIAOTU_PLE_CPU:-1}"   # 必须有:PLE 47.8GiB 走主机内存(UVA)
-GPU_PREFILL_MIN="${GPU_PREFILL_MIN:-2048}"  # ⭐ 0.2.9 实测最优:>0 才启用 tile 环(0=关!)
+GPU_PREFILL_MIN="${GPU_PREFILL_MIN:-2048}"
+# ⭐ 2026-10-19【最优默认】12 层精选常驻(按 CPU 时间/活跃专家数选出;B1053/B1055)
+#   实测 15K 自然结束:decode 46.0/43.8/44.0(C=1/2/4),比无常驻的 45.6 更高、步时更低 ✓
+#   ⛔ 不要再叠加热专家池:12 层 + 64 槽会挤爆 KV(实测 `No available memory for the cache blocks`)
+XIAOTU_MOE_GPU_RESIDENT_LAYERS="${XIAOTU_MOE_GPU_RESIDENT_LAYERS:-15,9,11,16,31,3,39,25,7,23,24,13}"  # ⭐ 0.2.9 实测最优:>0 才启用 tile 环(0=关!)
 KV_DTYPE="${KV_DTYPE:-auto}"
 TOOL_PARSER="${TOOL_PARSER:-}"
 REASONING_PARSER="${REASONING_PARSER:-}"
@@ -100,6 +104,7 @@ NCTL=(); [ -n "$NUMA_CMD" ] && NCTL=($NUMA_CMD)
   if [ -n "${XIAOTU_MOE_ASYNC:-}" ]; then echo "XIAOTU_MOE_ASYNC=$XIAOTU_MOE_ASYNC"; fi
   # ⭐ 2026-10-19:第一步=静态驻留(启动期装载,decode 期零传输)⇒ 该开关必须能被透传
   if [ -n "${XIAOTU_PIN_STATIC:-}" ]; then echo "XIAOTU_PIN_STATIC=$XIAOTU_PIN_STATIC"; fi
+  if [ -n "${XIAOTU_MOE_GPU_RESIDENT_LAYERS:-}" ]; then echo "XIAOTU_MOE_GPU_RESIDENT_LAYERS=$XIAOTU_MOE_GPU_RESIDENT_LAYERS"; fi
   # ⭐ 2026-10-19:逐层 CPU 计时(选常驻层要用)与池的逐层集中度统计
   if [ -n "${XIAOTU_CD_TIMING:-}" ]; then echo "XIAOTU_CD_TIMING=$XIAOTU_CD_TIMING"; fi
   if [ -n "${XIAOTU_CD_TIMING_EVERY:-}" ]; then echo "XIAOTU_CD_TIMING_EVERY=$XIAOTU_CD_TIMING_EVERY"; fi

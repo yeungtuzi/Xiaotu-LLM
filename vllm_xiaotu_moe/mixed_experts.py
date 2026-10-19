@@ -2263,19 +2263,28 @@ class _XiaotuExpertsMixin:
                     # 装配点【每层必过】⇒ 在这里 10 秒节流上报一次,长 step 期间也持续有输出 ✓,
                     # 并且带【真实进度】(qlen/层号/显存)⇒ 卡死时一眼看出"停在哪一层、当时处理多少 token" ✓
                     # 关闭:XIAOTU_PF_PROGRESS=0 ✓
-                    if os.environ.get("XIAOTU_PF_PROGRESS", "1") == "1":
+                    # ⛔ 2026-10-19【R65】捕获窗口内**不许**做任何 host 工作(打印也算):
+                    #   GLM 上实测 `[xtu-pf-progress]` 在 PIECEWISE 捕获期间打印 ⇒ 捕获作废 ✗
+                    #   (check_capture_log.py 机械判 FAIL;签名 cudaStreamCaptureInvalidated)
+                    if (os.environ.get("XIAOTU_PF_PROGRESS", "1") == "1"
+                            and not _in_capture_window()):
                         try:
                             _now = _time.perf_counter()
                             if _now - _PF_HB.get("t", 0.0) >= float(os.environ.get("XIAOTU_PF_PROGRESS_SEC", "2")):
                                 _PF_HB["t"] = _now
                                 _PF_HB["n"] = int(_PF_HB.get("n", 0)) + 1
                                 _PF_CALL["n"] = int(_PF_CALL.get("n", 0)) + 1
+                                # ⛔⛔ 2026-10-19【捕获作废的真凶】这里原来打印 `int(ids_i32[0,0])`
+                                #   —— 对 GPU 张量取 int() 就是 `.item()`，**同步设备**；
+                                #   一旦落在 CUDA capture 窗口内 ⇒ 捕获作废(error 在后续
+                                #   `out.to(dtype)` 才抛出 cudaStreamCaptureStatusInvalidated)✗
+                                #   ⇒ 心跳**只保留 host 侧信息**(时间/层名/qlen/计数/显存分配量)，
+                                #   不再读任何 device 值 ✓(alloc 是 host 计数器,不同步 ✓)
                                 print("[xtu-pf-progress] %s device=%s layer=%s qlen=%d call=%d "
-                                      "ids0=%s alloc=%.1fGiB"
+                                      "alloc=%.1fGiB"
                                       % (time.strftime("%H:%M:%S"), _dev,
                                          getattr(layer, "layer_name", "?"), qlen,
                                          _PF_CALL["n"],
-                                         int(ids_i32[0, 0]) if ids_i32.numel() else -1,
                                          torch.cuda.memory_allocated(_dev) / 2**30),
                                       flush=True)
                         except Exception:  # noqa: BLE001  心跳绝不能影响主流程 ✓

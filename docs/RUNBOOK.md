@@ -21,11 +21,14 @@ NVIDIA A100-PCIE-40GB(SM 8.0)· AMD EPYC 9654(无 AMX)。
 
 | 模型 | 推荐命令(关键参数) | 实测 |
 |---|---|---|
-| **qfn**(Qwen3.8-Flash-Next FP8) | `bash scripts/serve_qwen38.sh`(脚本默认即最优;TP=2 需按下方步骤显式给 `GPUS=1,2`) | **bs1 45.6 / C=4 95.7 tok/s**(PIN=0);`XIAOTU_PIN=1` + 64 槽时 **38.6 / 108.4** |
+| **qfn**(Qwen3.8-Flash-Next FP8) | `bash scripts/serve_qwen38.sh`,**显式加** `XIAOTU_MOE_GPU_RESIDENT_LAYERS=15,9,11,16,31,3,39,25,7,23,24,13`(**12 层精选常驻**;池保持 `XIAOTU_PIN=0`) | 15K/自然结束:**prefill 1,517/1,538/1,529 tok/s;decode 46.0/43.8/44.0 tok/s(C=1/2/4)**;步时 22.4/33.6/78.2 ms ⚠️ 旧 45.6/95.7 与 38.6/108.4 作废 |
 | **ds41f**(DeepSeek-V4.1-Flash FP8+FP4) | `bash scripts/serve_v41.sh`(脚本默认 = dspark 开、`EAGER=0`、`COMPILE=1`) | **单流 ~50 / C=4 ~100 tok/s** |
 | **glm**(GLM-5.3-Flash) | `bash scripts/serve_glm53_mainline.sh`(脚本默认 = MTP 关、`EAGER=0`、`THREADS=60`) | prefill **1,477/1,441/1,394 tok/s**(B1040 系列) |
 
-⭐ **qfn 的两个硬结论**(B1050):
+⭐ **qfn 的三个硬结论**(B1050/B1055):
+0. **12 层精选常驻是当前最优**(`15,9,11,16,31,3,39,25,7,23,24,13`,按"CPU 时间/活跃专家数"选出);
+   **不要开热专家池**:12 层常驻 + 64 槽池会挤爆 KV(实测 `No available memory for the cache blocks`),
+   且 6 层常驻时池在 C=4 也只有 96.7 < 常驻的 105.9;
 1. **必须关 MTP**:开 MTP 40.5 ms/token、关掉 16.3 ms/token(**2.5×**),因为 CPU verify 成本随 qlen 近似线性;
 2. **必须用 `--compilation-config {"cudagraph_mode":"FULL_DECODE_ONLY","mode":"VLLM_COMPILE"}`**
    (脚本已默认),默认 `FULL_AND_PIECEWISE` 会多抓无用图并挤占显存。

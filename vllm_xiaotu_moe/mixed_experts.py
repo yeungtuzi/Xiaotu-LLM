@@ -2631,6 +2631,13 @@ class _XiaotuExpertsMixin:
                         self._pin_ev0 = torch.cuda.Event()
                         self._pin_ev_mask = torch.cuda.Event()
                         self._pin_ev_done = torch.cuda.Event()
+            # ⭐ 2026-10-19:池**只在大 batch** 才有净收益(C=1 实测净负、C≥4 才摊薄)
+            #   ⇒ `XIAOTU_PIN_MIN_QLEN`(默认 0=不限制)以下直接走 CPU 路径,
+            #      不做 partial、也不触发自适应 ⇒ 小并发零代价 ✓
+            #   ⚠️ 池本身仍在 profile 期建好(图捕获前),这里只控制"用不用" ✓
+            _minq = int(os.environ.get("XIAOTU_PIN_MIN_QLEN", "0") or 0)
+            if _pinp and _minq > 1 and qlen < _minq:
+                _pinp = None
             if _pinp and _gp_mod is not None:
                 # ⭐⭐ 2026-10-15 用户裁定:热专家要从【静态】升级为【动态换入】
                 #    (「对所有三个模型均要实现热专家的驻留和动态换入(之前是静态的),

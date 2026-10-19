@@ -98,6 +98,8 @@ NCTL=(); [ -n "$NUMA_CMD" ] && NCTL=($NUMA_CMD)
   # ⭐ 2026-10-19:异步 CPU 解码是"每层一次 D2H 同步"的既有解药(ds41f: 6.53→1.80 ms/token),
   #    同样必须经 env 桥(EngineCore 重建 environ)。未设 ⇒ 不写行 ⇒ 行为逐字不变 ✓
   if [ -n "${XIAOTU_MOE_ASYNC:-}" ]; then echo "XIAOTU_MOE_ASYNC=$XIAOTU_MOE_ASYNC"; fi
+  # ⭐ 2026-10-19:第一步=静态驻留(启动期装载,decode 期零传输)⇒ 该开关必须能被透传
+  if [ -n "${XIAOTU_PIN_STATIC:-}" ]; then echo "XIAOTU_PIN_STATIC=$XIAOTU_PIN_STATIC"; fi
 } > "$XTU_ENV_FILE"
 export XIAOTU_ENV_FILE
 

@@ -1945,13 +1945,22 @@ class _XiaotuExpertsMixin:
                 from vllm_xiaotu_moe.gpu_prefill_fp8 import gpu_moe_layer_fp8
 
                 _pool = self._ensure_resident_fp8(layer)
-                out = gpu_moe_layer_fp8(
-                    h_bf16, ids_i32, wts_f32, *_pool.planes,
-                    H=int(self._H_eng), I=int(self._I_eng),
-                    K=int(self.moe_config.experts_per_token),
-                    device=h_bf16.device,
-                    swiglu_limit=float(getattr(self, "swiglu_limit", 0.0) or 0.0),
-                )
+                _lim = float(getattr(self, "swiglu_limit", 0.0) or 0.0)
+                if qlen <= 32:
+                    from vllm_xiaotu_moe.decode_moe_fp8 import gpu_moe_decode_fp8
+
+                    out = gpu_moe_decode_fp8(
+                        h_bf16, ids_i32, wts_f32, *_pool.planes,
+                        int(self._H_eng), int(self._I_eng),
+                        int(self.moe_config.experts_per_token),
+                        device=h_bf16.device, swiglu_limit=_lim)
+                else:
+                    out = gpu_moe_layer_fp8(
+                        h_bf16, ids_i32, wts_f32, *_pool.planes,
+                        H=int(self._H_eng), I=int(self._I_eng),
+                        K=int(self.moe_config.experts_per_token),
+                        device=h_bf16.device, swiglu_limit=_lim,
+                    )
             else:
                 from vllm_xiaotu_moe.gpu_prefill import gpu_moe_layer
 
@@ -2652,7 +2661,11 @@ class _XiaotuExpertsMixin:
                     _pinp.note_routing(ids_i32)
                 except Exception:  # noqa: BLE001  自适应绝不许影响主流程 ✓
                     pass
-                if not _in_capture_window():
+                # ⭐ 2026-10-19:第一步是【静态驻留】(表在启动期装载,decode 期零传输)
+                #   ⇒ XIAOTU_PIN_STATIC=1 时**完全不调用** maybe_adapt,避免把
+                #   "静态驻留"测成"一边换入一边跑"(我此前 WINDOW=50 的臂就吃了这个亏 ✗)
+                if (not _in_capture_window()
+                        and os.environ.get("XIAOTU_PIN_STATIC", "0") != "1"):
                     try:
                         _pinp.maybe_adapt(_gp_mod, staging_active=bool(_gpu_pf))
                     except Exception:  # noqa: BLE001  自适应绝不许影响主流程 ✓
@@ -2799,12 +2812,24 @@ class _XiaotuExpertsMixin:
                     #   实测后果:接受率 75.6% → **0%**(B897/B900)⇒ 步数 ×3.66 ⇒ 变慢 4.2×
                     #   ⇒ 与 GPU 预填路径(`:2258/2264`)对齐,补传同源的 `_limit` ✓
                     _limit = float(getattr(self, "swiglu_limit", 0.0) or 0.0)
-                    _p = _gp_mod.gpu_moe_layer(
-                        h_bf16, part_ids, torch.where(_res, wts_f32, _zw),
-                        *_pinp.planes, int(hidden_size), int(self._I_eng),
-                        int(part_ids.size(1)),
-                        device=h_bf16.device, slot=_pinp.as_slot(),
-                        out_dtype=torch.float32, swiglu_limit=_limit)
+                    # ⭐ 2026-10-19:decode 形状(qlen<=32)不再用 prefill 的 O(E) 内核,
+                    #   改用 pair 中心内核(grid=P=T×K);大 qlen(预填)仍走原路径 ✓
+                    _pw = torch.where(_res, wts_f32, _zw)
+                    if (qlen <= 32 and getattr(self, "_engine_attr", "") == "MOE_FP8"):
+                        from vllm_xiaotu_moe.decode_moe_fp8 import gpu_moe_decode_fp8
+
+                        _p = gpu_moe_decode_fp8(
+                            h_bf16, part_ids, _pw, *_pinp.planes,
+                            int(hidden_size), int(self._I_eng),
+                            int(part_ids.size(1)),
+                            device=h_bf16.device, swiglu_limit=_limit)
+                    else:
+                        _p = _gp_mod.gpu_moe_layer(
+                            h_bf16, part_ids, _pw,
+                            *_pinp.planes, int(hidden_size), int(self._I_eng),
+                            int(part_ids.size(1)),
+                            device=h_bf16.device, slot=_pinp.as_slot(),
+                            out_dtype=torch.float32, swiglu_limit=_limit)
                     _partial.copy_(_p.to(out.dtype))
                     _ev_done = getattr(self, "_pin_ev_done", None)
                     if _ev_done is None:

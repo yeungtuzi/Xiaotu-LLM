@@ -33826,3 +33826,33 @@ decode 形状(`qlen<=32`);prefill 仍走原路径 ✓ 对拍 `rms_rel=5.6e-7` �
 (基线 45.6 / 95.7;6 层精选 46.0 / 105.9)。
 * C=1 随层数上升(45.6 → 46.0 → 47.0),C=4 在 6 层最好、12 层略降(显存挤 KV/捕获缓冲)✓
 * ⇒ 若目标场景以 C=1 为主,选 **12 层精选**;以 C≥4 为主,选 **6 层精选** ✓
+
+### B1054【压缩每层握手:批量 D2H 被图捕获否决(`cudaErrorStreamCaptureUnjoined`);头部空间很小】
+
+**日期**:2026-10-19 | **动机**:用户指示"压缩每层握手"。
+
+#### 1. 做了什么
+把每层 3 次 `cudaMemcpyAsync`(hidden/ids/weights)合并为 **1 次 `cudaMemcpyBatchAsync`**
+(CUDA 13 头文件 + 驱动 580 支持;`cudaMemcpyAttributes{srcAccessOrder=Stream}`)。
+
+#### 2. 结果:不可用 ✗
+直接起服务 ⇒ 图捕获阶段报:
+
+```
+CUDA error: capturing stream has unjoined work
+cudaErrorStreamCaptureUnjoined
+```
+
+⇒ **`cudaMemcpyBatchAsync` 不是 capture-safe 的**,而我们的服务路径就是 `FULL_DECODE_ONLY` 图 ⇒
+图模式下仍必须用 3 次独立 `cudaMemcpyAsync`(它们各自是合法图节点)✓ 已回退该改动。
+
+#### 3. 由此得到的定量结论
+* 每层图节点数 = 3 次 D2H + 1 hostfn + 1 次 H2D ≈ 5 个;
+* 逐层 `period - compute`(= rest)≈ **0.28 ms**,其中**层内 attention** 是主体(≈0.2 ms),
+  拷贝/派发只占数十 µs;
+* ⇒ 即使把拷贝压到 2 个节点,理论收益 ≈ 0.3–0.6 ms/step(**1–2%**),**不值得动引擎** ✗
+
+#### 4. 结论 / 下一步
+主张手收益的结构性手段只有两条(不是压缩拷贝):
+1. **更多层常驻**(整段去掉握手;受显存上限 ~10–12 层);
+2. **池只在大并发启用**(C≥4 时 GPU partial 被摊薄,C=1 时不要开)。

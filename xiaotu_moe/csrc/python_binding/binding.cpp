@@ -933,6 +933,9 @@ static void bind_moe_class(py::module& m, const char* name) {
             }
 
             // 1) Async D2H copies on the caller stream (graph-capturable).
+            //    ⚠️ 2026-10-19 试过 `cudaMemcpyBatchAsync` 把 3 次提交合成 1 次:
+            //    它在**图捕获**下报 `cudaErrorStreamCaptureUnjoined`(非 capture-safe)⇒ **不可用** ✗
+            //    ⇒ 图模式仍必须用 3 次 cudaMemcpyAsync(它们各自是合法图节点)✓
             cudaMemcpyAsync(st->pin_hidden, hid_dev, nh,
                             cudaMemcpyDeviceToHost, s);
             cudaMemcpyAsync(st->pin_ids, ids_dev, ni,

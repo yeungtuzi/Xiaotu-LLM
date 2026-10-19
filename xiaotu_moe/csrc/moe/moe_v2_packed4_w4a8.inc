@@ -1283,13 +1283,16 @@ inline void matmul_packed4_group(const uint16_t* A, const uint8_t* W,
 #else
             const int NR = (M <= 2) ? 8 : std::min(gemm_nr, 8);
 #endif
-#if defined(__AVX512VBMI__)
-            // 【§548】XIAOTU_MOE_VBMI_DECODE=1 时用 VBMI 版解码路径(4 组一次);
-            // 累加顺序与下方完全一致(每 (行,token) 按 g 递增、组内 s 递增)⇒ 数值应逐位相同。
-            static const bool _vbmi_on = [] {
+            // ⭐【2026-10-19 编译修复】`_vbmi_on` 原来只定义在 `#if defined(__AVX512VBMI__)` 之内,
+            //   而下方(:1344)在**该宏之外**也要用它 ⇒ 带 `-mavx512vbmi` 编译时必报
+            //   `'_vbmi_on' was not declared` ✗。⇒ 定义提到宏外(非 VBMI 档恒 false,只多一个 bool)。
+            const bool _vbmi_on = [] {
                 const char* e2 = std::getenv("XIAOTU_MOE_VBMI_DECODE");
                 return e2 && std::atoi(e2) != 0;
             }();
+#if defined(__AVX512VBMI__)
+            // 【§548】XIAOTU_MOE_VBMI_DECODE=1 时用 VBMI 版解码路径(4 组一次);
+            // 累加顺序与下方完全一致(每 (行,token) 按 g 递增、组内 s 递增)⇒ 数值应逐位相同。
             if (_vbmi_on && (group_count % 4) == 0) {
                 if (i8_vnni_on_ && !_vbmi_on)   /* 审计必须修#1:VBMI 分支不读这两者 ⇒ 别白做 ✓ */ xiaotu_predecode_block(W, n0, n1, rowshift, K);   // A1:门控 ✓
                 for (int m0 = 0; m0 < M; m0 += MR) {

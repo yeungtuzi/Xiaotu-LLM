@@ -33758,3 +33758,37 @@ python scripts/check_capture_log.py dev-docs/report/tuning/logs/<tag>.log --expe
 * ⭐ **GLM 的 `PIN=1` 净亏很可能同源**:它走的是同一个 O(E) 内核,C=1 时 pair 少、网格 6,144 个 block
   摊不薄 ⇒ 负收益;换成 pair 内核后需**按统一口径(15K / MTP 按模型 / 自然结束)复测** ✓
 * ds41f 的 PIN 正收益则可能因为:它的 E/top-k 与 batch 更大,旧内核能摊薄;换新内核后应再验证是否会更好。
+
+### B1052【decode 线:pair 内核接入 + 引擎零权重跳过;层常驻 C=4 转正 +9.2%;池仍受"每层握手"压制;DSH 15K v2 数据集】
+
+**日期**:2026-10-19 | **口径**:统一口径(15K / MBT=8192 / MTP 按模型 / 自然结束 / TP=2 / GPU prefill on)
+
+#### 1. 引擎改动(必须,否则"命中白赚"不成立)
+* `moe.cpp::forward_many_m`:**建映射时跳过 `weight==0` 的 pair**;逐 token `token_n[i]` 计数;
+  计算/归约循环改用压缩后的 `c_expert_ids/c_weights`,全命中 token 的 MoE 输出显式清零 ✓
+  (原实现把命中 pair 映射成"专家0+权重0"后**照样完整计算** ⇒ 命中不省 CPU ✗)
+* 编译修复:`moe_v2_packed4_w4a8.inc` 的 `_vbmi_on` 原只在 `#if __AVX512VBMI__` 内定义、
+  却在宏外使用 ⇒ 带 `-mavx512vbmi` 必失败;定义提到宏外 ✓
+* 重编 6 个 ISA 变体(`scripts/build_engine_variants.sh`),`avx512_bf16_vbmi` 已刷新 ✓;
+  确定性测试通过(11/11 逐位一致)✓
+
+#### 2. 解码内核接入
+`decode_moe_fp8.gpu_moe_decode_fp8`(pair 中心,grid=`P=T×K`)已接入:池的 partial 计算与层常驻的
+decode 形状(`qlen<=32`);prefill 仍走原路径 ✓ 对拍 `rms_rel=5.6e-7` ✓
+
+#### 3. 实测(短 prompt 解码探针,基线 PIN=0 无 MTP = 45.6 / 95.7)
+| 臂 | C=1 | C=4 |
+|---|---|---|
+| 静态池 64 槽 + 跳过 + pair 内核 | 37.5 | 96.7 |
+| **层常驻 6 层(0-5)+ pair 内核** | **45.9** | **104.5(+9.2%)** |
+| 层常驻 8 层(0-7) | 45.8 | 98.8(显存挤压 KV) |
+
+* ⇒ **层常驻已转正(C=4)**,旧结论"常驻无效"是 **prefill 内核 + MTP 污染** 所致 ✓
+* ⇒ **池在 C=1 仍负**:命中只省了 GEMM 的一部分,而每层的 D2H→hostfn→H2D 握手与
+  GPU partial 内核照付 ⇒ 池的正收益只在大并发出现(本口径 C=4 勉强持平)✓
+* ⚠️ 8 层比 6 层 C=4 降:显存挤 KV/捕获缓冲,不是"层多反而差" ✓
+
+#### 4. 数据集 v2(用户:DSH 会话足够多也足够长)
+`scripts/build_dsh15k_dataset.py`:从 `~/.dsh/sessions/**/session.v4.jsonl.zstd`(203 个)
+按真实多轮会话切 15K 窗口 ⇒ **32 条 / 24 个不同会话 / token 中位 15,000** ✓
+输出:`/home/user/lvllm/process_data/data/dsh_15k_v2.jsonl` ✓

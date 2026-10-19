@@ -525,11 +525,29 @@ void MOE::forward_many_m(int qlen, int k, const uint64_t* expert_ids, const floa
     std::vector<std::vector<std::pair<uint64_t, int>>> token_expert_mapping(qlen); // [token_id, expert_idx[expert_id, offset_in_buffer]]
    
    
-    for (int i = 0; i < qlen; i++) {   
+    // ⭐⭐ 2026-10-19【"命中白赚"的必要条件】:权重为 0 的 pair **不参与计算**。
+    //   GPU 常驻/热专家池把"命中"的 pair 映射成 `(专家0, 权重0)`;旧实现照样把这对
+    //   压进 mapping ⇒ CPU 仍为它做完整 GEMM ⇒ 命中不省任何 CPU ⇒ "白赚"从未兑现 ✗
+    //   ⇒ 这里把有效 pair 压紧到 [0, token_n[i]),后续所有循环都按 token_n 走 ✓
+    std::vector<uint64_t> c_expert_ids((size_t)qlen * k);
+    std::vector<float> c_weights((size_t)qlen * k);
+    std::vector<int> token_n(qlen, 0);
+    for (int i = 0; i < qlen; i++) {
         token_expert_mapping [i].resize(k);
-        for (int j = 0; j < k; j++) { 
-            uint64_t expert_id =  expert_ids[i * k + j];
-            token_expert_mapping [i][j] = std::make_pair(expert_id, expert_selected_num[expert_id]++);
+        for (int j = 0; j < k; j++) {
+            const float w = weights[i * k + j];
+            if (w == 0.0f) continue;          // 跳过零权重(命中项 / 无效 id / EP 非本 rank)
+            const uint64_t expert_id = expert_ids[i * k + j];
+            const int t = token_n[i]++;
+            c_expert_ids[(size_t)i * k + t] = expert_id;
+            c_weights[(size_t)i * k + t] = w;
+            token_expert_mapping[i][t] = std::make_pair(expert_id, expert_selected_num[expert_id]++);
+        }
+    }
+    // 全命中(或全无效)的 token:CPU 不产出任何贡献 ⇒ 显式清零(MoE 输出为 bf16/f32,零字节即 0.0)
+    for (int i = 0; i < qlen; i++) {
+        if (token_n[i] == 0) {
+            memset((uint8_t*)output + (size_t)i * hidden_bytes, 0, hidden_bytes);
         }
     }
 
@@ -581,9 +599,10 @@ void MOE::forward_many_m(int qlen, int k, const uint64_t* expert_ids, const floa
         int nid = Backend_NUMA::numa_node_;  
         int token_id = task_id / k;
         int expert_idx =  task_id % k;
-        int expert_id = expert_ids[token_id * k + expert_idx];  
+        if (expert_idx >= token_n[token_id]) return;   // ⭐ 无效/命中 pair:不计算
+        int expert_id = (int)c_expert_ids[(size_t)token_id * k + expert_idx];
 
-        assert(token_expert_mapping [token_id][expert_idx].first == expert_id); 
+        assert(token_expert_mapping [token_id][expert_idx].first == (uint64_t)expert_id);
 
         
         int base = expert_reorder_offset[expert_id];
@@ -734,22 +753,23 @@ void MOE::forward_many_m(int qlen, int k, const uint64_t* expert_ids, const floa
         int ith = start_block + offset;
         size_t n_stride = config_.stride; 
 
-        int expert_id = token_expert_mapping [token_id][0].first;
+        const int tok_n = token_n[token_id];
+        if (tok_n == 0) return;   // 已在上方清零
+        int expert_id = (int)token_expert_mapping [token_id][0].first;
         int pos = token_expert_mapping [token_id][0].second;
         int base = expert_reorder_offset[expert_id];
         float* down_output_ptr_0 = down_output_ + (base + pos)  * config_.hidden_size + ith * config_.stride;
 
         for(int j=0; j<n_stride; ++j){
-            down_output_ptr_0[j] = down_output_ptr_0[j] * weights[token_id * k + 0];
+            down_output_ptr_0[j] = down_output_ptr_0[j] * c_weights[(size_t)token_id * k + 0];
         }
-        for(int i=1; i<k; i++){
-            expert_id = token_expert_mapping[token_id][i].first;
+        for(int i=1; i<tok_n; i++){
+            expert_id = (int)token_expert_mapping[token_id][i].first;
             pos = token_expert_mapping[token_id][i].second;
             base = expert_reorder_offset[expert_id]; 
-            int expert_idx = token_id * k + i;
             float* down_output_ptr = down_output_  +  (base + pos) * config_.hidden_size + ith * config_.stride;
             for(int j=0; j<n_stride; ++j){
-                    down_output_ptr_0[j] += down_output_ptr[j] * weights[expert_idx];
+                    down_output_ptr_0[j] += down_output_ptr[j] * c_weights[(size_t)token_id * k + i];
             }
         }
  

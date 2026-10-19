@@ -100,6 +100,10 @@ NCTL=(); [ -n "$NUMA_CMD" ] && NCTL=($NUMA_CMD)
   if [ -n "${XIAOTU_MOE_ASYNC:-}" ]; then echo "XIAOTU_MOE_ASYNC=$XIAOTU_MOE_ASYNC"; fi
   # ⭐ 2026-10-19:第一步=静态驻留(启动期装载,decode 期零传输)⇒ 该开关必须能被透传
   if [ -n "${XIAOTU_PIN_STATIC:-}" ]; then echo "XIAOTU_PIN_STATIC=$XIAOTU_PIN_STATIC"; fi
+  # ⭐ 2026-10-19:逐层 CPU 计时(选常驻层要用)与池的逐层集中度统计
+  if [ -n "${XIAOTU_CD_TIMING:-}" ]; then echo "XIAOTU_CD_TIMING=$XIAOTU_CD_TIMING"; fi
+  if [ -n "${XIAOTU_CD_TIMING_EVERY:-}" ]; then echo "XIAOTU_CD_TIMING_EVERY=$XIAOTU_CD_TIMING_EVERY"; fi
+  if [ -n "${XIAOTU_PIN_DEBUG:-}" ]; then echo "XIAOTU_PIN_DEBUG=$XIAOTU_PIN_DEBUG"; fi
 } > "$XTU_ENV_FILE"
 export XIAOTU_ENV_FILE
 

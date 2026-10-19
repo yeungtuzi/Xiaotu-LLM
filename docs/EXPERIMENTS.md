@@ -33731,3 +33731,30 @@ python scripts/check_capture_log.py dev-docs/report/tuning/logs/<tag>.log --expe
 ⇒ **判据**:能不能开投机,取决于"verify 成本随 qlen 的斜率",不是通用开关。
 
 **验收状态(0.2.9)**:C=4 **95.7(PIN=0)/108.4(PIN64)** ≥ 目标 100 ✓;C=1 **45.6** ≈ 目标 50(91%)。
+
+### B1051【decode 专用 FP8 MoE 内核(pair 中心):对拍 5.6e-7;比 prefill 内核快 2.7×;GLM PIN 负收益疑同源】
+
+**日期**:2026-10-19 | **背景**:用户指出"decode 当然不能用 prefill 的东西;两条线没有可复用的,tile 环也不该用"。
+
+#### 1. 根因(读码 + 离线微基准)
+* 旧路径(`gpu_prefill_fp8.gpu_moe_layer_fp8`)是 **prefill 内核**:grid=`(E, 2I/bn)`,
+  E=512 ⇒ 每层 6,144 个 block,**与活跃专家数无关**;tile 按大 M 设计,decode M=1 时空转 ~64×。
+* 实测(T=1,pairs=10):旧内核 **0.554–0.636 ms/层**;其中计算量按 A100 只有 ~12 µs ⇒ 全是形状/网格浪费 ✓
+
+#### 2. 新内核(独立文件 `vllm_xiaotu_moe/decode_moe_fp8.py`,不碰 prefill、不用 tile 环)
+* pair 中心:grid 第一维 = **P=T×K**;gate/up 再按 `(列块, H/HS)` 拆、down 按 `(H块, I块)` 拆,原子累加;
+* 数值:**与 CPU 反量化参考 `rms_rel=5.6e-7`** ✓(`scripts/test_decode_moe_fp8.py`)
+* 计时(离线 eager,含 3 次 launch 的 Python 开销):
+
+| T | pairs | 新内核 | 旧 prefill 内核 | 加速 |
+|---|---|---|---|---|
+| 1 | 10 | **0.207 ms** | 0.554 ms | **2.7×** |
+| 4 | 40 | 0.426 ms | 0.723 ms | 1.7× |
+| 16 | 160 | 1.039 ms | 1.823 ms | 1.8× |
+
+* ⚠️ 离线是 eager,launch 开销未消;图模式下预计更低,需服务内 A/B 才能定论。
+
+#### 3. 派生结论(待 qfn 完成后验证)
+* ⭐ **GLM 的 `PIN=1` 净亏很可能同源**:它走的是同一个 O(E) 内核,C=1 时 pair 少、网格 6,144 个 block
+  摊不薄 ⇒ 负收益;换成 pair 内核后需**按统一口径(15K / MTP 按模型 / 自然结束)复测** ✓
+* ds41f 的 PIN 正收益则可能因为:它的 E/top-k 与 batch 更大,旧内核能摊薄;换新内核后应再验证是否会更好。

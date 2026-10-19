@@ -7,6 +7,8 @@
 [![Platform](https://img.shields.io/badge/Platform-2%C3%97%20EPYC%209654%20%2B%203%C3%97%20A100-76b900)](#实测平台)
 [![Models](https://img.shields.io/badge/models-DeepSeek--V4.1--Flash%20%C2%B7%20GLM--5.3--Flash%20%C2%B7%20Qwen3.8-green)](docs/MODEL_GUIDES.md)
 
+> **v0.2.9**:针对 **Qwen3.8-Flash-Next** 优化 —— 新增**专家层常驻**(12 层精选,decode 46.3/92.9/127.3 tok/s @C=1/2/4),并修复 CUDA Graph 捕获崩溃。详见 [发行说明](RELEASE_NOTES_v0.2.9.md)。
+
 > **XTU = X Transformers Unity**(读音:汉语「小兔」)—— 一个**高性能 MoE 推理加速层**。
 >
 > 这是一个面向**超大 MoE 模型**的 **vLLM 插件**,核心思路是把计算拆开:

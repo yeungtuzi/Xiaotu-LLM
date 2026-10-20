@@ -22,8 +22,8 @@
 
 [**English**](README_EN.md) · 中文(默认)
 
-> **📌 当前版本：v0.2.8**（2026-10-15）—— 引入 GPU 常驻热专家：GPU 与 CPU 共同解码
-> [发行说明](RELEASE_NOTES_v0.2.8.md) · [性能口径](docs/BENCH_PROTOCOL.md)
+> **📌 当前版本：v0.2.9**（2026-10-19）—— 针对 Qwen3.8-Flash-Next 的专家层常驻；修复 CUDA Graph 捕获崩溃
+> [发行说明](RELEASE_NOTES_v0.2.9.md) · [性能口径](docs/BENCH_PROTOCOL.md)
 
 ---
 
@@ -106,6 +106,7 @@ vllm serve <MODEL_DIR> --tensor-parallel-size 2 --enable-expert-parallel \
 
 | 版本 | 主题 |
 |---|---|
+| **v0.2.9**（2026-10-19） | **针对 Qwen3.8-Flash-Next 的专家层常驻** —— 12 层精选整层常驻（decode 46.3/92.9/127.3 tok/s @C=1/2/4）；新增 decode 专用 MoE 内核与零权重 pair 跳过；修复 CUDA Graph 捕获崩溃 —— 详见[发行说明](RELEASE_NOTES_v0.2.9.md) |
 | **v0.2.8**（2026-10-15） | **引入 GPU 常驻热专家:GPU 与 CPU 共同解码** —— 按真实路由轨迹把热专家常驻显存、CPU 内核跳过它们,同一步里 GPU 与 CPU **并行**解码:**解码步时 C=1/C=2/C=4 分别 −1.9% / −4.4% / −14.1%**(三级 CI 排除 0,C=4 与"解码吞吐 +20.5%"双重显著);开关 `XIAOTU_PIN`(默认关,回退零成本);**同版**:性能口径改为**行业标准固定长度口径**([BENCH_PROTOCOL](docs/BENCH_PROTOCOL.md))+ GLM 开启 MTP 并统一负载 —— 详见[发行说明](RELEASE_NOTES_v0.2.8.md) |
 | **v0.2.7**（2026-10-09） | **优化引擎：削减 CPU→GPU DMA 缓冲区** —— 预填期的权重驻留量由 **2 × 整层** 改为 **N × 子层块环**：**7.56 → 1.89 GiB/rank**（TP=2 共省 **11 GB**），性能无损失；开关 `XIAOTU_GPF_STAGE_TILE_E`（`0` = 旧行为，可即时回滚）—— 详见[发行说明](RELEASE_NOTES_v0.2.7.md)（**2026-10-10 勘误**：性能表 DSpark 组 decode 列已更正，见发行说明） |
 | **v0.2.6** | **自举开发：INT8 激活 × FP4 专家权重 的计算路径** —— 为 **MXFP4** 专家权重增加 **INT8 激活**路径（fp4 码值全含于 int8 ⇒ **权重侧零代价**）：内核级 **24.9 → 15.1–15.7 ms/层（1.54–1.62×）**；端到端（qfn·MXFP4-FP8）GSM8K **两臂 193/200**、逐题一致 194/200（净 0）、256K 四针两臂 4/4 + `stop`、Vision 23 逐项一致 18/23；修复**回退路径回归**（慢 16–22% ⇒ +1.49% 指令）；打通 **qfn 的 MTP**（**2.44×**）；qfn 默认线程数 **120（5 核/CCD）**；路径默认关（`XIAOTU_MOE_INT8=1`）|

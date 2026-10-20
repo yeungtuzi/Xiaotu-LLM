@@ -7,6 +7,8 @@
 [![Platform](https://img.shields.io/badge/Platform-2%C3%97%20EPYC%209654%20%2B%203%C3%97%20A100-76b900)](#measurement-host)
 [![Models](https://img.shields.io/badge/models-DeepSeek--V4.1--Flash%20%C2%B7%20GLM--5.3--Flash%20%C2%B7%20Qwen3.8-green)](docs/MODEL_GUIDES.md)
 
+> **v0.2.9**: Qwen3.8-Flash-Next expert-layer residency — 12 selected layers fully resident, decode 46.3/92.9/127.3 tok/s at C=1/2/4; CUDA Graph capture crash fixed. See [release notes](RELEASE_NOTES_v0.2.9.md).
+
 > **XTU = X Transformers Unity** (pronounced *"xiao tu"*, Chinese for "little rabbit") —
 > a **high-performance MoE inference acceleration layer**.
 >
@@ -21,8 +23,8 @@
 
 [中文](README.md) · English (default)
 
-> **📌 Current release: v0.2.8** (2026-10-15) — Hot experts resident on the GPU: the GPU and the CPU decode together
-> [Release notes](RELEASE_NOTES_v0.2.8.md) · [Benchmark protocol](docs/BENCH_PROTOCOL.md)
+> **📌 Current release: v0.2.9** (2026-10-19) — Expert-layer residency for Qwen3.8-Flash-Next; CUDA Graph capture crash fixed
+> [Release notes](RELEASE_NOTES_v0.2.9.md) · [Benchmark protocol](docs/BENCH_PROTOCOL.md)
 
 ---
 
@@ -33,7 +35,7 @@
 3. **Supports older GPUs such as SM80**, and **NVFP4 / MXFP4** quantized weights; where the hardware has no native support, the weights are **dequantized and computed on the best available path**.
 4. Supports **AVX-512 VNNI and other ISAs**, picking the best CPU compute backend automatically.
 5. **Hardware-aware NUMA slicing**: the process is spread evenly across cores according to the NUMA topology, and the MoE weights are sharded to match, so **every node's compute only touches local memory** (no cross-socket traffic) while **total memory stays at a single copy of the weights**.
-6. **Hot experts can be pinned resident on the GPU with policy-driven dynamic swap-in**, giving **cooperative GPU + CPU decoding** and significantly higher decode throughput on **DeepSeek-V4.1-Flash** (since **v0.2.8**). **GLM-5.3-Flash is not supported yet** (VRAM limit); **Qwen3.8-Flash-Next is under validation**.
+6. **Hot experts can be pinned resident on the GPU with policy-driven dynamic swap-in**, giving **cooperative GPU + CPU decoding** and significantly higher decode throughput on **DeepSeek-V4.1-Flash** (since **v0.2.8**). **GLM-5.3-Flash is not supported yet** (VRAM limit); **Qwen3.8-Flash-Next supports expert-layer residency since v0.2.9** (12 selected layers, see [v0.2.9 release notes](RELEASE_NOTES_v0.2.9.md)).
 
 ## Measurement host
 
@@ -96,6 +98,7 @@ Per-model recipes, memory budgeting, self-checks and troubleshooting →
 
 | Version | Theme |
 |---|---|
+| **v0.2.9** (2026-10-19) | **Expert-layer residency for Qwen3.8-Flash-Next** — 12 selected layers fully resident (decode 46.3/92.9/127.3 tok/s at C=1/2/4); new decode-specific MoE kernel and zero-weight pair skipping; CUDA Graph capture crash fixed — see [release notes](RELEASE_NOTES_v0.2.9.md) |
 | **v0.2.8** (2026-10-15) | **Hot experts resident on the GPU: the GPU and the CPU decode together** — hot experts (from a real routing trace) are pinned in VRAM and skipped by the CPU kernels, so one step computes part of the experts on the GPU and the rest on the CPU **in parallel**: decode step time is **-1.9% / -4.4% / -14.1% at C=1/2/4** (all three CIs exclude zero; at C=4 both step time and decode throughput, **+20.5%**, are significant); switch `XIAOTU_PIN` (off by default, zero-cost rollback). Same release: the benchmark protocol moves to the **industry-standard fixed-length** metric ([BENCH_PROTOCOL](docs/BENCH_PROTOCOL.md)), and GLM enables MTP on a unified load — see [release notes](RELEASE_NOTES_v0.2.8.md) |
 | **v0.2.7** (2026-10-09) | **Engine optimisation: CPU→GPU DMA buffers cut** — per-prefill weight residency goes from **2 × whole layer** to an **N × sub-layer block ring**: **7.56 → 1.89 GiB/rank** (**11 GB** saved in total at TP=2), no performance loss; switch `XIAOTU_GPF_STAGE_TILE_E` (`0` = old behaviour, instantly revertible) — see [release notes](RELEASE_NOTES_v0.2.7.md) |
 | **v0.2.6** | **Bootstrapped development: INT8 activation x FP4 expert weights** — MXFP4 experts gain an **INT8 activation** path (the fp4 code set fits int8 exactly, so the **weight side is free**): kernel level **24.9 -> 15.1-15.7 ms/layer (1.54-1.62x)**; end to end (qfn, MXFP4-FP8) GSM8K **193/200 on both arms**, 194/200 per-question (net 0), 256K four-pin 4/4 + `stop` on both arms, Vision 23 agrees 18/23; **fallback-path regression fixed** (16-22% slower -> +1.49% instructions); **MTP on qfn (2.44x)**; qfn default threads **120 (5 cores/CCD)**; path off by default (`XIAOTU_MOE_INT8=1`) |

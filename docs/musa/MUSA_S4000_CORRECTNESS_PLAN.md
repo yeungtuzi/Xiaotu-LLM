@@ -1,7 +1,7 @@
 # MUSA / S4000 正确性验证计划（2026-10-21）
 
 > **目标平台**：Moore Threads MTT S4000 + 海光 x86 + 256GB host  
-> **目标**：先验证 **官方 Qwen3.8-Flash-Next FP8 混合推理在 MUSA 上的正确性**；FP8 通过后**立即转 NVFP4**。**永远不做 BF16**。不追求性能。  
+> **目标**：先验证 **官方 Qwen3.8-Flash-Next FP8 权重 + BF16 计算**在 MUSA 上的混合推理正确性；S4000 无原生 FP8 算力，采用 FP8 权重 → BF16 计算/反量化；NVFP4 同样走“NVFP4/FP8 权重 + BF16 计算”。后续 S5000 再恢复原生 FP8。不追求性能。  
 > **分支**：`feature/musa-correctness`（从 `main` 切出；验证通过后再合并）。  
 > **状态**：本机无 MUSA 硬件；先完成离线调研、版本锁定、移植映射和 preflight，设备上线后按 Phase 1 开工。
 
@@ -9,7 +9,7 @@
 
 ## 0.1 权重口径定稿（2026-10-21）
 
-**第一目标：官方 `Qwen/Qwen3.8-Flash-Next-FP8`。**
+**第一目标：官方 `Qwen/Qwen3.8-Flash-Next-FP8` 权重，计算 dtype = BF16（S4000 无原生 FP8）。**
 
 原因很直接：
 
@@ -17,13 +17,14 @@
 |---|---:|---|
 | 官方 FP8 | **185.56 GB** | ✅ 第一目标 |
 | 社区 NVFP4 | 128.95 GB | ✅ FP8 通过后立即转 |
-| 官方 BF16 | **360.02 GB** | ⛔ **永久排除**（不做、不下载、不作为回退） |
+| 官方 BF16 权重 | **360.02 GB** | ⛔ 不下载；**BF16 只作为计算 dtype，不是 checkpoint** |
 
 所以：
 
-- **BF16 永远不进入路线**；
-- 先跑 **官方 FP8**，它也是官方发布、qfn 架构、CPU 专家路径可以复用；
-- **FP8 通过后立即转社区 NVFP4**，不插入 BF16 阶段；
+- **不再禁止 BF16**：S4000 用 FP8 权重 + BF16 计算；
+- 先跑 **官方 FP8** 权重，它也是官方发布、qfn 架构、CPU 专家路径可以复用；
+- **FP8 通过后立即转社区 NVFP4**，NVFP4 也用 BF16 计算；
+- 2026-10-21 用户决策：不在本机追原生 FP8/FP4 kernel，后续到 S5000 再开原生 FP8；
 - 仍然不依赖厂商专用镜像作为运行路径；镜像只作参考。
 
 ---
@@ -114,7 +115,7 @@ git push -u origin feature/musa-correctness
 - [x] 锁定 vllm-musa / torch_musa / vLLM / MUSA 版本；
 - [x] 建端口映射（见 [MUSA_PORT_MAP.md](MUSA_PORT_MAP.md)）；
 - [x] preflight 脚本（无硬件也能跑）；
-- [x] 确认权重路线：**官方 FP8 → 社区 NVFP4；永不 BF16**；
+- [x] 确认权重路线：**官方 FP8 权重 + BF16 计算 → 社区 NVFP4 + BF16 计算**；不下载 BF16 checkpoint；
 - [ ] 从镜像/分支提取 `qwen4_exp` 补丁作为**参考**，不把镜像作为运行依赖；
 - [x] 官方 FP8 权重结构审计（152,089 tensors / 185.50GB / experts 147,456）；
 - [ ] 准备官方 FP8 qfn 的 CPU golden / 单层 shape 测试；

@@ -6,6 +6,7 @@
 - [端口映射](MUSA_PORT_MAP.md)
 - [版本/仓库锁定](MUSA_VERSION_MATRIX.md)
 - [qwen4_exp/MUSA 审计](MUSA_QWEN4EXP_AUDIT.md)
+- [候选补丁](../../patches/musa/README.md)
 - [preflight 脚本](../../scripts/musa_preflight.sh)
 
 分支：`feature/musa-correctness`（验证通过后再合并到 `main`）。

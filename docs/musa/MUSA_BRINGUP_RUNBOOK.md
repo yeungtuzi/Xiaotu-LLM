@@ -88,6 +88,13 @@ eager
 max_model_len = 8192
 ```
 
+先生成 8K prompt：
+
+```bash
+python scripts/musa/make_long_prompts.py --tokenizer Qwen/Qwen3.8-Flash-Next-FP8 \
+  --target-tokens 8192 --out /tmp/prompts-8k.jsonl
+```
+
 记录：
 
 - 是否 OOM；

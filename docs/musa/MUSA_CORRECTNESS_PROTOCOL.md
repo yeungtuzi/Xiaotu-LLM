@@ -46,6 +46,12 @@ python scripts/musa/compare_openai.py \
 
 ## 5. 8K 扩展
 
+先生成同一份长 prompt（CUDA/MUSA 共用）：
+
+```bash
+python scripts/musa/make_long_prompts.py   --tokenizer Qwen/Qwen3.8-Flash-Next-FP8   --target-tokens 8192   --out /tmp/prompts-8k.jsonl
+```
+
 - 用同一组长 prompt（8K 左右）重复上述流程；
 - 不压缩 MBT，不指定 KV 字节，只指定上下文长度；
 - 记录 prefill 是否 OOM、KV 峰值、首 token 时间（仅记录，不作性能结论）。

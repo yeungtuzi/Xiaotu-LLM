@@ -32,11 +32,21 @@ def main() -> None:
     ap.add_argument("--full-attn-layers", type=int, default=12)
     ap.add_argument("--kv-heads", type=int, default=8)
     ap.add_argument("--head-dim", type=int, default=128)
-    ap.add_argument("--kv-dtype", choices=["bf16", "fp8"], default="bf16")
+    ap.add_argument("--config", default="", help="可选:从 config.json 读 num_key_value_heads/head_dim")
+    ap.add_argument("--kv-dtype", choices=["fp8", "bf16"], default="fp8",
+                    help="qfn 的既成配置是 fp8(见 USER_QA_LEDGER:958,342→1,688,025 token,"
+                         "256K 四针 4/4 + GSM8K 25/25 逐题一致);bf16 只作对照")
     ap.add_argument("--ctx", type=int, default=262144)
     ap.add_argument("--margin-gb", type=float, default=3.0)
     a = ap.parse_args()
 
+    if a.config:
+        import json as _j
+        _c = _j.load(open(a.config))
+        _t = _c.get("text_config", _c)
+        a.kv_heads = int(_t.get("num_key_value_heads") or a.kv_heads)
+        a.head_dim = int(_t.get("head_dim") or a.head_dim)
+        print(f"[config] kv_heads={a.kv_heads} head_dim={a.head_dim}")
     experts_gb = a.experts_gb or (67.99 if a.fmt == "nvfp4" else 64.19)
     caps = [float(x) for x in a.cards.split(",")]
     split = [int(x) for x in a.split.split(",")]

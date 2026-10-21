@@ -1,0 +1,4 @@
+{"id":"zh-explain","messages":[{"role":"user","content":"用三句话解释 MoE 模型里的 expert routing，并说明 top-k 的作用。"}]}
+{"id":"en-code","messages":[{"role":"user","content":"Write a Python function that returns the first non-repeated character in a string. Include one example."}]}
+{"id":"tool-json","messages":[{"role":"system","content":"You are a tool-calling assistant. Reply with JSON only."},{"role":"user","content":"Call the weather tool for Shanghai tomorrow. Use {\"tool\":...,\"args\":...}."}]}
+{"id":"long-chain","messages":[{"role":"user","content":"A train travels 120 km at 60 km/h, then 90 km at 45 km/h. Show the total time and average speed. Keep the reasoning concise."}]}

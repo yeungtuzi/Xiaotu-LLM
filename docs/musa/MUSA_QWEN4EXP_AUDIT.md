@@ -70,6 +70,10 @@ launch_pdl=current_platform.is_arch_support_pdl()
 
 ## 2.2 插件 PLE offload 的 MUSA 适配
 
+MUSA 第一轮优先用 vLLM 0.32 自带的 `EngramConfig.cpu_offload=True`
+（qwen4 的 `ple_layer_ids` 会自动创建 EngramConfig），不叠加旧的 UVA 钩子；
+`XIAOTU_PLE_CPU=0` 是正确性模式默认值。
+
 `vllm_xiaotu_moe/ple_offload.py` 原本只找 `qwen4_exp.nvidia.*`，并用
 `torch.cuda.is_available()` 判断设备。MUSA 上会：
 

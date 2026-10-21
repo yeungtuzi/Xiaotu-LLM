@@ -27,8 +27,9 @@ def apply() -> list[str]:
         "XIAOTU_MOE_GPU_RESIDENT_LAYERS": "",
         # Do not run the Triton GPU prefill path.
         "VLLM_XIAOTU_GPU_PREFILL_MIN_TOKENS": "0",
-        # PLE n-gram table stays in host memory.
-        "XIAOTU_PLE_CPU": "1",
+        # vLLM 0.32's own EngramConfig.cpu_offload handles the qwen4 PLE table;
+        # do not layer our older UVA hook on top for the first MUSA pass.
+        "XIAOTU_PLE_CPU": "0",
         # No MTP/speculator in the first correctness pass.
         "XIAOTU_SPEC_DECODE": "0",
     }

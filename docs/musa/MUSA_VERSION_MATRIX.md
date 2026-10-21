@@ -12,25 +12,29 @@
 
 ---
 
-## 1. vllm-musa 目标
+## 1. vllm-musa 目标（2026-10-21 修正）
+
+**官方 Qwen3.8-Flash-Next 需要 `qwen4_exp` 模型代码；vLLM 0.29/0.28 没有，0.32 才有。**
+
+因此 MUSA 正确性目标改为：
 
 | 项 | 值 |
 |---|---|
 | 仓库 | https://github.com/MooreThreads/vllm-musa |
-| 分支 | `v0.28.0-dev` |
-| commit | `d85ef82d15f5f96132611a0755945c2f8ed9132d`（2026-10-19） |
-| 包版本 | `vllm-musa 0.1.28` |
-| 上游 vLLM | `v0.28.0` @ `2cf0a6915ce544dc493a0990f2ea38d81601128a` |
+| 分支 | **`v0.32.0-dev`** |
+| commit | `93183864c3de94baddb052c9e1ec7d2f8bf0562b` |
+| 上游 vLLM | **`v0.32.0` @ `5df63a7203cdb9328d824a27b682e77c7b9928be`** |
 | 引擎 | vLLM V1；支持时 runner V2 |
+| 模型代码 | upstream `vllm/models/qwen4_exp/`（v0.32 已有） |
 
-**其他相关分支（不要混用）**
+**其他分支**
 
 | 分支 | HEAD | 上游 vLLM | 备注 |
 |---|---|---|---|
+| `v0.28.0-dev` | `d85ef82d` | v0.28.0 | 适合小 dense/旧模型；**不含完整 qwen4_exp**，不能作为 qfn 主目标 |
 | `v0.30.0-dev` | `47184da2` | v0.30.0 | 中间版本 |
-| `v0.32.0-dev` | `93183864` | v0.32.0 @ `5df63a72` | patch 里已出现 `qwen4_exp_qsa_triton_warmup`；更接近主线但和我们的 0.29 不同 |
 
-先固定 `v0.28.0-dev` 做正确性，因为它有 qfn 专用镜像线索；`v0.32.0-dev` 作为后续 port 目标。
+**结论**：先用 **vllm-musa v0.32.0-dev 源码**（不是专用镜像）跑官方 FP8 qfn，作为 oracle；随后把我们的插件/CPU 专家路径 port 到 vLLM 0.32。
 
 ## 2. 运行时 pin（来自 requirements）
 
@@ -72,7 +76,7 @@ torchada==0.1.95
 
 | 项 | 我们 | MUSA 参考 | 处理 |
 |---|---|---|---|
-| vLLM | 0.29.0 目标 | 0.28.0 pin | 先用 0.28 跑正确性 |
+| vLLM | 0.29.0 目标 | **0.32.0 pin** | 先 port 到 0.32（qwen4_exp 必需） |
 | qfn 模型 | 我们 qfn 插件 | qfn 专用镜像 | 先取镜像/补丁 |
 | 量化 | NVFP4 W4A16 + FP8_PB_WO | MUSA quant patch | 单层对拍 |
 | CPU 引擎 | x86 `.so` | 同一 x86 | AVX2 优先 |

@@ -58,8 +58,8 @@
 | host | 256GB | qfn experts 67.99GB + PLE 51.2GB 可放 host |
 | MUSA | Toolkit 5.2.0 系列 | 以 vllm-musa `requirements/musa_private.txt` 为准 |
 | PyTorch | 2.11.0.post2+musa5.2.0 | torch_musa 同版本 |
-| vLLM | **0.28.0**（先用） | vllm-musa 当前 pin：`2cf0a691...`；我们主线目标 0.29.0，先别混 |
-| vllm-musa | `v0.28.0-dev` @ `d85ef82d` | 包版本 0.1.28；2026-10-19；另有 v0.30/v0.32-dev 分支，先不混 |
+| vLLM | **0.32.0**（先用） | 官方 qfn 需要 `qwen4_exp`；vLLM 0.32 才有；v0.29/0.28 没有 |
+| vllm-musa | **`v0.32.0-dev` @ `93183864`** | 上游 vLLM 0.32 @ `5df63a72`；qwen4_exp 在 upstream，不在 v0.28 |
 | torchada | 0.1.95 | CUDA→MUSA 兼容层 |
 | MATE | 0.2.7 | MUSA attention/tensor kernels |
 | Triton | 3.2.0 | MUSA 后端 |
@@ -185,7 +185,7 @@ qfn 单层
 | 风险 | 影响 | 缓解 |
 |---|---|---|
 | S4000 非 vllm-musa 主验证卡 | 可能有未覆盖算子 | 先小模型/单层；记录 `musaInfo` |
-| vllm-musa pin vLLM 0.28 vs 我们 0.29 | 补丁不匹配 | 先用 0.28 验证；再评估 0.29 port |
+| vllm-musa pin vLLM 0.32 vs 我们 0.29 | 插件 API 需要 port | 先以 0.32 做 qfn oracle；再 port 我们的插件到 0.32 |
 | qwen4_exp 只在专用镜像 | 源码分支不完整 | 先拉镜像/分支；提取补丁 |
 | NVFP4 无原生 MUSA 支持 | 需 dequant | 先 CPU golden；再 MUSA dequant |
 | 多卡 MCCL 不熟 | TP 失败 | 单卡优先，多卡后置 |

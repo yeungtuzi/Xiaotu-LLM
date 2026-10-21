@@ -9,4 +9,6 @@
 
 分支：`feature/musa-correctness`（验证通过后再合并到 `main`）。
 
+版本：**vllm-musa `v0.32.0-dev` + 官方 Qwen3.8-Flash-Next FP8**；qwen4_exp 在 vLLM 0.32 才有。
+
 当前状态：设备未上线；先做离线准备。设备上线后从 Phase 1 开始。

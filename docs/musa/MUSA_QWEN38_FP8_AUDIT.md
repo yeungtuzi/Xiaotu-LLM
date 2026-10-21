@@ -77,7 +77,8 @@ model.language_model.layers.1.ple.ple_embedding.ngram_embedding.shard_0.weight
 
 ## 6. 尚未确认
 
-1. vllm-musa `v0.28.0-dev` 是否包含 `qwen4_exp` 完整模型代码（当前源码分支未见完整支持）；
-2. qfn 专用镜像的 qwen4_exp 补丁是否可以提取到我们树；
+1. ~~vllm-musa `v0.28.0-dev` 是否包含 `qwen4_exp` 完整模型代码~~  
+   ⇒ **已确认：vLLM 0.32 才包含 `vllm/models/qwen4_exp/`；0.28/0.29 没有。MUSA 目标改为 vllm-musa `v0.32.0-dev`。**
+2. qfn 专用镜像的 qwen4_exp 补丁是否可以提取到我们树（只作参考，不作依赖）；
 3. MUSA 上 GDN/QSA/mamba 的实际可用性；
 4. FP8 linear/MoE 在 S4000 上的 kernel 覆盖。

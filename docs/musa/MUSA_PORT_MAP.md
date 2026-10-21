@@ -24,7 +24,7 @@
 ## 2. 最小路径
 
 ```text
-vllm-musa（平台 + qwen4_exp + attention）
+vllm-musa v0.32（平台 + qwen4_exp + attention）
   + 官方 Qwen3.8-Flash-Next FP8 权重加载
   + CPU 全部专家（xiaotu_moe）
   + PLE host

@@ -20,6 +20,9 @@ def apply() -> list[str]:
     if not enabled():
         return []
     defaults = {
+        # vLLM's native switch: routed experts live on the host from construction.
+        # This is the prerequisite for the CPU expert backend.
+        "VLLM_EXPERTS_LOAD_DEVICE": "cpu",
         # CPU experts for every layer.
         "XIAOTU_MOE_GPU_RESIDENT_LAYERS": "",
         # Do not run the Triton GPU prefill path.
@@ -29,6 +32,16 @@ def apply() -> list[str]:
         # No MTP/speculator in the first correctness pass.
         "XIAOTU_SPEC_DECODE": "0",
     }
+    # vLLM may have cached envs at import time; mirror the switch into vllm.envs
+    # as well so mainline_shims sees it.  Explicit user settings still win.
+    try:
+        import vllm.envs as _vllm_envs
+
+        if getattr(_vllm_envs, "VLLM_EXPERTS_LOAD_DEVICE", None) != "cpu":
+            _vllm_envs.VLLM_EXPERTS_LOAD_DEVICE = "cpu"
+    except Exception:  # noqa: BLE001 - vLLM may not be importable yet
+        pass
+
     applied = []
     for k, v in defaults.items():
         if k not in os.environ:

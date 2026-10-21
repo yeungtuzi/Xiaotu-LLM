@@ -82,8 +82,17 @@ PASS
 export XTU_MUSA_CORRECTNESS=1
 ```
 
-它会强制：CPU 全专家、无 GPU 常驻层、无 GPU prefill、PLE host、MTP/投机关。
+它会强制：`VLLM_EXPERTS_LOAD_DEVICE=cpu`、CPU 全专家、无 GPU 常驻层、无 GPU prefill、PLE host、MTP/投机关。
 显式设置的环境变量优先。
+
+⚠️ 仍建议在启动 vLLM **之前**显式导出：
+
+```bash
+export VLLM_EXPERTS_LOAD_DEVICE=cpu
+export XTU_MUSA_CORRECTNESS=1
+```
+
+因为 vLLM 可能在插件加载前已缓存 `envs`。
 
 条件：
 

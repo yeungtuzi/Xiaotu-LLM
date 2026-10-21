@@ -75,6 +75,16 @@ PASS
 
 该测试不依赖 GPU/CUDA runtime；设备上线前即可复现。
 
+补充的多 token / top_k=10 检查（`T=2, H=1024, I=512, E=8`）：
+
+```text
+max_abs = 0.1207
+rms     = 133.0
+rel     = 0.091%
+```
+
+说明 N-sliced 的 rowmap/多 token 路径也已经走通。
+
 ## 5. 第一轮验收
 
 ```text

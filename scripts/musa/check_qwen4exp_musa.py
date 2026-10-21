@@ -27,6 +27,11 @@ def main() -> int:
         "is_musa_branch": re.compile(r"is_musa"),
         "tl_extra_cuda": re.compile(r"tl\.extra\.cuda"),
         "pdl": re.compile(r"is_arch_support_pdl|launch_pdl"),
+        "cuda_only_topk": re.compile(
+            r"top_k_per_row_decode|torch\.ops\._C\.(cooperative_topk|persistent_topk)"
+        ),
+        "qsa_partial_stages": re.compile(r"partial_stages\s*="),
+        "tensor_is_cuda_guard": re.compile(r"\.is_cuda"),
     }
     hits = {k: [] for k in checks}
     for f in files:
@@ -35,7 +40,8 @@ def main() -> int:
             for i, line in enumerate(text.splitlines(), 1):
                 if rx.search(line):
                     hits[k].append((f.relative_to(root), i, line.strip()))
-    for k in ("is_rocm_only_dispatch", "is_musa_branch", "tl_extra_cuda", "pdl"):
+    for k in ("is_rocm_only_dispatch", "is_musa_branch", "tl_extra_cuda", "pdl",
+              "cuda_only_topk", "qsa_partial_stages", "tensor_is_cuda_guard"):
         print(f"\n## {k}: {len(hits[k])}")
         for f, i, line in hits[k][:20]:
             print(f"{f}:{i}: {line}")
@@ -44,6 +50,8 @@ def main() -> int:
     print("\nExpected after MUSA port:")
     print("- is_musa_branch > 0")
     print("- tl_extra_cuda / pdl either guarded or launch_pdl forced false on MUSA")
+    print("- cuda_only_topk: 0005 replaces it on MUSA")
+    print("- qsa_partial_stages: 0006 forces 1 on MUSA")
     return 0
 
 

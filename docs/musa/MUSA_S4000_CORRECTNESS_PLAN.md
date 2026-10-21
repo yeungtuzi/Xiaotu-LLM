@@ -37,7 +37,7 @@
 | MUSA | Toolkit 5.2.0 系列 | 以 vllm-musa `requirements/musa_private.txt` 为准 |
 | PyTorch | 2.11.0.post2+musa5.2.0 | torch_musa 同版本 |
 | vLLM | **0.28.0**（先用） | vllm-musa 当前 pin：`2cf0a691...`；我们主线目标 0.29.0，先别混 |
-| vllm-musa | `v0.28.0-dev` @ `d85ef82d` | 包版本 0.1.28；2026-10-19 |
+| vllm-musa | `v0.28.0-dev` @ `d85ef82d` | 包版本 0.1.28；2026-10-19；另有 v0.30/v0.32-dev 分支，先不混 |
 | torchada | 0.1.95 | CUDA→MUSA 兼容层 |
 | MATE | 0.2.7 | MUSA attention/tensor kernels |
 | Triton | 3.2.0 | MUSA 后端 |

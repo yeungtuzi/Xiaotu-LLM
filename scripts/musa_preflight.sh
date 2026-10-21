@@ -34,7 +34,8 @@ for c in musaInfo mthreads-gmi mthreads-smi nvidia-smi; do
   if command -v "$c" >/dev/null 2>&1; then echo "$c: $(command -v $c)"; else echo "$c: MISSING"; fi
 done
 echo "--- xiaotu CPU engine .so deps ---"
-for so in xiaotu_moe/build/*.so; do
+PY_EXT=$(python3 -c 'import sysconfig; print(sysconfig.get_config_var("EXT_SUFFIX") or "")' 2>/dev/null || true)
+for so in xiaotu_moe/build/*"${PY_EXT}"; do
   [ -e "$so" ] || continue
   echo "$so"
   ldd "$so" 2>/dev/null | grep -E 'libcudart|libcuda|not found' || echo "  (no cuda deps)"

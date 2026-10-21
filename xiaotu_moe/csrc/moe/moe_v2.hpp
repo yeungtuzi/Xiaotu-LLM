@@ -1748,6 +1748,7 @@ public:
     // (微基准 5.74 s/chunk vs 现在的 8.9 s)⇒ 每 chunk 省 ~3 s,直接换算成预填充吞吐。
     // **不额外占内存**(只是把已有页锁住,不复制),符合"不得额外多占系统内存"的约束。
     // 返回成功锁页的缓冲个数;失败只记数不抛(调用方可回退到 pageable)。
+#ifndef XIAOTU_MOE_NO_CUDA
     size_t pin_hostbufs() {
         size_t ok = 0, tried = 0;
         auto reg = [&](const void* ptr, size_t bytes) {
@@ -1767,6 +1768,9 @@ public:
         fprintf(stderr, "[pin] host 分片锁页: %zu/%zu 个缓冲成功\n", ok, tried);
         return ok;
     }
+#else
+    size_t pin_hostbufs() { return 0; }
+#endif
 
     const void* host_wbuf(int which, int node) const {
         if (which == 0) return (node >= 0 && node < (int)w13_shard_.size()) ? w13_shard_[node] : nullptr;

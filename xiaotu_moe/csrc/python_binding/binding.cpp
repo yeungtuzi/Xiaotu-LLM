@@ -30,8 +30,10 @@
 #include <sys/mman.h>
 #include <unistd.h>
 
+#ifndef XIAOTU_MOE_NO_CUDA
 #include <cuda_runtime.h>
 #include <cuda.h>   // 驱动 API:cuStreamWriteValue32 / cuStreamWaitValue32(item 1/3)
+#endif
 #if defined(__AVX512F__)
 #include <immintrin.h>
 #endif
@@ -86,6 +88,7 @@ static bool xiaotu_async_enabled() {
     return e;
 }
 
+#ifndef XIAOTU_MOE_NO_CUDA
 struct CpuDecodeState {
     void* pin_hidden = nullptr;
     void* pin_ids = nullptr;
@@ -176,6 +179,7 @@ struct CpuDecodeState {
         for (void* p : retired) cudaFreeHost(p);
     }
 };
+#endif  // XIAOTU_MOE_NO_CUDA
 
 // ---- EP(专家并行)跨 rank 归约:走共享内存,不进 GPU -----------------------
 // 背景:TP=2 时每个 rank 只算自己那半专家,部分和必须相加。用 GPU 的 NCCL
@@ -281,6 +285,7 @@ bool auto_ep_setup(const void* key, const MOEConfigV2& cfg) {
 }
 }  // namespace
 
+#ifndef XIAOTU_MOE_NO_CUDA
 // Map engine pointer -> its pinned buffers / host-fn context. Keyed by the
 // MOE* identity; every MOE instance across every type has a unique address, so
 // sharing one map across all template instantiations is safe.
@@ -394,6 +399,8 @@ static bool async_init(CpuDecodeState* st) {
 }
 
 
+#endif  // XIAOTU_MOE_NO_CUDA (xtu_rd is host-only)
+
 // ==================== [XTU-RDUMP] decode 路由 ID 环形转储(P0.3) ====================
 // 为什么在 binding 里:decode 的 python 侧在 FULL 图 replay 时**不执行**(graph-dead),
 // 路由 ID 唯一必然过手的地点就是这里(ids 已完成 D2H;hostfunc 与异步握手两条路径共用
@@ -499,6 +506,7 @@ static inline void capture(uintptr_t tag, int qlen, int k, const uint32_t* ids) 
 }
 }  // namespace xtu_rd
 
+#ifndef XIAOTU_MOE_NO_CUDA
 // 【第 217 轮】"CPU MoE + EP 归约"抽成独立函数:host-func 路径与异步握手
 // 路径(worker 线程)共用同一份实现,避免两份代码漂移。
 template <typename MOET>
@@ -599,6 +607,9 @@ static void run_moe_and_ep(MOET* engine, int qlen, int k, const uint16_t* hid,
 // 成本:每引擎 ≈1.5 MB 锁页内存(64 token × H=4096: hidden 0.5MB + out 1MB)。
 static constexpr int kDecodeTokenFloor = 64;
 
+#endif  // XIAOTU_MOE_NO_CUDA
+
+#ifndef XIAOTU_MOE_NO_CUDA
 static void prealloc_decode_buffers(const void* key, const MOEConfigV2& cfg) {
     const int H = cfg.hidden_size;
     const int K = cfg.top_k;
@@ -614,6 +625,7 @@ static void prealloc_decode_buffers(const void* key, const MOEConfigV2& cfg) {
                        (size_t)tok * K * sizeof(float),
                        (size_t)tok * H * sizeof(float), false);
 }
+#endif  // XIAOTU_MOE_NO_CUDA
 
 
 // ---- SIGSEGV diagnostics (debug build): print faulting addr + stack ----
@@ -724,7 +736,9 @@ static void bind_moe_class(py::module& m, const char* name) {
             // lk 链只给 num_processes/process_id:引擎自建跨 rank 归约(见 auto_ep_setup)
             auto_ep_setup((const void*)p, cfg);
             // 必须在任何 CUDA graph 捕获之前把解码 pinned 缓冲开好(R103)。
+#ifndef XIAOTU_MOE_NO_CUDA
             prealloc_decode_buffers((const void*)p, cfg);
+#endif
             return p;
         }), py::arg("cfg"), py::arg("w13_weight"), py::arg("w2_weight"),
             py::arg("w13_scale") = py::int_(0), py::arg("w2_scale") = py::int_(0),
@@ -766,6 +780,7 @@ static void bind_moe_class(py::module& m, const char* name) {
             auto it = g_ep_state.find(&self);
             return it != g_ep_state.end() && it->second && it->second->world > 1;
         })
+#ifndef XIAOTU_MOE_NO_CUDA
         // 显式预分配 pinned 缓冲(必须在 CUDA graph capture **之前**调用)。
         // 捕获期间调用 cudaHostAlloc/cudaFreeHost 都会让 capture 失效
         // (实测:cudaErrorStreamCaptureInvalidated → PyTorch CUDACachingAllocator
@@ -1066,6 +1081,7 @@ static void bind_moe_class(py::module& m, const char* name) {
         }, py::arg("stream"), py::arg("qlen"), py::arg("top_k"),
            py::arg("hidden"), py::arg("expert_ids"), py::arg("weights"),
            py::arg("out_gpu"))
+#endif  // XIAOTU_MOE_NO_CUDA
         // ---- GPU 流式 prefill:让 Python 能 DMA 引擎自有的主机缓冲 -------------
         // 动机(NOTES §459):GPU prefill 原先要求保留 checkpoint 源张量才能逐层
         // 流式权重,代价是 +269 GiB 主机内存,本机放不下。而引擎的每 node 紧凑分片
@@ -1087,6 +1103,7 @@ static void bind_moe_class(py::module& m, const char* name) {
         // which: 0 = w13 shard(node), 1 = w2 shard(node), 2 = w13 scales, 3 = w2 scales
         // 【§610】一次性把自有 host 分片锁页(幂等;返回成功个数)。
         .def("pin_hostbufs", [](MOE& self) -> size_t { return self.pin_hostbufs(); })
+#ifndef XIAOTU_MOE_NO_CUDA
         .def("copy_hostbuf_to_device",
              [](MOE& self, int which, int node, uintptr_t dst, uintptr_t stream) -> size_t {
             const void* src = self.host_wbuf(which, node);
@@ -1139,6 +1156,7 @@ static void bind_moe_class(py::module& m, const char* name) {
         }, py::arg("which"), py::arg("node"), py::arg("src_off"), py::arg("dst"),
            py::arg("dpitch"), py::arg("spitch"), py::arg("width"), py::arg("height"),
            py::arg("stream"))
+#endif  // XIAOTU_MOE_NO_CUDA
         .def("cpu_prefill", [](MOE& self,
                               int qlen, int top_k,
                               py::object expert_ids, py::object weights,

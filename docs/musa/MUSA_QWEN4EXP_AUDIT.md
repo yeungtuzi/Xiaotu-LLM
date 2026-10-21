@@ -137,15 +137,25 @@ MUSA 没有 CUDA runtime / CUDA driver，因此：
 
 > **直接 `import xiaotu_moe` 会在 dlopen 阶段失败，stream-free 回退也来不及生效。**
 
-所以 MUSA 需要额外一步：
+已实现 CPU-only 构建开关：
 
-1. 给 `binding.cpp` 加 `XIAOTU_MOE_NO_CUDA` 编译开关；
-2. 去掉 `CpuDecodeState` / `cpu_decode` / `copy_hostbuf_*` / `prealloc_decode_buffers`；
+1. `binding.cpp` 增加 `XIAOTU_MOE_NO_CUDA` 条件编译；
+2. 去掉 `CpuDecodeState` / `cpu_decode` / `copy_hostbuf_*` /
+   `prealloc_decode_buffers`；
 3. 只保留 `cpu_prefill`（host-only）；
-4. 用 `NO_CUDA=1` 重新构建 `.so`；
+4. `scripts/build_engine_variants.sh` 支持 `NO_CUDA=1`；
 5. 插件 MUSA 回退只调用 `cpu_prefill`。
 
-这是比“Python 层设备判断”更底层的阻塞，已加入 preflight 检查。
+已验证（本机）：
+
+```text
+NO_CUDA=1 ONLY=scalar ... build_engine_variants.sh
+→ _xiaotu_moe_C_scalar.cpython-313...so
+→ ldd: no cudart / no libcuda
+→ import ok
+```
+
+这是比“Python 层设备判断”更底层的阻塞；preflight 仍会检查 `.so` 依赖。
 
 ---
 

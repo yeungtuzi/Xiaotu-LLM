@@ -75,6 +75,11 @@ while IFS= read -r cand; do
 done < <(_cudart_candidates | sort -u)
 
 CUDA_FLAGS=()
+NO_CUDA="${NO_CUDA:-0}"
+if [[ "$NO_CUDA" == "1" ]]; then
+  CUDA_FLAGS=(-DXIAOTU_MOE_NO_CUDA)
+  echo ">> NO_CUDA=1: building CPU-only engine (no cudart/libcuda)"
+else
 if [[ -n "$CUDART_SONAME" ]]; then
   CUDA_FLAGS=(-I"$CUDART_INC" -L"$CUDART_LIBDIR"
               -Wl,--no-as-needed -l:"$CUDART_SONAME" -Wl,--as-needed
@@ -99,6 +104,7 @@ else
   echo "!! CUDA driver lib not found (libcuda.so.1 is required for cuStreamWriteValue32)" >&2
   exit 2
 fi
+fi  # NO_CUDA
 
 COMMON="-std=c++17 -shared -fPIC -O3 -ffast-math -fno-finite-math-only"
 # 【§629c】编译器可切(`CXX=g++-14` 或 conda 的

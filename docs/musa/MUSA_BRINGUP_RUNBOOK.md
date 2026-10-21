@@ -37,8 +37,15 @@ libcudart.so.13 => not found
 libcuda.so.1 => not found
 ```
 
-说明当前 `.so` 是 CUDA 构建，**MUSA 不能直接用**；需要先构建
-`XIAOTU_MOE_NO_CUDA=1` 的 CPU-only 引擎变体。
+说明当前 `.so` 是 CUDA 构建，**MUSA 不能直接用**。先构建 CPU-only 引擎：
+
+```bash
+NO_CUDA=1 PYTHON=/path/to/venv/bin/python \
+  PYBIND11_INC=/path/to/torch/include \
+  bash scripts/build_engine_variants.sh
+```
+
+构建后应看到 `.so` **不再依赖 libcudart/libcuda**。
 
 ## 2. 应用 qwen4_exp MUSA 候选补丁
 

@@ -95,18 +95,18 @@ def _musa_cpu_forward(engine, qlen: int, top_k: int, hidden, ids, weights, out) 
     slower than the CUDA path.
     """
     capturing = getattr(torch.cuda, "is_current_stream_capturing", None)
+    is_capturing = False
     if capturing is not None:
         try:
-            if capturing():
-                raise RuntimeError(
-                    "MUSA correctness fallback does not support CUDA-graph "
-                    "capture; disable graph capture for the first pass"
-                )
-        except RuntimeError:
-            raise
+            is_capturing = bool(capturing())
         except Exception:
             # MUSA's torch.cuda shim need not expose stream-capture state.
-            pass
+            is_capturing = False
+    if is_capturing:
+        raise RuntimeError(
+            "MUSA correctness fallback does not support CUDA-graph capture; "
+            "disable graph capture for the first correctness pass"
+        )
     try:
         if engine.ep_enabled():
             raise RuntimeError(

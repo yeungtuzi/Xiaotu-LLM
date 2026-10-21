@@ -45,10 +45,26 @@
 | deep_ep | 1.1.0+musa5.2.0 | 多卡 EP 时再启用 |
 | tilelang_musa | 0.1.12+musa.2 | 可选 |
 
-**qfn 专用镜像**：vllm-musa README 提到
-`registry.mthreads.com/mcconline/inference/vllm/vllm-openai:qwen38-flash-next`，
-但当前源码分支没有 `qwen4_exp` 的完整补丁；先取得该镜像/对应分支，再决定
-“直接用镜像做 oracle”还是“把补丁合入源码”。
+**qfn 专用镜像的定位（2026-10-21 用户澄清）**
+
+vllm-musa README 提到：
+`registry.mthreads.com/mcconline/inference/vllm/vllm-openai:qwen38-flash-next`
+
+但**它不是我们的运行路径，也不是交付依赖**：
+
+- 只作 **oracle / 补丁参考**，用来确认 qwen4_exp/attention 的期望行为；
+- 正式目标：**我们的 vLLM-MUSA 分支直接加载权重**，不要求用户安装厂商专用镜像；
+- 如果该镜像只支持官方 BF16/FP8 qfn，不支持我们的 NVFP4 社区量化，则它不能作为 NVFP4 的 oracle。
+
+**权重口径必须先确认**
+
+- “官方权重”通常指 `Qwen/Qwen3.8-Flash-Next` 的 BF16/FP8；
+- `lovedheart/...NVFP4-W4A16...` 是**社区量化**，不是 Qwen 官方发布；
+- 两者不是同一个 checkpoint，也不是同一套量化 kernel；
+- 在动手前必须确认 MUSA 验证目标是：
+  - A. 官方 BF16/FP8 qfn；
+  - B. 社区 NVFP4 qfn；
+  - C. 两者都要（先官方、后 NVFP4）。
 
 ---
 
@@ -76,7 +92,8 @@ git push -u origin feature/musa-correctness
 - [x] 锁定 vllm-musa / torch_musa / vLLM / MUSA 版本；
 - [x] 建端口映射（见 [MUSA_PORT_MAP.md](MUSA_PORT_MAP.md)）；
 - [x] preflight 脚本（无硬件也能跑）；
-- [ ] 取 qfn 专用镜像/分支，确认 `qwen4_exp` 支持；
+- [ ] 确认“官方权重”具体 checkpoint（BF16/FP8 vs 社区 NVFP4）；
+- [ ] 从镜像/分支提取 `qwen4_exp` 补丁作为**参考**，不把镜像作为运行依赖；
 - [ ] 准备 CPU golden / 单层 shape 测试；
 - [ ] 准备 `musaInfo`/`vllm_collect_env` 采集脚本。
 

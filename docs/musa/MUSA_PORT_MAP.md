@@ -34,9 +34,10 @@ vllm-musa（平台 + qwen4_exp + attention）
 
 ## 3. 关键判断
 
-1. **能否直接用 vllm-musa 的 qfn 镜像做 oracle？**
-   - 能：先用它跑 qfn，采集输出作为参考；
-   - 不能：只取 qwen4_exp/attention 补丁，接到我们树。
+1. **能否用 vllm-musa 的 qfn 镜像做 oracle？**
+   - 能：只采集输出/行为作参考，**不作为运行路径或交付依赖**；
+   - 不能：只取 qwen4_exp/attention 补丁，接到我们树；
+   - 若镜像只支持官方 BF16/FP8，不能当 NVFP4 的 oracle。
 
 2. **NVFP4 是否有现成 MUSA kernel？**
    - 先查 `Model-Optimizer-musa`、vllm-musa 的 quant patch；

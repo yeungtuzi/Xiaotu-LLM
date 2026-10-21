@@ -28,7 +28,6 @@ class TestMusaCorrectness(unittest.TestCase):
             applied = mod.apply()
             self.assertEqual(os.environ["VLLM_EXPERTS_LOAD_DEVICE"], "cpu")
             self.assertEqual(os.environ["XIAOTU_MOE_GPU_RESIDENT_LAYERS"], "")
-            self.assertEqual(os.environ["XIAOTU_MOE_NSLICE_SMALL"], "0")
             self.assertEqual(os.environ["VLLM_XIAOTU_GPU_PREFILL_MIN_TOKENS"], "0")
             self.assertEqual(os.environ["XIAOTU_PLE_CPU"], "1")
             self.assertEqual(os.environ["XIAOTU_SPEC_DECODE"], "0")

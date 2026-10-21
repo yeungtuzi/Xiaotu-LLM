@@ -25,10 +25,6 @@ def apply() -> list[str]:
         "VLLM_EXPERTS_LOAD_DEVICE": "cpu",
         # CPU experts for every layer.
         "XIAOTU_MOE_GPU_RESIDENT_LAYERS": "",
-        # The N-sliced small-M kernel segfaults at realistic qfn dimensions on
-        # the CPU-only scalar build (reproduced 2026-10-21).  Correctness first:
-        # force the legacy per-token path.
-        "XIAOTU_MOE_NSLICE_SMALL": "0",
         # Do not run the Triton GPU prefill path.
         "VLLM_XIAOTU_GPU_PREFILL_MIN_TOKENS": "0",
         # PLE n-gram table stays in host memory.

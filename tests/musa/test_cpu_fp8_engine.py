@@ -59,11 +59,6 @@ def _silu(x: float) -> float:
 
 class TestCpuFp8Engine(unittest.TestCase):
     def test_cpu_prefill_matches_reference(self):
-        # Tiny synthetic dims hit the N-sliced small-M path, whose row mapping
-        # is not the target of this test. Force the legacy per-token path and
-        # disable NUMA sharding so the reference is unambiguous.
-        os.environ["XIAOTU_MOE_NOSHARD"] = "1"
-        os.environ["XIAOTU_MOE_NSLICE_SMALL"] = "0"  # small-M N-slice crashes at real dims
         m = _load_engine()
         random.seed(7)
         E, H, I, T, K = 4, 128, 128, 4, 2

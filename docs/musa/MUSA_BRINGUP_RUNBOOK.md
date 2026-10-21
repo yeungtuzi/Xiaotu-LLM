@@ -105,7 +105,7 @@ PASS
 export XTU_MUSA_CORRECTNESS=1
 ```
 
-它会强制：`VLLM_EXPERTS_LOAD_DEVICE=cpu`、CPU 全专家、无 GPU 常驻层、无 GPU prefill、PLE host、MTP/投机关，并关闭 `XIAOTU_MOE_NSLICE_SMALL`（该路径在真实 qfn 维度上实测 SIGSEGV，scalar/AVX2 均复现）。
+它会强制：`VLLM_EXPERTS_LOAD_DEVICE=cpu`、CPU 全专家、无 GPU 常驻层、无 GPU prefill、PLE host、MTP/投机关。
 显式设置的环境变量优先。
 
 ⚠️ 仍建议在启动 vLLM **之前**显式导出：

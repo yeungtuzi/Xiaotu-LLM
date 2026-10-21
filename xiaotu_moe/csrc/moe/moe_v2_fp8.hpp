@@ -144,10 +144,12 @@ inline void matmul_fp8_quant_range(const uint16_t* A, const uint8_t* W, const fl
     }
 #else
     for (int i = 0; i < M; ++i) {
-        const uint16_t* Arow = A + (size_t)i * K;
+        const uint16_t* Arow = A + (size_t)(rowmap ? rowmap[i] : (uint32_t)i) * K;
         float* Crow = C + (size_t)i * N;
         for (int j = n0; j < n1; ++j) {
-            const uint8_t* Wrow = W + (size_t)j * K;
+            const int local_j = j - rowshift;
+            if (local_j < 0) continue;
+            const uint8_t* Wrow = W + (size_t)local_j * K;
             const float* Srow = S + (size_t)(j / gn) * ((K + gk - 1) / gk);
             float acc = 0.f;
             for (int k = 0; k < K; ++k)

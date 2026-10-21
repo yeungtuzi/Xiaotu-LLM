@@ -10,8 +10,8 @@
 #   * 检查点在本地 HF 缓存(173 GiB,131 分片),`quant_method: fp8` ⇒ vLLM 原生 `Fp8Config`;
 #     本插件按 `FusedMoEMethodBase` **泛化打 shim** ⇒ `Fp8MoEMethod` 自动走 CPU 专家;
 #   * 权重分布(按张量头部精确统计):路由专家 **114.9 GiB**(留 CPU)、
-#     **PLE/ngram 表 47.8 GiB**(必须 `XIAOTU_PLE_CPU=1` 走 UVA,否则单卡必 OOM,
-#     见 vllm_xiaotu_moe/ple_offload.py 头部注释)、其余非专家仅 ~10 GiB;
+#     **PLE/ngram 表 47.8 GiB**（CUDA 默认 `XIAOTU_PLE_CPU=1` 走 UVA；MUSA
+#     correctness profile 改用上游 EngramConfig.cpu_offload）、其余非专家仅 ~10 GiB;
 #   * ⇒ PLE offload 后 GPU 侧非专家 ~10 GiB,40GB 单卡放得下。
 #
 # 用法:

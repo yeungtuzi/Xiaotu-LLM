@@ -76,6 +76,15 @@ PASS
 
 ## 5. 官方 FP8 qfn，8K，batch 1
 
+启动前设置：
+
+```bash
+export XTU_MUSA_CORRECTNESS=1
+```
+
+它会强制：CPU 全专家、无 GPU 常驻层、无 GPU prefill、PLE host、MTP/投机关。
+显式设置的环境变量优先。
+
 条件：
 
 ```text

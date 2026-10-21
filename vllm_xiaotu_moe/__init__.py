@@ -159,6 +159,11 @@ _xtu_death_debug()
 由 `mixed_experts` 注册到主线的 CPU experts 后端槽位;`mainline_shims` 提供
 混合模式所需的主线配合(上游尚未合并)。用法见 README 与 docs/RUNBOOK.md。
 """
+from . import musa_correctness as _musa_correctness
+
+# Opt-in MUSA correctness mode must run before the other modules read env.
+_musa_correctness.apply()
+
 from . import hybrid_model  # noqa: F401
 from . import mixed_experts  # noqa: F401
 from . import mainline_shims  # noqa: F401

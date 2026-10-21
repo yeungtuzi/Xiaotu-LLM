@@ -2,6 +2,16 @@
 
 > 只锁**正确性验证**需要的版本；设备上线后以 `musaInfo` / `vllm_collect_env` 实测为准。
 
+## 0. 权重目标
+
+| 权重 | 大小 | 优先级 |
+|---|---:|---|
+| `Qwen/Qwen3.8-Flash-Next-FP8` | 185.56 GB | **P0（先跑）** |
+| `Qwen/Qwen3.8-Flash-Next` BF16 | 360.02 GB | P2（256GB host 放不下，需 NVMe/mmap） |
+| `lovedheart/...NVFP4...` | 128.95 GB | P2（后续） |
+
+---
+
 ## 1. vllm-musa 目标
 
 | 项 | 值 |

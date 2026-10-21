@@ -7,10 +7,11 @@
 | 层 | 当前（CUDA/vLLM） | MUSA 目标 | 优先级 |
 |---|---|---|---|
 | vLLM 平台 | `vllm` CUDA platform | `vllm-musa` 的 `MUSAPlatform` / `MTGPUWorker` | P0 |
-| 模型 | qfn `Qwen4ExpForConditionalGeneration` | qwen4_exp 专用镜像/补丁 | P0 |
+| 模型 | 官方 `Qwen/Qwen3.8-Flash-Next-FP8` | qwen4_exp 支持；镜像/补丁只作参考 | P0 |
 | attention | GDN/QSA/mamba | vllm-musa 的 MUSA attention/Mamba patch | P0 |
 | KV cache | CUDA paged KV | vLLM-MUSA KV / Mamba pool | P0 |
-| NVFP4 专家 | W4A16 g16 | MUSA dequant / Model-Optimizer-musa | P0 |
+| 官方 FP8 专家 | FP8 | MUSA FP8 / qwen 官方路径 | P0 |
+| NVFP4 专家（后续） | W4A16 g16 | MUSA dequant / Model-Optimizer-musa | P2 |
 | FP8_PB_WO | blockwise 128 weight-only | MUSA FP8 linear / 自定义 | P0 |
 | CPU 专家 | `xiaotu_moe` AVX512/AVX2 | 同一 x86 `.so`（海光） | P0 |
 | GPU prefill | 我们的 Triton tile ring | **先关闭**；正确性不走 GPU prefill | P1 |
@@ -24,7 +25,7 @@
 
 ```text
 vllm-musa（平台 + qwen4_exp + attention）
-  + qfn NVFP4 权重加载/反量化
+  + 官方 Qwen3.8-Flash-Next FP8 权重加载
   + CPU 全部专家（xiaotu_moe）
   + PLE host
   + MTP off

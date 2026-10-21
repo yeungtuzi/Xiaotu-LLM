@@ -1,9 +1,30 @@
 # MUSA / S4000 正确性验证计划（2026-10-21）
 
 > **目标平台**：Moore Threads MTT S4000 + 海光 x86 + 256GB host  
-> **目标**：只验证 **qfn NVFP4 混合推理在 MUSA 上的正确性**，不追求性能。  
+> **目标**：先验证 **官方 Qwen3.8-Flash-Next FP8 混合推理在 MUSA 上的正确性**；NVFP4 后续再挂。不追求性能。  
 > **分支**：`feature/musa-correctness`（从 `main` 切出；验证通过后再合并）。  
 > **状态**：本机无 MUSA 硬件；先完成离线调研、版本锁定、移植映射和 preflight，设备上线后按 Phase 1 开工。
+
+---
+
+## 0.1 权重口径定稿（2026-10-21）
+
+**第一目标：官方 `Qwen/Qwen3.8-Flash-Next-FP8`。**
+
+原因很直接：
+
+| 权重 | 大小 | 256GB host 是否可行 |
+|---|---:|---|
+| 官方 BF16 | **360.02 GB** | ❌ 放不下 |
+| 官方 FP8 | **185.56 GB** | ✅ 可以 |
+| 社区 NVFP4 | 128.95 GB | ✅，但属于后续目标 |
+
+所以：
+
+- **BF16 不作为第一目标**（360GB > 256GB；除非做 NVMe/mmap 流式）；
+- 先跑 **官方 FP8**，它也是官方发布、qfn 架构、CPU 专家路径可以复用；
+- **社区 NVFP4 放到 Phase 4/P2**，不阻塞官方 FP8 的正确性验证；
+- 仍然不依赖厂商专用镜像作为运行路径；镜像只作参考。
 
 ---
 
@@ -11,7 +32,8 @@
 
 ### 做
 
-- qfn NVFP4（`W4A16_NVFP4` + `FP8_PB_WO`）在 MUSA 上的**加载/反量化/前向正确性**；
+- **官方 Qwen3.8-Flash-Next FP8** 在 MUSA 上的**加载/前向正确性**；
+- 后续：qfn NVFP4（`W4A16_NVFP4` + `FP8_PB_WO`）的加载/反量化/前向；
 - CPU 专家 + GPU attention/KV 的**混合模式**；
 - 单卡优先，随后多 S4000；
 - 8K/32K 上下文，batch 1，MTP 关；
@@ -94,7 +116,7 @@ git push -u origin feature/musa-correctness
 - [x] preflight 脚本（无硬件也能跑）；
 - [ ] 确认“官方权重”具体 checkpoint（BF16/FP8 vs 社区 NVFP4）；
 - [ ] 从镜像/分支提取 `qwen4_exp` 补丁作为**参考**，不把镜像作为运行依赖；
-- [ ] 准备 CPU golden / 单层 shape 测试；
+- [ ] 准备官方 FP8 qfn 的 CPU golden / 单层 shape 测试；
 - [ ] 准备 `musaInfo`/`vllm_collect_env` 采集脚本。
 
 ### Phase 1：设备上线，栈冒烟（0.5–1 天）
@@ -105,9 +127,9 @@ git push -u origin feature/musa-correctness
 4. 采集版本、拓扑、显存、MUSA 可用算子；
 5. **不做 qfn**，先证明栈可用。
 
-### Phase 2：qfn 单层/短上下文（1–3 天）
+### Phase 2：官方 FP8 qfn 单层/短上下文（1–3 天）
 
-1. qfn NVFP4 权重加载；
+1. 官方 FP8 权重加载；
 2. 单层 dequant + MoE，与 CPU golden 对拍；
 3. qfn 8K、batch 1、MTP 关、文本 only；
 4. GPU 0 层专家，CPU 全部专家；
@@ -115,13 +137,15 @@ git push -u origin feature/musa-correctness
 
 ### Phase 3：端到端正确性（2–4 天）
 
+- 官方 FP8 qfn 端到端；
 - 固定 prompt 集，比较 token/logits；
 - 工具调用/多轮；
 - 32K 上下文；
 - 多 S4000 只做 TP 通信冒烟，不追性能。
 
-### Phase 4：收口
+### Phase 4：NVFP4（P2）与收口
 
+- 官方 FP8 通过后，再挂社区 NVFP4；
 - 记录 MUSA 与 CUDA 的数值差异；
 - 记录未支持算子/回退；
 - 通过后合并到 main；

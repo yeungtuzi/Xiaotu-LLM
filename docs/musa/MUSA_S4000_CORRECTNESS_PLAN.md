@@ -116,6 +116,7 @@ git push -u origin feature/musa-correctness
 - [x] preflight 脚本（无硬件也能跑）；
 - [x] 确认权重路线：**官方 FP8 → 社区 NVFP4；永不 BF16**；
 - [ ] 从镜像/分支提取 `qwen4_exp` 补丁作为**参考**，不把镜像作为运行依赖；
+- [x] 官方 FP8 权重结构审计（152,089 tensors / 185.50GB / experts 147,456）；
 - [ ] 准备官方 FP8 qfn 的 CPU golden / 单层 shape 测试；
 - [ ] 准备 `musaInfo`/`vllm_collect_env` 采集脚本。
 

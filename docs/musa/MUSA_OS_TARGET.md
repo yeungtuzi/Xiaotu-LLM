@@ -67,9 +67,28 @@ sudo apt-mark hold linux-image-5.15.0-105-generic \
   linux-image-generic linux-headers-generic
 ```
 
-## BIOS
+## BIOS / IOMMU
 
 - Above 4G Decoding: On
 - Resizable BAR: On
-- IOMMU: On（多卡建议）
 - Secure Boot: Off
+- IOMMU:
+  - **MTT S4000 且内存 ≥256GB：必须开启 IOMMU**
+  - S5000：关闭 IOMMU
+  - AMD/Hygon 平台内核参数：`amd_iommu=on iommu=pt`
+
+检查：
+
+```bash
+cat /proc/cmdline
+dmesg | grep -i -E 'AMD-Vi|IOMMU'
+```
+
+`/proc/cmdline` 应包含：
+
+```text
+amd_iommu=on
+```
+
+缺少时 MUSA 驱动可能能枚举 GPU，但 torch/GPU 初始化会卡死，严重时
+`mtgpu` 模块加载会阻塞 boot，导致 sshd 起不来。

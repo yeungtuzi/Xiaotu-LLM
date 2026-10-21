@@ -6,6 +6,9 @@ echo "host: $(hostname)  kernel: $(uname -r)  arch: $(uname -m)"
 echo "os: $(lsb_release -ds 2>/dev/null || cat /etc/os-release 2>/dev/null | awk -F= '/^PRETTY_NAME/{print $2; exit}')"
 echo "python: $(python3 --version 2>&1)"
 echo "compute path: GPU_DEVICE=${GPU_DEVICE:-CUDA} (default CUDA)"
+if ! grep -q 'amd_iommu=on' /proc/cmdline 2>/dev/null; then
+  echo "WARN: S4000 + RAM >=256GB requires amd_iommu=on (iommu=pt recommended)"
+fi
 if [ "${GPU_DEVICE:-CUDA}" = "MUSA" ]; then
   echo "MUSA path requested: correctness profile will apply"
 fi

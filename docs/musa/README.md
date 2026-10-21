@@ -7,6 +7,7 @@
 - [版本/仓库锁定](MUSA_VERSION_MATRIX.md)
 - [qwen4_exp/MUSA 审计](MUSA_QWEN4EXP_AUDIT.md)
 - [候选补丁](../../patches/musa/README.md)
+- [开发机档案](MUSA_MACHINE_PROFILE.md)
 - [目标 OS](MUSA_OS_TARGET.md)
 - [上线 Runbook](MUSA_BRINGUP_RUNBOOK.md)
 - [正确性对拍协议](MUSA_CORRECTNESS_PROTOCOL.md)
@@ -16,4 +17,4 @@
 
 版本：**vllm-musa `v0.32.0-dev` + 官方 Qwen3.8-Flash-Next FP8**；qwen4_exp 在 vLLM 0.32 才有。
 
-当前状态：设备未上线；先做离线准备。设备上线后从 Phase 1 开始。
+当前状态：MUSA 开发机 `mtts4000`（192.168.100.248）已上线；CUDA 工作仍在远端 EPYC。设备侧细节见 [开发机档案](MUSA_MACHINE_PROFILE.md)。

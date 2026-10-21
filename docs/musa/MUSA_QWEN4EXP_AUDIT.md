@@ -161,13 +161,13 @@ NO_CUDA=1 ONLY=scalar ... build_engine_variants.sh
 
 ## 2.5 CPU-only 引擎的 N-sliced 崩溃（已规避）
 
-在 CPU-only scalar 构建上，真实 qfn 维度：
+在 CPU-only **scalar 与 AVX2** 构建上，真实 qfn 维度：
 
 ```text
 H=2560, I=640, qlen=1, top_k=2
 ```
 
-默认 `forward_many_nsliced` 路径 **SIGSEGV**（2026-10-21 本机复现）。
+默认 `forward_many_nsliced` 路径 **SIGSEGV**（2026-10-21 本机 scalar/AVX2 均复现，`matmul_fp8_quant_range`）。
 
 规避：
 

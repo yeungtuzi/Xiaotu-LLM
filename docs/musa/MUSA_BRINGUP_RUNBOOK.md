@@ -120,7 +120,7 @@ PASS
 export XTU_MUSA_CORRECTNESS=1
 ```
 
-它会强制：`VLLM_EXPERTS_LOAD_DEVICE=cpu`、CPU 全专家、无 GPU 常驻层、无 GPU prefill、上游 `EngramConfig.cpu_offload=True` 负责 PLE host、MTP/投机关。
+它会强制：`VLLM_EXPERTS_LOAD_DEVICE=cpu`、CPU 全专家、无 GPU 常驻层、无 GPU prefill、上游 `EngramConfig.cpu_offload=True` 负责 PLE host、MTP/投机。
 显式设置的环境变量优先。
 
 ⚠️ 仍建议在启动 vLLM **之前**显式导出：
@@ -131,6 +131,14 @@ export XTU_MUSA_CORRECTNESS=1
 ```
 
 因为 vLLM 可能在插件加载前已缓存 `envs`。
+
+启动（已内置 MUSA correctness profile）：
+
+```bash
+CKPT=/path/to/Qwen3.8-Flash-Next-FP8 bash scripts/serve_qwen38.sh
+```
+
+该 profile 会强制 CPU 专家、无 GPU 常驻、无 GPU prefill、eager、8K。
 
 条件：
 

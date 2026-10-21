@@ -58,6 +58,20 @@ GPU_PREFILL_MIN="${GPU_PREFILL_MIN:-2048}"
 #   实测 15K 自然结束:decode 46.0/43.8/44.0(C=1/2/4),比无常驻的 45.6 更高、步时更低 ✓
 #   ⛔ 不要再叠加热专家池:12 层 + 64 槽会挤爆 KV(实测 `No available memory for the cache blocks`)
 XIAOTU_MOE_GPU_RESIDENT_LAYERS="${XIAOTU_MOE_GPU_RESIDENT_LAYERS:-15,9,11,16,31,3,39,25,7,23,24,13}"  # ⭐ 0.2.9 实测最优:>0 才启用 tile 环(0=关!)
+# MUSA correctness profile: opt-in, conservative; never touches the CUDA defaults above.
+if [ "${XTU_MUSA_CORRECTNESS:-0}" = "1" ]; then
+  echo "[qwen38] MUSA correctness profile: CPU experts, no resident, no GPU prefill, eager, 8K"
+  export VLLM_EXPERTS_LOAD_DEVICE=cpu
+  export XIAOTU_MOE_GPU_RESIDENT_LAYERS=""
+  export XIAOTU_PLE_CPU=0
+  export XIAOTU_SPEC_DECODE=0
+  PLE_CPU=0
+  GPU_PREFILL_MIN=0
+  EAGER=1
+  MAXLEN="${MAXLEN:-8192}"
+  SEQS="${SEQS:-1}"
+  MBT="${MBT:-8192}"
+fi
 KV_DTYPE="${KV_DTYPE:-auto}"
 TOOL_PARSER="${TOOL_PARSER:-}"
 REASONING_PARSER="${REASONING_PARSER:-}"
@@ -82,6 +96,7 @@ NCTL=(); [ -n "$NUMA_CMD" ] && NCTL=($NUMA_CMD)
 {
   echo "XIAOTU_MOE_THREADS=$THREADS"
   echo "XIAOTU_MOE_SPIN_IDLE_US=${SPIN_IDLE_US:-300}"
+  echo "VLLM_EXPERTS_LOAD_DEVICE=${VLLM_EXPERTS_LOAD_DEVICE:-gpu}"
   echo "VLLM_XIAOTU_GPU_PREFILL_MIN_TOKENS=$GPU_PREFILL_MIN"
   echo "XIAOTU_PLE_CPU=$PLE_CPU"
   echo "XIAOTU_RELEASE_SOURCE=${XIAOTU_RELEASE_SOURCE:-1}"

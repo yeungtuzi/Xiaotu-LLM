@@ -13,6 +13,12 @@ echo "--- tools ---"
 for c in musaInfo mthreads-gmi mthreads-smi nvidia-smi; do
   if command -v "$c" >/dev/null 2>&1; then echo "$c: $(command -v $c)"; else echo "$c: MISSING"; fi
 done
+echo "--- xiaotu CPU engine .so deps ---"
+for so in xiaotu_moe/build/*.so; do
+  [ -e "$so" ] || continue
+  echo "$so"
+  ldd "$so" 2>/dev/null | grep -E 'libcudart|libcuda|not found' || echo "  (no cuda deps)"
+done
 echo "--- python packages ---"
 python3 - <<'PY' 2>/dev/null || true
 mods=['torch','torch_musa','vllm','vllm_musa','triton','torchada']

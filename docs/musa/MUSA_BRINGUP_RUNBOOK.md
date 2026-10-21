@@ -24,6 +24,22 @@ git pull --ff-only
 - vllm-musa **v0.32.0-dev** @ `93183864`；
 - 不用 `qwen38-flash-next` 专用镜像作为运行路径。
 
+## 1.5 检查 CPU 引擎 .so
+
+```bash
+bash scripts/musa_preflight.sh | sed -n '/xiaotu CPU engine/,/python packages/p'
+```
+
+如果看到：
+
+```text
+libcudart.so.13 => not found
+libcuda.so.1 => not found
+```
+
+说明当前 `.so` 是 CUDA 构建，**MUSA 不能直接用**；需要先构建
+`XIAOTU_MOE_NO_CUDA=1` 的 CPU-only 引擎变体。
+
 ## 2. 应用 qwen4_exp MUSA 候选补丁
 
 先检查：

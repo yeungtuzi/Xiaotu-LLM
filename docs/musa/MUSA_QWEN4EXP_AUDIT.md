@@ -116,6 +116,39 @@ out_cpu → MUSA device
 
 ---
 
+## 2.4 预编译 .so 的 CUDA 依赖（MUSA 硬阻塞）
+
+本仓库自带的 CPU 引擎 `.so` 当前链接：
+
+```text
+libcudart.so.13
+libcuda.so.1
+```
+
+在普通 x86 开发机上：
+
+```text
+ldd xiaotu_moe/build/_xiaotu_moe_C_avx2...so
+→ libcudart.so.13 => not found
+→ libcuda.so.1 => not found
+```
+
+MUSA 没有 CUDA runtime / CUDA driver，因此：
+
+> **直接 `import xiaotu_moe` 会在 dlopen 阶段失败，stream-free 回退也来不及生效。**
+
+所以 MUSA 需要额外一步：
+
+1. 给 `binding.cpp` 加 `XIAOTU_MOE_NO_CUDA` 编译开关；
+2. 去掉 `CpuDecodeState` / `cpu_decode` / `copy_hostbuf_*` / `prealloc_decode_buffers`；
+3. 只保留 `cpu_prefill`（host-only）；
+4. 用 `NO_CUDA=1` 重新构建 `.so`；
+5. 插件 MUSA 回退只调用 `cpu_prefill`。
+
+这是比“Python 层设备判断”更底层的阻塞，已加入 preflight 检查。
+
+---
+
 ## 3. 其他依赖
 
 - `qwen_gdn_linear_attn`、`MambaHybridModelState`、`MambaSpec`：MUSA 的 mamba 支持需单独验；

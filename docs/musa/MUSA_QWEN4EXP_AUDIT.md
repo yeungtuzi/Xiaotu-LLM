@@ -48,6 +48,26 @@ launch_pdl=current_platform.is_arch_support_pdl()
 - `launch_pdl` 在 MUSA 上关闭；
 - `current_platform.is_rocm()` 分支改为“AMD or MUSA”。
 
+## 2.1 torchada 的两个关键兼容点
+
+已核对 torchada 源码（`/root/lvllm/data/refs/musa/torchada`）：
+
+| 兼容点 | 行为 | 对 qwen4_exp 的影响 |
+|---|---|---|
+| `Tensor.is_cuda` | torchada 把 MUSA tensor 的 `is_cuda` 补成 True（`src/torchada/_patch.py:1774`） | qwen4 的 `if not q.is_cuda: return` 不会误跳过 QSA/PLE kernel |
+| `tl.extra.cuda` | torchada 映射到 `tl.extra.musa` | GDC/PDL 符号可能可用，但 MUSA PDL 语义未验证 |
+
+因此：
+
+- `q.is_cuda` 检查在 MUSA 上**不是**主要阻塞；
+- 我们的 `0002`–`0004` 强制 `launch_pdl=False` 是**保守正确性选择**，不是唯一方案；
+- 若 S4000 实测 PDL 可用，可再放开；第一轮先关。
+
+`current_platform.is_cuda()` 仍为 False，所以 QSA 的 top-k 会走
+`ops.top_k_per_row_decode`；vllm-musa 已注册该 op，但要在设备上确认。
+
+---
+
 ## 3. 其他依赖
 
 - `qwen_gdn_linear_attn`、`MambaHybridModelState`、`MambaSpec`：MUSA 的 mamba 支持需单独验；

@@ -10,6 +10,7 @@ PATCHES=(
   "$PATCH_DIR/0002-qwen4exp-musa-disable-pdl.patch"
   "$PATCH_DIR/0003-qwen4exp-musa-ple-pdl.patch"
   "$PATCH_DIR/0004-qwen4exp-musa-qsa-cache-pdl.patch"
+  "$PATCH_DIR/0005-qwen4exp-musa-qsa-topk-fallback.patch"
 )
 cd "$ROOT"
 for p in "${PATCHES[@]}"; do

@@ -217,6 +217,28 @@ rel     = 0.104%
 
 ---
 
+## 2.6 QSA top-k 的 MUSA 缺口
+
+vllm-musa 的 patch 0059 **删除了** CUDA-only 的：
+
+```text
+top_k_per_row_decode
+```
+
+而 qwen4_exp 的 AMD QSA 路径在 `current_platform.is_cuda()` 为 false 时
+正好调用这个 op。MUSA 上会直接报未注册。
+
+已加候选补丁：
+
+```text
+0005-qwen4exp-musa-qsa-topk-fallback.patch
+```
+
+MUSA 时用 `torch.topk` 按 `visible_blocks` 长度做 mask 后选 top-k；
+只保证正确性，不追求性能。需实机验证 top-k 顺序/边界。
+
+---
+
 ## 3. 其他依赖
 
 - `qwen_gdn_linear_attn`、`MambaHybridModelState`、`MambaSpec`：MUSA 的 mamba 支持需单独验；

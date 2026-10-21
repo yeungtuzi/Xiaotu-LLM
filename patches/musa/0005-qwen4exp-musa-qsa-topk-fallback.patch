@@ -1,0 +1,69 @@
+From: XTU MUSA bring-up
+Subject: [PATCH] qwen4_exp/amd: torch.topk fallback for MUSA QSA selection
+
+Candidate patch against vLLM v0.32.0; NOT hardware-validated.
+vllm-musa removes the CUDA-only top_k_per_row_decode op, so use a
+correctness-first torch.topk fallback on MUSA.
+
+--- a/vllm/models/qwen4_exp/amd/ops/qsa.py	2026-10-21 16:00:34.193505192 +0800
++++ b/vllm/models/qwen4_exp/amd/ops/qsa.py	2026-10-21 16:00:34.197505313 +0800
+@@ -724,6 +724,29 @@
+     return out
+ 
+ 
++def _musa_topk_per_row_decode(
++    logits: torch.Tensor,
++    seq_lens: torch.Tensor,
++    blocks: torch.Tensor,
++    topk: int,
++) -> None:
++    """MUSA fallback for vLLM's CUDA-only top_k_per_row_decode.
++
++    `seq_lens` is per-row visible length; columns beyond it must be excluded.
++    This is a correctness-first torch.topk path, not a performance path.
++    """
++    columns = logits.shape[1]
++    lens = seq_lens.to(torch.long)
++    ar = torch.arange(columns, device=logits.device)
++    mask = ar[None, :] < lens[:, None]
++    neg_inf = torch.full_like(logits, float("-inf"))
++    masked = torch.where(mask, logits, neg_inf)
++    k = min(int(topk), int(columns))
++    _, idx = torch.topk(masked, k, dim=1)
++    blocks.zero_()
++    blocks[:, :k].copy_(idx.to(torch.int32))
++
++
+ def qsa_select_paged_tokens(
+     q: torch.Tensor,
+     k_cache: torch.Tensor,
+@@ -794,16 +817,19 @@
+                 columns,
+             )
+         else:
+-            ops.top_k_per_row_decode(
+-                logits,
+-                1,
+-                visible_blocks,
+-                blocks,
+-                blocks.shape[0],
+-                logits.stride(0),
+-                logits.stride(1),
+-                block_topk,
+-            )
++            if getattr(current_platform, "is_musa", lambda: False)():
++                _musa_topk_per_row_decode(logits, visible_blocks, blocks, block_topk)
++            else:
++                ops.top_k_per_row_decode(
++                    logits,
++                    1,
++                    visible_blocks,
++                    blocks,
++                    blocks.shape[0],
++                    logits.stride(0),
++                    logits.stride(1),
++                    block_topk,
++                )
+         expand_qsa_block_indices_cuda(
+             blocks,
+             query_positions[row_slice],

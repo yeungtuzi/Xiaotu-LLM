@@ -70,6 +70,21 @@ bash scripts/musa/apply_qwen4exp_patches.sh /path/to/vllm
 0004  QSA cache 关闭 PDL/GDC
 ```
 
+## 2.5 CPU-only FP8 qfn-shape 金标准
+
+在真实 MUSA 之前，先验证 CPU 引擎在 qfn-like 路由形状（top_k=10）上的数值：
+
+```bash
+python scripts/musa/cpu_fp8_qfn_golden.py
+```
+
+期望：
+
+```text
+PASS
+rel < 2e-2
+```
+
 ## 3. qwen4_exp import 冒烟
 
 ```bash

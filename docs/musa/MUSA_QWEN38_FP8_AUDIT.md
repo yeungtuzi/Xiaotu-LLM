@@ -61,6 +61,20 @@ model.language_model.layers.1.ple.ple_embedding.ngram_embedding.shard_0.weight
 - **PLE 在 host**：官方 FP8 PLE 仍是 51.2GB 量级；256GB host 可放下；
 - **无 BF16 阶段**：官方 FP8 直接接 NVFP4。
 
+## 4.5 CPU-only qfn-shape 金标准
+
+`scripts/musa/cpu_fp8_qfn_golden.py` 用 `E=16, H=2560, I=640, top_k=10`
+验证 CPU-only 引擎：
+
+```text
+max_abs = 0.1764
+rms     = 279.7
+rel     = 0.063%
+PASS
+```
+
+该测试不依赖 GPU/CUDA runtime；设备上线前即可复现。
+
 ## 5. 第一轮验收
 
 ```text

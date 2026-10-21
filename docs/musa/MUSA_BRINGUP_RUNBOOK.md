@@ -140,6 +140,10 @@ CKPT=/path/to/Qwen3.8-Flash-Next-FP8 bash scripts/serve_qwen38.sh
 
 该 profile 会强制 CPU 专家、无 GPU 常驻、无 GPU prefill、eager、8K。
 
+⚠️ 启动脚本会显式写 `XIAOTU_ENV_FILE`，插件在 `musa_correctness.apply()` **之前**
+读取它；因此不要手工往这个文件里塞旧的 `XIAOTU_PLE_CPU=1` 或
+`XIAOTU_MOE_GPU_RESIDENT_LAYERS=...`，否则会覆盖 MUSA correctness profile。
+
 条件：
 
 ```text

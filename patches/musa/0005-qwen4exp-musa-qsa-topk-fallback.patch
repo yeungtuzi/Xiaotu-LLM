@@ -5,8 +5,8 @@ Candidate patch against vLLM v0.32.0; NOT hardware-validated.
 vllm-musa removes the CUDA-only top_k_per_row_decode op, so use a
 correctness-first torch.topk fallback on MUSA.
 
---- a/vllm/models/qwen4_exp/amd/ops/qsa.py	2026-10-21 16:00:34.193505192 +0800
-+++ b/vllm/models/qwen4_exp/amd/ops/qsa.py	2026-10-21 16:00:34.197505313 +0800
+--- a/vllm/models/qwen4_exp/amd/ops/qsa.py	2026-10-21 16:01:01.070315107 +0800
++++ b/vllm/models/qwen4_exp/amd/ops/qsa.py	2026-10-21 16:01:01.074315228 +0800
 @@ -724,6 +724,29 @@
      return out
  

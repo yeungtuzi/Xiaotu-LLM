@@ -5,6 +5,10 @@ echo "===== MUSA preflight $(date -Is) ====="
 echo "host: $(hostname)  kernel: $(uname -r)  arch: $(uname -m)"
 echo "os: $(lsb_release -ds 2>/dev/null || cat /etc/os-release 2>/dev/null | awk -F= '/^PRETTY_NAME/{print $2; exit}')"
 echo "python: $(python3 --version 2>&1)"
+echo "compute path: GPU_DEVICE=${GPU_DEVICE:-CUDA} (default CUDA)"
+if [ "${GPU_DEVICE:-CUDA}" = "MUSA" ]; then
+  echo "MUSA path requested: correctness profile will apply"
+fi
 if ! uname -r | grep -q '^5\.15\.'; then
   echo "WARN: S4000/vllm-musa reference kernel is 5.15.0-105-generic; current=$(uname -r)"
 fi

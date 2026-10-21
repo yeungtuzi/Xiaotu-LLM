@@ -7,7 +7,7 @@
 | 层 | 当前（CUDA/vLLM） | MUSA 目标 | 优先级 |
 |---|---|---|---|
 | vLLM 平台 | `vllm` CUDA platform | `vllm-musa` 的 `MUSAPlatform` / `MTGPUWorker` | P0 |
-| 模型 | 官方 `Qwen/Qwen3.8-Flash-Next-FP8` | qwen4_exp 支持；镜像/补丁只作参考 | P0 |
+| 模型 | 官方 `Qwen/Qwen3.8-Flash-Next-FP8` | qwen4_exp 需加 MUSA 分支；见 [MUSA_QWEN4EXP_AUDIT.md](MUSA_QWEN4EXP_AUDIT.md) | P0 |
 | attention | GDN/QSA/mamba | vllm-musa 的 MUSA attention/Mamba patch | P0 |
 | KV cache | CUDA paged KV | vLLM-MUSA KV / Mamba pool | P0 |
 | 官方 FP8 专家 | FP8 | MUSA FP8 / qwen 官方路径 | P0 |

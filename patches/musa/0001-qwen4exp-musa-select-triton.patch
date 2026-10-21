@@ -1,0 +1,19 @@
+From: XTU MUSA bring-up
+Subject: [PATCH] qwen4_exp: route MUSA to the Triton/AMD path
+
+This is a candidate patch against vLLM v0.32.0; it is NOT validated on MUSA.
+It only fixes platform dispatch.  The AMD path still contains CUDA-specific
+PDL/GDC calls that need separate guards.
+
+diff --git a/vllm/models/qwen4_exp/__init__.py b/vllm/models/qwen4_exp/__init__.py
+--- a/vllm/models/qwen4_exp/__init__.py
++++ b/vllm/models/qwen4_exp/__init__.py
+@@ -26,7 +26,10 @@ def __getattr__(name: str) -> Any:
+         if current_platform.is_xpu() or current_platform.is_tpu():
+             raise NotImplementedError("Qwen4Exp currently supports CUDA and ROCm only")
+-        if current_platform.is_rocm():
++        is_musa = getattr(current_platform, "is_musa", lambda: False)()
++        if current_platform.is_rocm() or is_musa:
+             from .amd.model import (
+                 Qwen4ExpForCausalLM,
+                 Qwen4ExpForConditionalGeneration,

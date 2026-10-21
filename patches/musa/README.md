@@ -17,6 +17,8 @@ bash scripts/musa/apply_qwen4exp_patches.sh /path/to/vllm
 - `0004`: same PDL guard for `common/qsa_cache.py` (QSA metadata).
 - `0005`: MUSA `torch.topk` fallback for QSA selection; vllm-musa removes
   the CUDA-only `top_k_per_row_decode` op.
+- `0006`: one QSA partial stage on MUSA, matching the more conservative ROCm
+  path.
 
 Status: **candidate, not hardware-validated**. The guards only force
 `launch_pdl=False`; they do not prove the AMD/Triton kernels themselves compile

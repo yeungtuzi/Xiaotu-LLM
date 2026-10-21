@@ -239,6 +239,25 @@ MUSA 时用 `torch.topk` 按 `visible_blocks` 长度做 mask 后选 top-k；
 
 ---
 
+## 2.7 QSA partial stages 的保守选择
+
+`qwen4_exp/amd/ops/qsa.py` 里：
+
+```python
+partial_stages = 1 if current_platform.is_rocm() else 2
+```
+
+MUSA 不走 ROCm 分支，会拿到 2 个 software-pipelining stage。第一轮正确性
+优先采用与 ROCm 一致的保守值 1：
+
+```text
+0006-qwen4exp-musa-qsa-partial-stages.patch
+```
+
+CUDA 路径不变；需实机确认数值与性能。
+
+---
+
 ## 3. 其他依赖
 
 - `qwen_gdn_linear_attn`、`MambaHybridModelState`、`MambaSpec`：MUSA 的 mamba 支持需单独验；

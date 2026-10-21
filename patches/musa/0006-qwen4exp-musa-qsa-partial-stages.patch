@@ -1,0 +1,19 @@
+From: XTU MUSA bring-up
+Subject: [PATCH] qwen4_exp/amd: use conservative QSA partial stages on MUSA
+
+Candidate patch against vLLM v0.32.0; NOT hardware-validated.
+MUSA's Triton path is closer to ROCm; use one partial stage for correctness.
+This does not change the CUDA path.
+
+--- a/vllm/models/qwen4_exp/amd/ops/qsa.py
++++ b/vllm/models/qwen4_exp/amd/ops/qsa.py
+@@ -879,7 +879,8 @@
+         block_n, target_splits, partial_warps = 64, 1, 2
+     # gfx942 and gfx950 have a 64 KiB LDS limit. One software-pipelining
+     # stage keeps the wide TP4 tile within that shared-memory budget.
+-    partial_stages = 1 if current_platform.is_rocm() else 2
++    is_musa = getattr(current_platform, "is_musa", lambda: False)()
++    partial_stages = 1 if (current_platform.is_rocm() or is_musa) else 2
+ 
+     num_tiles = triton.cdiv(logical_indices.shape[1], block_n)
+     # Avoid empty splits when the selection width is smaller than the profile.

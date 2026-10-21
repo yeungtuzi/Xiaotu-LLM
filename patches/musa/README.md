@@ -6,8 +6,8 @@ normal build until validated on S4000.
 Apply order:
 
 ```bash
-git apply patches/musa/0001-qwen4exp-musa-select-triton.patch
-git apply patches/musa/0002-qwen4exp-musa-disable-pdl.patch
+bash scripts/musa/apply_qwen4exp_patches.sh /path/to/vllm --check
+bash scripts/musa/apply_qwen4exp_patches.sh /path/to/vllm
 ```
 
 - `0001`: route MUSA to the Triton/AMD qwen4_exp path instead of `nvidia`.

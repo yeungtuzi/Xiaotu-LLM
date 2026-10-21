@@ -762,6 +762,44 @@ _IN_STARTUP = [True]
 #   ⇒ 两者必须分开:本 flag 只覆盖 warmup/捕获,不覆盖 profile ✓
 _IN_WARMUP = [False]
 
+# ⭐ 2026-10-20:activation 占位必须在 **KV 定容之前** 真正分配。
+#   用户原则:"只指定上下文长度,不指定 KV 大小;我们的内存申请排在 KV 之前,
+#   让 KV 来适应我们"。原先 `activation_reserve_bytes()` 只进 GPU prefill 的
+#   *预检*,没进 vLLM 的 `determine_available_memory` ⇒ KV 把 free 吃满,
+#   长 prefill 的 512 MiB `q_padded` 在谷底找不到连续块(C=4 OOM, BUG A68)。
+#   这里在 profile 期持有一个 **3 GiB 活张量** ⇒ vLLM 测到的 free 少 3 GiB
+#   ⇒ KV 池自动缩小;KV 分配完成后再释放,块留在 torch cache 里给 q_padded 复用。
+_ACT_RESERVE = None
+
+
+def _reserve_activation_for_kv() -> None:
+    """Allocate the activation reserve **before** vLLM sizes the KV pool."""
+    global _ACT_RESERVE
+    if _ACT_RESERVE is not None:
+        return
+    n = activation_reserve_bytes()
+    if n <= 0:
+        return
+    try:
+        _ACT_RESERVE = torch.empty(int(n), dtype=torch.uint8, device="cuda")
+        print(f"[vllm-xtu-moe] ⭐ profile 期 activation 占位 "
+              f"{n / 2**30:.2f} GiB(在 KV 定容前分配 ⇒ KV 自动让出这块)✓",
+              flush=True)
+    except Exception as exc:  # noqa: BLE001
+        _ACT_RESERVE = None
+        print(f"[vllm-xtu-moe] ⚠️ activation 占位失败,本次 KV 可能吃满: "
+              f"{type(exc).__name__}: {exc}", flush=True)
+
+
+def _release_activation_after_kv() -> None:
+    """Drop the reserve **after** KV caches are sized; block stays in torch cache."""
+    global _ACT_RESERVE
+    if _ACT_RESERVE is not None:
+        _ACT_RESERVE = None
+        print("[vllm-xtu-moe] ⭐ KV 已定容 ⇒ 释放 activation 占位(块留给 q_padded 复用)✓",
+              flush=True)
+
+
 
 def in_profile_run() -> bool:
     """True during startup (profiling/capture/warmup) -- GPU prefill must not run."""
@@ -1006,6 +1044,11 @@ def install_profile_guard() -> list[str]:
                 #     分配**持久真缓冲** ⇒ vLLM 测得到 ⇒ KV 据实定容 ✓
                 #   * ⛔ 失败**必须出声**:静默退化正是 B510 那次事故的形态 ✗
                 try:
+                    _reserve_activation_for_kv()
+                except Exception as _e:  # noqa: BLE001
+                    print("[vllm-xtu-moe] ⛔ activation 占位失败(不掩盖): "
+                          f"{type(_e).__name__}: {_e}", flush=True)
+                try:
                     _reserve_staging_from_model(getattr(self, "model_runner", None))
                 except Exception as _e:  # noqa: BLE001
                     print("[vllm-xtu-moe] ⛔ profile 期 staging 记账失败(不掩盖)"
@@ -1065,6 +1108,9 @@ def install_profile_guard() -> list[str]:
     if orig_warm is not None and not getattr(orig_warm, "_xtu_shim", False):
         @functools.wraps(orig_warm)
         def compile_or_warm_up_model(self, *a, **kw):
+            # ⭐ 2026-10-20:KV 已定容 ⇒ 现在释放 activation 占位(在 warmup/图捕获前),
+            #   块留在 torch cache 里供长 prefill 的 q_padded 复用。
+            _release_activation_after_kv()
             # ⭐ 2026-10-09:本窗口 = **warmup + CUDA graph 捕获** ⇒ 期间挡住 GPU 预填 ✗
             #   (实测:侧流预填与捕获交错 ⇒ replay 时 `cuGraphLaunch` SIGSEGV)✓
             _IN_WARMUP[0] = True
@@ -2029,7 +2075,10 @@ def gpu_moe_layer(
                 pass
     if slot is not None:
         # Mark the slot free only after these kernels have actually finished.
-        slot.busy = torch.cuda.Event()
+        # ⭐ 2026-10-20:旧实现每次调用都 new 一个 Event;PIN 路径每层每 forward 调一次
+        #   ⇒ 长时间压测累计大量 CUDA event(与 as_slot 同族泄漏)。复用同一个 event。
+        if getattr(slot, "busy", None) is None:
+            slot.busy = torch.cuda.Event()
         slot.busy.record(torch.cuda.current_stream(device))
     return out
 

@@ -175,6 +175,7 @@ class LayerPool:
         for e, s in self.slot_of.items():
             sm[e] = self.n_local + s
         self.slotmap = sm.to(device=device, non_blocking=False)
+        self._slot = None          # ⭐ 2026-10-20:复用 as_slot(),不要每层每次 forward 新建 Event
         self._load_all(_gp)
         gib = sum(p.numel() for p in self.planes) / 2**30
         print(f"[xtu-pin] layer{layer_idx}: slots={S} pool={gib:.2f} GiB "
@@ -229,10 +230,15 @@ class LayerPool:
         torch.cuda.synchronize()
 
     def as_slot(self):
-        # 喂给 gpu_moe_layer 的 slot-like:bufs=planes,ready=构建期已完成事件
-        ev = torch.cuda.Event()
-        ev.record()   # 前面 _load_all 已 synchronize,这里只是保序凭证
-        return _ReadySlot(self.planes, ev)
+        # 喂给 gpu_moe_layer 的 slot-like:bufs=planes,ready=构建期已完成事件。
+        # ⭐ 2026-10-20:旧实现**每次调用**都 new 一个 Event;PIN 路径每层每 forward 调一次
+        #   ⇒ 长时间压测累计大量 CUDA event(并可能留下未释放资源)。槽内容不变,
+        #   复用同一个 _ReadySlot 即可;`busy` 由 gpu_moe_layer 每次覆盖。
+        if self._slot is None:
+            ev = torch.cuda.Event()
+            ev.record()   # 前面 _load_all 已 synchronize,这里只是保序凭证
+            self._slot = _ReadySlot(self.planes, ev)
+        return self._slot
 
     # ---- 【运行中自适应】两个入口:只改 plane 内容 + 表内容,不改图、不改池子大小 ----
     def swap_out(self, s: int) -> int:

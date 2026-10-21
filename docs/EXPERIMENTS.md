@@ -33989,3 +33989,147 @@ FP8 32×32 + expert FP4、48 分片/475.3 GiB/96,085 tensors);适配 = 换路径
   1017 PIN 路径补 `swiglu_limit` + MXFP4 clamp(见 A68 同批改动)。
 * **决策**:保持 EP 默认;不投入 DP+EP(需 all-to-all、40GB 显存放不下 attention 复制,且无 ≥5% 证据)。
   详见 `dev-docs/PLAN_EP_VS_TP_2026-10-19.md` §7。
+
+### B1062 (2026-10-20) ⭐ 离线发现:当前 `expert_pin_v1_700.bin` 很可能在 1017 之前生成
+
+【证据(仅文件时间/内容,未上机)】
+- 表 mtime **2026-10-15 02:16**;路由轨迹 `route.bin.pid401479` mtime **2026-10-14 11:34**;
+- AGENTS/记录:ds41f 自 **2026-10-19** 起专指 1017,且要求“1017 换权重后重新采路由再生成 PIN 表”;
+- 表有 **700 槽 / 40 层**;a775 的 1017 profile 只有 **36 个 MoE 层**(缺 20–23),表却给 20–23 分了 **70 槽**;
+- 用 a775 1017 counts 作参照:我们 630 个有效槽覆盖 **7.7%**,同槽数理想 top-N **21.9%**,50 槽/层理想 **42.9%**;
+  top-N 重合也低(layer 0 Jaccard 0.176;layer 1 = 0)。
+
+【判断】⇒ 当前表大概率是 **0917 路由**,不是 1017;静态 PIN 的 32% hit / 有限收益可能被旧表污染。
+**不要**再用这张表下“PIN 上限”结论;先重采 1017 轨迹,或用 a775 counts 生成候选表做离线对照。
+
+【动作】离线报告:`dev-docs/BACKPORT_ASSESSMENT_2026-10-20.md` §1.1;服务器恢复后第一轮先重采 PIN,再做 adaptive verification。
+
+### B1063 (2026-10-20) ⛔ 更正 B1062 的定性:**不是“发现”,是用户早已明确要求重采、我没执行**
+
+用户指出:**“我明确要求重新生成专家表”**。所以 B1062 把“当前 PIN 表是 1017 之前生成的”写成“离线发现”**不成立** ——
+这是**执行缺口**:用户已经要求重采,我却没有把“重采 1017 路由 → 生成新表”作为交付项,还继续用旧表做 PIN 结论。
+
+【事实不变(仅作证据)】
+- 旧表 mtime **2026-10-15**,旧路由 **2026-10-14**;1017 于 **2026-10-19** 成为 ds41f 默认;
+- 旧表 700 槽 / 40 层,含 20–23 层; a775 的 1017 profile 只有 36 个 MoE 层;
+- 用 a775 counts 作参照:旧表覆盖 **7.7%**,同槽数理想 **21.9%**。
+
+【已补的离线动作】
+- 生成候选表 `/root/lvllm/tmp/pin_1017_candidate/expert_pin_1017_a775_700.bin`(700 槽 / 36 层,覆盖 24.1%);
+- **候选不是生产表**:负载/硬件不同,层 20–23 是否建池还要按 1017 config 确认;
+- 服务器恢复后**第一件事**是用 1017 真实 `XIAOTU_ROUTING_DUMP` 重采,生成正式表,再做 PIN/动态 PIN 结论。
+
+【纪律】用户明确要求的资产重生成,必须进 TODO + 验收门;**不能把“旧资产导致的问题”写成“新发现”**。
+
+### B1064 (2026-10-21) ⛔ 社区 a775 撤回 DSpark 变长验证:+13.9% 但会改错 token
+
+【事实（a775/Lsglang 1017，2026-10-20/21）】
+- 10-20 默认改成长度 1–6 的变长验证;两个请求同时 decode:**100.1 → 114.03 tok/s(+13.9%)**;
+  单请求 101.33 → 104.42(temp 0),temp 0.7 反而略低;单请求净 +1~3%,日间波动 ±2%。
+- 10-21 01:47 回退默认:**单请求温度 0 逐字复述 4 段代码,变长验证 4/4 段错**
+  (`Collector`→`Colletor`、`deque`→`dequ`、`bootstrap`→`botstrap`、`reasoning`→`reasonings`);
+  固定验证 0/4;编码代理工具调用标记被改坏,参数解析成 `{}`。
+- 10-21 10:20 彻底删除 compact 启动路径;README 明确默认 **static**。
+- 已排除 FP4 prefill、deepseek-recipe 分词;分歧从 layer 1(SWA-only)的 attention 输出开始,根因未找到。
+
+【判断】⇒ +13.9% 是**不可交付**的吞吐数字。任何 adaptive/variable verification 必须同时过:
+① 逐 token/逐字节 greedy 对拍;② 工具调用标记/参数解析;③ 24h 稳定性;④ 最后才看 step/AL。
+**只报 tok/s 的变长验证结论一律不采信。**
+
+【关联】`dev-docs/BACKPORT_ASSESSMENT_2026-10-20.md` §2.4;`REFERENCE_RADAR.md` §3.7。
+
+### B1065 (2026-10-21) ⭐ 用户实测更正:prefill 时两张 GPU 的 H2D 已跑满 ⇒ 当前按 **H2D-bound** 处理
+
+【用户实测(优先于旧推断)】
+- prefill 时两张卡(主 TP=2 的 GPU1/2)的 **PCIe H2D 带宽跑满**;
+- 同一时刻 GPU 计算能力**远未用满** ⇒ 计算不是当前 prefill 的限速项;
+- 因此暂定:**prefill 的硬上限 = 每 rank 需要搬运的专家字节 / 有效 H2D 带宽**。
+
+【作废旧口径】
+- B434 的“DMA 只用 ~35%、不是 DMA bound”是**旧配置/旧口径**的结论,**不得再当现状引用**;
+- 之前 `[cd-timing]` 的 decode 分解(CPU 36% / GPU 62%)仍有效,但它描述的是 **decode**,不能外推到 prefill;
+- 社区 a775 的“prefill MoE 受 PCIe 上传限制”与用户实测同向,可作为旁证。
+
+【新模型】
+```
+prefill 时间/chunk ≈ H2D 字节 / 有效带宽 + 固定开销
+H2D 字节 = 该 chunk 实际触达、且未驻留的 (layer, expert) × 每槽字节
+有效带宽 = 单卡 H2D(本机 GPU1/2 实测 pinned ≈25 GB/s;GPU0 x8 ≈12.5 GB/s)
+```
+⇒ 提 prefill 只有三条路:
+1. **减少 H2D 字节**:提高热专家/整层驻留覆盖率;更大 chunk 摊薄重复上传;
+2. **提高有效带宽**:确认 GPU1/2 跑在 x16/Gen4;批量化/固定内存;避免 GPU0 x8 参与主 prefill;
+3. **重叠**:H2D 饱和时 overlap 不能突破 bytes/BW 上限,只能消除气泡。
+
+【对“大显存”的修正】
+- 大显存不只提 decode,也直接提 **prefill**:驻留层/专家不再走 H2D;
+- 但 ds41f 整层成本 3.61 GiB/rank,12 层放不下;qfn 12 层(1.41 GiB/层)不可照搬;
+- prefill 更偏好**整层驻留**(整层字节全免),decode 更偏好**专家槽**(按热度);40 GB 上两者要权衡。
+
+【待办】
+1. 量化 `H2D bytes/token`、`DMA busy%`、`有效带宽`(即使已饱和,也要有数);
+2. 重采 1017 PIN 表,先降 miss;
+3. A/B:700 槽 vs 2–3 个整层(prefill 口径),看 prefill 收益与 decode 代价;
+4. 确认 GPU1/2 的 PCIe 宽度/代际,GPU0 不参与主 prefill。
+
+### B1066 (2026-10-21) ⭐⭐ prefill H2D 饱和的代码级原因:当前**每层把全部专家 tile 都搬一遍**,且 **PIN 不参与 prefill**
+
+【用户实测】PCIe 4.0 x16;prefill 时两张卡 H2D 均 >20 GB/s(接近物理上限);MBT=8192 已近 OOM,不能再加 chunk。
+
+【代码事实(本仓)】
+- `mixed_experts.py` 的 GPU prefill 走 `gpu_moe_layer_from_engine_tiled`。
+- `gpu_prefill.py` 里 `tiles = stage_tiles(E)` 是 **E 的全部 tile**;`_issue(i)` 在 `row1 > row0` 判断**之前**执行
+  ⇒ 即使某 tile 没有 token 路由到,也照样 H2D 上传;计算可跳过,搬运不跳过。
+- tile 默认 `tile = E//3`(384 ⇒ 96);每 rank 每层上传全部 384 个专家。
+- **PIN/热专家池只服务 decode 路径**;`gpu_prefill.py` 没有读取 PIN 表/驻留集合
+  ⇒ 当前“多驻留”**不会减少 prefill H2D**。这与社区 a775 的 “GPU Pool 同时服务 decode 和 prefill” 有结构差距。
+
+【算术(1017,TP=2)】
+- 每 rank 每层全专家 = 384 × 9.40 MB ≈ **3.61 GiB**;
+- 40 层 = **144.4 GiB/rank/chunk**;
+- 25 GB/s ⇒ **5.8 s/chunk**;8192 token ⇒ **~1.4k tok/s** —— 与实测 prefill 量级吻合。
+- 若 2 个整层常驻(7.2 GiB/rank):字节 −5% ⇒ prefill 约 +5%;
+- 12 个整层 = 43.3 GiB/rank > 40 GB,不可行。
+
+【结论/待办(按收益排序)】
+1. **让 prefill 认识驻留**:跳过/复用 PIN 或整层常驻的专家字节;这是“大显存提 prefill”的前提。
+2. **跳过零路由 tile**:先算 `seg_start` 再 `_issue`;MBT=8192 下可能收益有限(专家可能已全触达),但代码上应做。
+3. **整层常驻 A/B**:2–3 层,prefill 口径;与 700 槽对比;注意 decode 负收益(B122/B300)。
+4. **CPU 并行 prefill**:H2D 饱和时把一部分冷专家放 CPU 算,换字节;CPU 预填慢,但可与 H2D 并行。
+5. chunk/带宽已到顶;不要再假设“加 MBT”能救。
+
+### B1067 (2026-10-21) 设计:Strata 式 **CPU/GPU co-prefill** —— 让 CPU 分担一部分专家字节,并让两边同时结束
+
+【用户指出的 Strata 策略】不是“CPU 兜底”,而是:
+- 预测/估算 GPU 侧(H2D + 计算)与 CPU 侧(专家计算)的完成时间;
+- 把一部分专家分给 CPU,GPU 只上传**自己那部分**;
+- 调分界点,使 `T_cpu ≈ T_gpu`(基本同时结束);
+- 总时间从“GPU 搬全部专家”变成 `max(GPU 搬自己那份, CPU 算自己那份)`。
+
+【我们现状(缺口)】
+- `gpu_moe_layer_from_engine_tiled` 每层上传**全部 384 专家 tile**,CPU 在 GPU prefill 期间基本空闲;
+- CPU 只在亚门槛残块/回退路径参与,不是 co-prefill;
+- 所以 Strata 式收益目前 **0**,且 H2D 已饱和 ⇒ 这是少数还能降 prefill 时间的方向。
+
+【原型(最小可行)】
+1. 每层先算 routing counts / 每专家或每 tile 的 token 数;
+2. 选一个 CPU 子集(先按 tile=96,后续可 expert 级):
+   - GPU 只 `_issue` 剩余 tile;CPU 用现有 MXFP4 专家内核算 CPU 子集;
+   - 两边输出 `atomic_add` 到同一 `out`(现有 tile 路径已有 atomic 累加);
+3. 预估:
+   ```
+   T_gpu ≈ bytes_gpu / BW + compute_gpu(bytes_gpu)
+   T_cpu ≈ compute_cpu(experts_cpu, tokens)
+   ```
+   用实测常数(每专家 CPU ns、H2D 25 GB/s、GPU 每 tile ms)求 `n_cpu` 使两者接近;
+4. 先固定 10%/20%/30% 三档,测 prefill tok/s、正确性、CPU 占用;再上自适应。
+
+【约束/风险】
+- CPU 全量 prefill 只有 ~59–127 tok/s ⇒ CPU 份额不能大;按时间平衡可能只 5–15%;
+- tile 粒度 96 太粗;若 CPU 只接整个 tile,分界点跳变大,后续要 expert 级;
+- CPU/GPU 数值路径不同,必须 greedy 逐 token 对拍;atomic 顺序可能改数值;
+- 与 decode 的 CPU 线程竞争:prefill 期间 decode 也要 CPU;需要优先级/配额;
+- 不改 MBT、不改 KV;省的是 H2D 字节,不是激活。
+
+【预期】若 CPU 能无痛吸收 10–20% 字节,prefill 约 +11–25%(按 `1/(1-f)` 上限打折);
+但 CPU 计算慢,实际更可能 +5–15%。先做 15K/64K 冷 prefill,与当前全 GPU 路径 A/B。

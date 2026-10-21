@@ -455,3 +455,15 @@ AL 与 tok/s 虚高,见 QA #264);本文件里与此冲突的段落一律以本�
    只数 chunk 会把 decode 低估 **AL 倍**(实测 C=1:5.4 vs **42.6 tok/s**)。
    ⇒ 必须传 **`--tokenizer <model_dir>`**,按窗口内文本的 token 数计;**步时**仍按 chunk 间隔(≈step)✓
 3. 报 decode 时必须同时给 **`--tokenizer`、窗口内 token 数、步时**;缺任一项视为口径不完整 ✗
+
+### 6.4 ⭐ 15K 载荷辨析(2026-10-20,用户追问"为什么输出只有 100–200 token")
+
+* **`/tmp/dsh15k_salt32.jsonl`(合成 salt 载荷)**:64K 字符 = 固定 **15,000 token** 的
+  **SYS/AGENTS 文档** + 唯一 salt 前缀,**没有 user 任务、没有生成提示、末尾停在文档中间**。
+  ⇒ decode 实测 **7–47 token/条**(`v2_c1` 中位 51、`v2_c2` 242、`v2_c4` 159;`capped=0`、`deg=0`)。
+  ⛔ **只能用于 prefill/形状测试,不能代表真实 agent decode 负载**。
+* **`dsh_15k_v2.jsonl`(当前 §6 载荷)**:真实 DSH 会话的 15K token 窗口,但窗口是**硬切**,
+  末尾常在 assistant 文本/代码/文档中间;实测 decode **中位 1024、94% 被 1024 截断**
+  ⇒ **实质是 cap-limited,不是"自然结束"**;只能用于"15K 上下文引擎吞吐",不能用来断言模型自然输出长度。
+* 要测**自然输出长度**:按 **user turn 边界**切 15K + `apply_chat_template` + `max_tokens=4096`,
+  并报截断率;要测**引擎吞吐**:固定 cap 并明确报 `capped%`。

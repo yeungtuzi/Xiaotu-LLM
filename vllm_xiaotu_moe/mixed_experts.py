@@ -112,7 +112,13 @@ def _musa_cpu_forward(engine, qlen: int, top_k: int, hidden, ids, weights, out) 
     w_cpu = weights.detach().to(dtype=torch.float32, device="cpu").contiguous()
     h = int(hidden.shape[-1])
     out_cpu = torch.empty((int(qlen), h), dtype=torch.float32, device="cpu")
-    engine.cpu_prefill(int(qlen), int(top_k), ids_cpu, w_cpu, hid, out_cpu)
+    # The pybind extractor accepts int data pointers or numpy arrays; torch
+    # Tensor objects are NOT accepted (they would silently become nullptr).
+    engine.cpu_prefill(
+        int(qlen), int(top_k),
+        int(ids_cpu.data_ptr()), int(w_cpu.data_ptr()),
+        int(hid.data_ptr()), int(out_cpu.data_ptr()),
+    )
     out.copy_(out_cpu.to(device=out.device, dtype=out.dtype, non_blocking=False))
 
 

@@ -109,6 +109,9 @@ engine.cpu_prefill(...)          # stream-free, 只做 host forward_many
 out_cpu → MUSA device
 ```
 
+注意：`cpu_prefill` 的 pybind 指针提取器只接受 **int data_ptr 或 numpy array**，
+传 torch.Tensor 会静默变成 nullptr；回退里统一传 `int(t.data_ptr())`。
+
 特点：
 
 - 不依赖 CUDA runtime / CUDA graph；

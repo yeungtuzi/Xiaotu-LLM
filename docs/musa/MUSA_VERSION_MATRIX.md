@@ -12,6 +12,28 @@
 
 ---
 
+## 0.5 主机 OS / Python
+
+| 项 | 值 |
+|---|---|
+| OS | **Ubuntu 22.04.4 LTS x86_64** |
+| Kernel | **5.15.0-105-generic**（锁定，不自动升级） |
+| Secure Boot | OFF |
+| Python | **3.12**（独立 venv；插件 requires-python >=3.12） |
+| MUSA apt 源 | `https://dl.mthreads.com/repo/repository/ubuntu2204/` |
+
+MUSA 5.2 提供 cp312 wheel：
+
+```text
+torch-2.11.0.post2+musa5.2.0-cp312
+torch_musa-2.11.0.post2+musa5.2.0-cp312
+triton-3.2.0-cp312
+```
+
+不要用 Ubuntu 24.04 / Debian 12/13。见 [MUSA_OS_TARGET.md](MUSA_OS_TARGET.md)。
+
+---
+
 ## 1. vllm-musa 目标（2026-10-21 修正）
 
 **官方 Qwen3.8-Flash-Next 需要 `qwen4_exp` 模型代码；vLLM 0.29/0.28 没有，0.32 才有。**
@@ -77,7 +99,7 @@ torchada==0.1.95
 | 项 | 我们 | MUSA 参考 | 处理 |
 |---|---|---|---|
 | vLLM | 0.29.0 目标 | **0.32.0 pin** | 先 port 到 0.32（qwen4_exp 必需） |
-| qfn 模型 | 我们 qfn 插件 | qfn 专用镜像 | 先取镜像/补丁 |
+| qfn 模型 | 我们 qfn 插件 | qfn 专用镜像（仅 oracle） | 不作运行依赖，只对拍 |
 | 量化 | NVFP4 W4A16 + FP8_PB_WO | MUSA quant patch | 单层对拍 |
 | CPU 引擎 | x86 `.so` | 同一 x86 | AVX2 优先 |
 | GPU prefill | Triton tile ring | 不需要 | 关闭 |

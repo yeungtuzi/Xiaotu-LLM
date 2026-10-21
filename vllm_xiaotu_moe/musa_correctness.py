@@ -11,14 +11,33 @@ from __future__ import annotations
 import os
 
 
+def requested_device() -> str:
+    """Explicit compute-path selector.
+
+    ``GPU_DEVICE=MUSA`` selects the MUSA line; unset/CUDA keeps the default
+    CUDA line.  This is intentionally independent of vLLM's auto-detected
+    platform so a user can pin the path.
+    """
+    return (os.environ.get("GPU_DEVICE") or "CUDA").strip().upper()
+
+
+def musa_requested() -> bool:
+    return requested_device() in ("MUSA", "MTGPU", "S4000")
+
+
 def enabled() -> bool:
-    return os.environ.get("XTU_MUSA_CORRECTNESS", "0") == "1"
+    return (
+        os.environ.get("XTU_MUSA_CORRECTNESS", "0") == "1"
+        or musa_requested()
+    )
 
 
 def apply() -> list[str]:
     """Set defaults; explicit user env always wins (setdefault)."""
     if not enabled():
         return []
+    if musa_requested() and "XTU_MUSA_CORRECTNESS" not in os.environ:
+        os.environ["XTU_MUSA_CORRECTNESS"] = "1"
     defaults = {
         # vLLM's native switch: routed experts live on the host from construction.
         # This is the prerequisite for the CPU expert backend.

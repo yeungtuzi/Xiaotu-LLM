@@ -33,6 +33,22 @@ class TestMusaCorrectness(unittest.TestCase):
             self.assertEqual(os.environ["XIAOTU_SPEC_DECODE"], "0")
             self.assertTrue(any("VLLM_EXPERTS_LOAD_DEVICE" in x for x in applied))
 
+    def test_gpu_device_musa_enables(self):
+        mod = load()
+        with patch.dict(os.environ, {"GPU_DEVICE": "MUSA"}, clear=True):
+            self.assertTrue(mod.enabled())
+            mod.apply()
+            self.assertEqual(os.environ["XTU_MUSA_CORRECTNESS"], "1")
+            self.assertEqual(os.environ["VLLM_EXPERTS_LOAD_DEVICE"], "cpu")
+            self.assertEqual(mod.requested_device(), "MUSA")
+
+    def test_gpu_device_cuda_is_default(self):
+        mod = load()
+        with patch.dict(os.environ, {}, clear=True):
+            self.assertEqual(mod.requested_device(), "CUDA")
+            self.assertFalse(mod.enabled())
+            self.assertEqual(mod.apply(), [])
+
     def test_explicit_experts_device_wins(self):
         mod = load()
         with patch.dict(os.environ, {

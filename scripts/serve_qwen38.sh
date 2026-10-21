@@ -61,6 +61,7 @@ XIAOTU_MOE_GPU_RESIDENT_LAYERS="${XIAOTU_MOE_GPU_RESIDENT_LAYERS:-15,9,11,16,31,
 # MUSA correctness profile: opt-in, conservative; never touches the CUDA defaults above.
 if [ "${XTU_MUSA_CORRECTNESS:-0}" = "1" ]; then
   echo "[qwen38] MUSA correctness profile: CPU experts, no resident, no GPU prefill, eager, 8K"
+  export GPU_DEVICE=MUSA
   export VLLM_EXPERTS_LOAD_DEVICE=cpu
   export XIAOTU_MOE_GPU_RESIDENT_LAYERS=""
   export XIAOTU_PLE_CPU=0

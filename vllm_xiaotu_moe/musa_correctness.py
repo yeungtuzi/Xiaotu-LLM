@@ -37,7 +37,8 @@ def apply() -> list[str]:
     try:
         import vllm.envs as _vllm_envs
 
-        if getattr(_vllm_envs, "VLLM_EXPERTS_LOAD_DEVICE", None) != "cpu":
+        # Honor an explicit user override; only mirror the CPU choice.
+        if os.environ.get("VLLM_EXPERTS_LOAD_DEVICE") == "cpu":
             _vllm_envs.VLLM_EXPERTS_LOAD_DEVICE = "cpu"
     except Exception:  # noqa: BLE001 - vLLM may not be importable yet
         pass

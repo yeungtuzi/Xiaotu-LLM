@@ -1,0 +1,21 @@
+From: XTU MUSA bring-up
+Subject: [PATCH] qwen4_exp/common: disable CUDA PDL/GDC in QSA cache metadata on MUSA
+
+Candidate patch against vLLM v0.32.0; NOT hardware-validated.
+
+diff --git a/vllm/models/qwen4_exp/common/qsa_cache.py b/vllm/models/qwen4_exp/common/qsa_cache.py
+index f960dea..96adac6 100644
+--- a/vllm/models/qwen4_exp/common/qsa_cache.py
++++ b/vllm/models/qwen4_exp/common/qsa_cache.py
+@@ -191,7 +191,10 @@ def compressed_qsa_slot_mapping(
+ 
+ @cache
+ def _metadata_launch_pdl() -> bool:
+-    return current_platform.is_arch_support_pdl()
++    # MUSA Triton does not expose CUDA GDC/PDL primitives.
++    return current_platform.is_arch_support_pdl() and not getattr(
++        current_platform, "is_musa", lambda: False
++    )()
+ 
+ 
+ @triton.jit(

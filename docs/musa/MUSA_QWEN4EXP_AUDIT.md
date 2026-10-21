@@ -63,7 +63,7 @@ launch_pdl=current_platform.is_arch_support_pdl()
 
 - 在 `qwen4_exp/__init__.py` 里把 MUSA 也导向 `amd` 路径；
 - 仅作为起点，不保证 AMD/Triton 路径在 MUSA 上能跑；
-- 后续还要处理 `tl.extra.cuda.gdc_*` / PDL；已补 `patches/musa/0002-qwen4exp-musa-disable-pdl.patch`（仅 hc.py，candidate）。
+- 后续还要处理 `tl.extra.cuda.gdc_*` / PDL；已补 `0002`（hc.py）、`0003`（PLE）、`0004`（QSA cache）三个 PDL candidate patch。
 
 静态检查：`python scripts/musa/check_qwen4exp_musa.py <vllm_root>`；当前 v0.32 报告 `is_musa_branch=0`、`tl_extra_cuda=29`、`pdl=61`。
 

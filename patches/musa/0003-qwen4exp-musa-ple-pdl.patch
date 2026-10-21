@@ -1,0 +1,50 @@
+From: XTU MUSA bring-up
+Subject: [PATCH] qwen4_exp/common: disable CUDA PDL/GDC in PLE on MUSA
+
+Candidate patch against vLLM v0.32.0; NOT hardware-validated.
+
+diff --git a/vllm/models/qwen4_exp/common/ops/ple.py b/vllm/models/qwen4_exp/common/ops/ple.py
+index 41ce082..6e80e91 100644
+--- a/vllm/models/qwen4_exp/common/ops/ple.py
++++ b/vllm/models/qwen4_exp/common/ops/ple.py
+@@ -20,6 +20,13 @@ from vllm.utils.torch_utils import direct_register_custom_op
+ from vllm.v1.attention.backends.utils import NULL_BLOCK_ID
+ 
+ 
++def _ple_launch_pdl() -> bool:
++    """MUSA Triton does not expose CUDA GDC/PDL primitives."""
++    return current_platform.is_arch_support_pdl() and not getattr(
++        current_platform, "is_musa", lambda: False
++    )()
++
++
+ # N-gram ID generation
+ @triton.jit(do_not_specialize=["num_tokens", "num_reqs", "binary_search_iters"])
+ def _ple_ngram_ids_kernel(
+@@ -129,7 +136,7 @@ def _ple_ngram_ids(
+     num_reqs = query_start_loc.numel() - 1
+     ctx_len = ngram_context.shape[1]
+     BLOCK_T = 8
+-    launch_pdl = current_platform.is_arch_support_pdl()
++    launch_pdl = _ple_launch_pdl()
+     _ple_ngram_ids_kernel[(triton.cdiv(num_tokens, BLOCK_T),)](
+         input_ids,
+         query_start_loc,
+@@ -276,7 +283,7 @@ def _ple_gate(
+         HC=hc,
+         BLOCK_H=triton.next_power_of_2(h),
+         num_warps=4,
+-        launch_pdl=current_platform.is_arch_support_pdl(),
++        launch_pdl=_ple_launch_pdl(),
+     )
+     return gated, normed
+ 
+@@ -630,7 +637,7 @@ def ple_conv(
+         raise ValueError(f"Unsupported short-conv mode: {mode}")
+ 
+     num_warps = 4 if mode == "prefill" else 8
+-    launch_pdl = current_platform.is_arch_support_pdl()
++    launch_pdl = _ple_launch_pdl()
+     # Pure-prefill indices can be a strided block-table column view.
+     state_idx_stride = state_indices.stride(0)
+ 

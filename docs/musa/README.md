@@ -7,6 +7,7 @@
 - [版本/仓库锁定](MUSA_VERSION_MATRIX.md)
 - [qwen4_exp/MUSA 审计](MUSA_QWEN4EXP_AUDIT.md)
 - [候选补丁](../../patches/musa/README.md)
+- [目标 OS](MUSA_OS_TARGET.md)
 - [上线 Runbook](MUSA_BRINGUP_RUNBOOK.md)
 - [正确性对拍协议](MUSA_CORRECTNESS_PROTOCOL.md)
 - [preflight 脚本](../../scripts/musa_preflight.sh)

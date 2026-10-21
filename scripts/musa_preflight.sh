@@ -3,6 +3,26 @@
 set -u
 echo "===== MUSA preflight $(date -Is) ====="
 echo "host: $(hostname)  kernel: $(uname -r)  arch: $(uname -m)"
+echo "os: $(lsb_release -ds 2>/dev/null || cat /etc/os-release 2>/dev/null | awk -F= '/^PRETTY_NAME/{print $2; exit}')"
+echo "python: $(python3 --version 2>&1)"
+if ! uname -r | grep -q '^5\.15\.'; then
+  echo "WARN: S4000/vllm-musa reference kernel is 5.15.0-105-generic; current=$(uname -r)"
+fi
+if command -v python3 >/dev/null 2>&1; then
+  python3 - <<'PYV'
+import sys
+if sys.version_info < (3, 12):
+    print(f"WARN: plugin requires Python >=3.12, current={sys.version.split()[0]}")
+else:
+    print(f"python ok: {sys.version.split()[0]}")
+PYV
+fi
+echo "--- MUSA packages ---"
+for p in musa mtml sgpu-dkms mt-container-toolkit; do
+  if command -v dpkg >/dev/null 2>&1; then
+    dpkg -s "$p" 2>/dev/null | awk -v p="$p" -F': ' '/^Package|^Version/{printf "%s %s; ", $1, $2} END{print ""}'
+  fi
+done
 echo "cpu: $(lscpu 2>/dev/null | awk -F: '/Model name/{gsub(/^ +/,"",$2);print $2;exit}')"
 echo "nproc: $(nproc)  mem: $(free -h 2>/dev/null | awk '/Mem:/{print $2}')"
 echo "--- CPU flags ---"

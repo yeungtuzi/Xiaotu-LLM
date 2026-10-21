@@ -159,6 +159,36 @@ NO_CUDA=1 ONLY=scalar ... build_engine_variants.sh
 
 ---
 
+## 2.5 CPU-only 引擎的 N-sliced 崩溃（已规避）
+
+在 CPU-only scalar 构建上，真实 qfn 维度：
+
+```text
+H=2560, I=640, qlen=1, top_k=2
+```
+
+默认 `forward_many_nsliced` 路径 **SIGSEGV**（2026-10-21 本机复现）。
+
+规避：
+
+```bash
+XIAOTU_MOE_NSLICE_SMALL=0
+```
+
+`XTU_MUSA_CORRECTNESS=1` 已默认设置该值，强制 legacy per-token 路径。
+
+同一维度下 legacy 路径与 Python 参考：
+
+```text
+max_abs = 0.0605
+rms     = 58.04
+rel     = 0.104%
+```
+
+⇒ CPU-only 引擎在正确路径上数值可用，但**默认 N-sliced 路径需要后续修**。
+
+---
+
 ## 3. 其他依赖
 
 - `qwen_gdn_linear_attn`、`MambaHybridModelState`、`MambaSpec`：MUSA 的 mamba 支持需单独验；

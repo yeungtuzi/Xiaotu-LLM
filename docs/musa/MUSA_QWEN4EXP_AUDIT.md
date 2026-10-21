@@ -169,6 +169,20 @@ H=2560, I=640, qlen=1, top_k=2
 
 默认 `forward_many_nsliced` 路径 **SIGSEGV**（2026-10-21 本机 scalar/AVX2 均复现，`matmul_fp8_quant_range`）。
 
+ASAN 定位（AVX2, `-fsanitize=address`）：
+
+```text
+heap-buffer-overflow READ of size 16
+  fp8_detail::load_bf16_as_f32
+  fp8_detail::matmul_fp8_quant_range
+  FP8WeightTraits::gate_up_slice_batch_impl
+  forward_many_nsliced
+```
+
+读到了 `input` 缓冲区末尾之外：batch 路径按 `me` 个 assignment 行取
+`A + i*K`，但 N-sliced 传入的 gathered 输入只有 `M` 行。根因在 batch 路径的
+行指针/行数契约，不是 FP8 反量化。
+
 规避：
 
 ```bash

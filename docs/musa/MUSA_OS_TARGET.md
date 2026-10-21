@@ -24,6 +24,16 @@ Python: 3.12 venv
 - MUSA 5.2 提供 cp312 wheel：
   `torch` / `torch_musa` / `triton` cp312 x86_64。
 
+## 计算路径开关
+
+```bash
+GPU_DEVICE=MUSA   # 走 MUSA 线
+GPU_DEVICE=CUDA   # 或不设，走 CUDA 线
+```
+
+`GPU_DEVICE=MUSA` 会自动启用 MUSA correctness 默认值；显式
+`XTU_MUSA_CORRECTNESS=1` 仍然优先。
+
 ## Python 版本
 
 - 我们的插件：`requires-python >=3.12`；

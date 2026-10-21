@@ -12,14 +12,22 @@
 > **XTU = X Transformers Unity** (pronounced *"xiao tu"*, Chinese for "little rabbit") —
 > a **high-performance MoE inference acceleration layer**.
 >
-> It is a **vLLM plugin for very large MoE models**. The core idea is to split the work:
+> It is a **vLLM plugin for very large MoE models**. The core idea is **tiered data placement**,
+> with one scheduler handling swap-in, prefetch and overlap across tiers:
 >
-> * the **GPU** handles the **non-expert** parts — attention, KV cache, embeddings;
-> * the **CPU** holds the **expert weights** and does the **expert compute**;
-> * for **long prompts**, part of the expert compute is **streamed onto the GPU**.
+> * **Resident GPU**: attention/KV, dense and drafter — the parts used every step;
+> * **Dynamic GPU**: a hot-expert pool / hot layers, kept resident **on demand** under a budget;
+> * **CPU DRAM**: the full expert weights plus large tables such as Engram/PLE;
+> * **NVMe (optional)**: a design slot for cold Engram/PLE data, off by default.
 >
-> In other words: even when the **expert weights do not fit in VRAM**, a large MoE model
-> still runs — while **changing mainline vLLM as little as possible**.
+> **In both prefill and decode, GPU and CPU compute together**: the GPU handles attention/KV/dense
+> plus resident experts, while the CPU handles cold experts; the scheduler splits experts by
+> routing and budget, and **overlaps transfers with compute on both sides**.
+>
+> The result: even when **VRAM holds only a fraction of the weights**, a very large MoE
+> model still computes efficiently. It is not "park the experts on the CPU forever"; it puts
+> **data in the right tier and activates it at the right time** — while **changing mainline
+> vLLM as little as possible**.
 
 [中文](README.md) · English (default)
 

@@ -11,7 +11,7 @@
 | attention | GDN/QSA/mamba | vllm-musa 的 MUSA attention/Mamba patch | P0 |
 | KV cache | CUDA paged KV | vLLM-MUSA KV / Mamba pool | P0 |
 | 官方 FP8 专家 | FP8 | MUSA FP8 / qwen 官方路径 | P0 |
-| NVFP4 专家（后续） | W4A16 g16 | MUSA dequant / Model-Optimizer-musa | P2 |
+| NVFP4 专家（FP8 后立即转） | W4A16 g16 | MUSA dequant / Model-Optimizer-musa | P1 |
 | FP8_PB_WO | blockwise 128 weight-only | MUSA FP8 linear / 自定义 | P0 |
 | CPU 专家 | `xiaotu_moe` AVX512/AVX2 | 同一 x86 `.so`（海光） | P0 |
 | GPU prefill | 我们的 Triton tile ring | **先关闭**；正确性不走 GPU prefill | P1 |
@@ -38,7 +38,7 @@ vllm-musa（平台 + qwen4_exp + attention）
 1. **能否用 vllm-musa 的 qfn 镜像做 oracle？**
    - 能：只采集输出/行为作参考，**不作为运行路径或交付依赖**；
    - 不能：只取 qwen4_exp/attention 补丁，接到我们树；
-   - 若镜像只支持官方 BF16/FP8，不能当 NVFP4 的 oracle。
+   - 若镜像只支持官方 BF16/FP8，不能当 NVFP4 的 oracle；BF16 本身不在路线内。
 
 2. **NVFP4 是否有现成 MUSA kernel？**
    - 先查 `Model-Optimizer-musa`、vllm-musa 的 quant patch；

@@ -7,8 +7,8 @@
 | 权重 | 大小 | 优先级 |
 |---|---:|---|
 | `Qwen/Qwen3.8-Flash-Next-FP8` | 185.56 GB | **P0（先跑）** |
-| `Qwen/Qwen3.8-Flash-Next` BF16 | 360.02 GB | P2（256GB host 放不下，需 NVMe/mmap） |
-| `lovedheart/...NVFP4...` | 128.95 GB | P2（后续） |
+| `lovedheart/...NVFP4...` | 128.95 GB | **P1（FP8 通过后立即转）** |
+| `Qwen/Qwen3.8-Flash-Next` BF16 | 360.02 GB | ⛔ **永久排除** |
 
 ---
 

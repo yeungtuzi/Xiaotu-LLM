@@ -1,7 +1,7 @@
 # MUSA / S4000 正确性验证计划（2026-10-21）
 
 > **目标平台**：Moore Threads MTT S4000 + 海光 x86 + 256GB host  
-> **目标**：先验证 **官方 Qwen3.8-Flash-Next FP8 混合推理在 MUSA 上的正确性**；NVFP4 后续再挂。不追求性能。  
+> **目标**：先验证 **官方 Qwen3.8-Flash-Next FP8 混合推理在 MUSA 上的正确性**；FP8 通过后**立即转 NVFP4**。**永远不做 BF16**。不追求性能。  
 > **分支**：`feature/musa-correctness`（从 `main` 切出；验证通过后再合并）。  
 > **状态**：本机无 MUSA 硬件；先完成离线调研、版本锁定、移植映射和 preflight，设备上线后按 Phase 1 开工。
 
@@ -15,15 +15,15 @@
 
 | 权重 | 大小 | 256GB host 是否可行 |
 |---|---:|---|
-| 官方 BF16 | **360.02 GB** | ❌ 放不下 |
-| 官方 FP8 | **185.56 GB** | ✅ 可以 |
-| 社区 NVFP4 | 128.95 GB | ✅，但属于后续目标 |
+| 官方 FP8 | **185.56 GB** | ✅ 第一目标 |
+| 社区 NVFP4 | 128.95 GB | ✅ FP8 通过后立即转 |
+| 官方 BF16 | **360.02 GB** | ⛔ **永久排除**（不做、不下载、不作为回退） |
 
 所以：
 
-- **BF16 不作为第一目标**（360GB > 256GB；除非做 NVMe/mmap 流式）；
+- **BF16 永远不进入路线**；
 - 先跑 **官方 FP8**，它也是官方发布、qfn 架构、CPU 专家路径可以复用；
-- **社区 NVFP4 放到 Phase 4/P2**，不阻塞官方 FP8 的正确性验证；
+- **FP8 通过后立即转社区 NVFP4**，不插入 BF16 阶段；
 - 仍然不依赖厂商专用镜像作为运行路径；镜像只作参考。
 
 ---
@@ -76,7 +76,7 @@ vllm-musa README 提到：
 
 - 只作 **oracle / 补丁参考**，用来确认 qwen4_exp/attention 的期望行为；
 - 正式目标：**我们的 vLLM-MUSA 分支直接加载权重**，不要求用户安装厂商专用镜像；
-- 如果该镜像只支持官方 BF16/FP8 qfn，不支持我们的 NVFP4 社区量化，则它不能作为 NVFP4 的 oracle。
+- 如果该镜像只支持官方 BF16/FP8 qfn，不支持我们的 NVFP4 社区量化，则它不能作为 NVFP4 的 oracle；BF16 本身也不在路线内。
 
 **权重口径必须先确认**
 
@@ -114,7 +114,7 @@ git push -u origin feature/musa-correctness
 - [x] 锁定 vllm-musa / torch_musa / vLLM / MUSA 版本；
 - [x] 建端口映射（见 [MUSA_PORT_MAP.md](MUSA_PORT_MAP.md)）；
 - [x] preflight 脚本（无硬件也能跑）；
-- [ ] 确认“官方权重”具体 checkpoint（BF16/FP8 vs 社区 NVFP4）；
+- [x] 确认权重路线：**官方 FP8 → 社区 NVFP4；永不 BF16**；
 - [ ] 从镜像/分支提取 `qwen4_exp` 补丁作为**参考**，不把镜像作为运行依赖；
 - [ ] 准备官方 FP8 qfn 的 CPU golden / 单层 shape 测试；
 - [ ] 准备 `musaInfo`/`vllm_collect_env` 采集脚本。
@@ -143,9 +143,9 @@ git push -u origin feature/musa-correctness
 - 32K 上下文；
 - 多 S4000 只做 TP 通信冒烟，不追性能。
 
-### Phase 4：NVFP4（P2）与收口
+### Phase 4：NVFP4（FP8 之后立即转）与收口
 
-- 官方 FP8 通过后，再挂社区 NVFP4；
+- 官方 FP8 通过后，**立即**挂社区 NVFP4；不插入 BF16；
 - 记录 MUSA 与 CUDA 的数值差异；
 - 记录未支持算子/回退；
 - 通过后合并到 main；
@@ -170,7 +170,7 @@ qfn 单层
 ## 6. 合并门槛
 
 - [ ] `musa_preflight.sh` 全绿；
-- [ ] qfn NVFP4 单层数值通过；
+- [ ] qfn NVFP4 单层数值通过（FP8 之后）；
 - [ ] 8K 端到端无 NaN/OOM；
 - [ ] 固定 prompt 的 token/logits 与参考一致或在容差内；
 - [ ] 不修改主线默认路径；

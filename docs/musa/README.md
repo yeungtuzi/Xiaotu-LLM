@@ -1,6 +1,6 @@
 # MUSA / S4000 正确性验证
 
-目标：在 **MTT S4000 + 海光 x86 + 256GB** 上先验证 **官方 Qwen3.8-Flash-Next FP8 混合推理**的正确性；NVFP4 后续。不追求性能。
+目标：在 **MTT S4000 + 海光 x86 + 256GB** 上先验证 **官方 Qwen3.8-Flash-Next FP8 混合推理**的正确性；FP8 通过后立即转 NVFP4。**永不 BF16**。不追求性能。
 
 - [总计划](MUSA_S4000_CORRECTNESS_PLAN.md)
 - [端口映射](MUSA_PORT_MAP.md)

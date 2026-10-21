@@ -78,20 +78,9 @@ _LT_LOCK = _threading.Lock()
 
 
 def _musa_active() -> bool:
-    # Explicit GPU_DEVICE wins.  XTU_MUSA_CORRECTNESS=1 is itself explicit.
-    if os.environ.get("XTU_MUSA_CORRECTNESS") == "1":
-        return True
-    mode = (os.environ.get("GPU_DEVICE") or "").strip().upper()
-    if mode in ("MUSA", "MTGPU", "S4000"):
-        return True
-    if mode == "CUDA":
-        return False
-    try:
-        from vllm.platforms import current_platform
+    from .musa_correctness import musa_path_active
 
-        return bool(getattr(current_platform, "is_musa", lambda: False)())
-    except Exception:  # noqa: BLE001
-        return False
+    return musa_path_active()
 
 
 def _musa_cpu_forward(engine, qlen: int, top_k: int, hidden, ids, weights, out) -> None:

@@ -49,6 +49,16 @@ class TestMusaCorrectness(unittest.TestCase):
             self.assertFalse(mod.enabled())
             self.assertEqual(mod.apply(), [])
 
+    def test_musa_path_active(self):
+        mod = load()
+        with patch.dict(os.environ, {"GPU_DEVICE": "MUSA"}, clear=True):
+            self.assertTrue(mod.musa_path_active())
+        with patch.dict(os.environ, {"GPU_DEVICE": "CUDA"}, clear=True):
+            self.assertFalse(mod.musa_path_active())
+        with patch.dict(os.environ, {"XTU_MUSA_CORRECTNESS": "1",
+                                      "GPU_DEVICE": "CUDA"}, clear=True):
+            self.assertTrue(mod.musa_path_active())
+
     def test_explicit_experts_device_wins(self):
         mod = load()
         with patch.dict(os.environ, {

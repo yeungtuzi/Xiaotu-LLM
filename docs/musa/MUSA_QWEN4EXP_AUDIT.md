@@ -68,6 +68,25 @@ launch_pdl=current_platform.is_arch_support_pdl()
 
 ---
 
+## 2.2 插件 PLE offload 的 MUSA 适配
+
+`vllm_xiaotu_moe/ple_offload.py` 原本只找 `qwen4_exp.nvidia.*`，并用
+`torch.cuda.is_available()` 判断设备。MUSA 上会：
+
+- 找不到 AMD PLE 类（MUSA 走 `amd` 分派）；
+- `torch.cuda.is_available()` 可能为 False，导致小 scale 不回设备。
+
+已改为：
+
+- MUSA 时优先尝试 `vllm.models.qwen4_exp.amd.ple_layer`；
+- 量化方法类从 `common.ngram_embedding` 兜底；
+- 用 `current_platform.is_available()` / `current_platform.device_type`
+  替代硬编码 `torch.cuda`。
+
+状态：**代码已改，未上机验证**。
+
+---
+
 ## 3. 其他依赖
 
 - `qwen_gdn_linear_attn`、`MambaHybridModelState`、`MambaSpec`：MUSA 的 mamba 支持需单独验；

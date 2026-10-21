@@ -29,6 +29,40 @@ import os
 import torch
 
 
+def _current_platform():
+    try:
+        from vllm.platforms import current_platform
+
+        return current_platform
+    except Exception:  # noqa: BLE001 - plugin may be imported very early
+        return None
+
+
+def _device_available() -> bool:
+    """Platform-neutral replacement for torch.cuda.is_available()."""
+    plat = _current_platform()
+    try:
+        if plat is not None:
+            return bool(plat.is_available())
+    except Exception:  # noqa: BLE001
+        pass
+    return bool(torch.cuda.is_available())
+
+
+def _target_device() -> torch.device:
+    """Current accelerator device, including MUSA/ROCm."""
+    plat = _current_platform()
+    if plat is not None:
+        dtype = getattr(plat, "device_type", None)
+        if dtype:
+            try:
+                idx = plat.current_device()
+            except Exception:  # noqa: BLE001
+                idx = 0
+            return torch.device(dtype, idx)
+    return torch.device("cuda", torch.cuda.current_device())
+
+
 def ple_cpu_enabled() -> bool:
     return os.environ.get("XIAOTU_PLE_CPU", "0") == "1"
 
@@ -50,8 +84,8 @@ def _to_uva(layer: torch.nn.Module) -> None:
         if nbytes < (1 << 30):
             # 小参数(FP8 的 weight_scale 等)必须回到输出设备:主线的 FP8 PLE
             # 会检查 "FP8 PLE embedding scale must be on the output device"。
-            if p.device.type == "cpu" and torch.cuda.is_available():
-                p.data = p.data.to(torch.device("cuda", torch.cuda.current_device()))
+            if p.device.type == "cpu" and _device_available():
+                p.data = p.data.to(_target_device())
             continue
         data = p.data
         if not data.is_pinned() and os.environ.get("XIAOTU_PLE_NO_PIN", "0") != "1":
@@ -76,19 +110,34 @@ def _import_ple_classes():
     Returns ``(method, ngram, module)``; ``module`` is the module that *defines*
     the pinned-host lookup kernel (needed by `_install_pinned_kernel_u8`).
     """
-    for module in (
+    plat = _current_platform()
+    on_musa = bool(getattr(plat, "is_musa", lambda: False)()) if plat is not None else False
+    candidates = [
         "vllm.models.qwen4_exp.nvidia.ngram_embedding",
         "vllm.models.qwen4_exp.nvidia.ple_layer",
-    ):
+    ]
+    if on_musa:
+        # MUSA dispatch uses the AMD/Triton qwen4_exp path; its PLE classes live
+        # in amd/ple_layer.py, while the quantization method is shared/common.
+        candidates = [
+            "vllm.models.qwen4_exp.amd.ple_layer",
+        ] + candidates
+    common_method = None
+    try:
+        common = importlib.import_module("vllm.models.qwen4_exp.common.ngram_embedding")
+        common_method = getattr(common, "Qwen4ExpPLEFp8EmbeddingMethod", None)
+    except Exception:  # noqa: BLE001
+        pass
+    for module in candidates:
         try:
             mod = importlib.import_module(module)
         except Exception:  # noqa: BLE001 - not every vLLM has qwen4_exp
             continue
-        method = getattr(mod, "Qwen4ExpPLEFp8EmbeddingMethod", None)
+        method = getattr(mod, "Qwen4ExpPLEFp8EmbeddingMethod", None) or common_method
         ngram = getattr(mod, "Qwen4ExpNGramEmbedding", None)
-        if method is not None:
+        if method is not None and ngram is not None:
             return method, ngram, mod
-    return None, None, None
+    return common_method, None, None
 
 
 class _PinnedKernelU8:
@@ -182,8 +231,8 @@ def install() -> list[str]:
                 # "FP8 PLE embedding scale must be on the output device"。
                 # 上游的 pinned-host 类自己会把大表做成 UVA(pinned+CPU),
                 # 所以这里只需把"<1GiB 的 CPU 参数"搬回当前设备即可。
-                if torch.cuda.is_available():
-                    dev = torch.device("cuda", torch.cuda.current_device())
+                if _device_available():
+                    dev = _target_device()
                     for _, p in layer.named_parameters(recurse=False):
                         if (
                             p is not None

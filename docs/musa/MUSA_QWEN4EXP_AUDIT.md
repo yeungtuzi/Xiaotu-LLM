@@ -261,6 +261,27 @@ CUDA 路径不变；需实机确认数值与性能。
 
 ---
 
+## 2.8 vLLM custom op 的 MUSA 注册
+
+vLLM 的 `direct_register_custom_op` 默认使用：
+
+```python
+dispatch_key = current_platform.dispatch_key
+```
+
+vllm-musa 的 `MUSAPlatform.dispatch_key = "MUSA"`，所以 qwen4_exp AMD 路径里的：
+
+```text
+torch.ops.vllm.qwen4_exp_*
+```
+
+会在 **MUSA** dispatch key 上注册，不依赖手工改 op。
+
+唯一例外仍是 vllm-musa 主动删除的 CUDA `_C.top_k_per_row_decode`，已由
+0005 补丁处理。
+
+---
+
 ## 3. 其他依赖
 
 - `qwen_gdn_linear_attn`、`MambaHybridModelState`、`MambaSpec`：MUSA 的 mamba 支持需单独验；

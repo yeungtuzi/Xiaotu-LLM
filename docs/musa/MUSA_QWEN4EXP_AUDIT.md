@@ -87,6 +87,35 @@ launch_pdl=current_platform.is_arch_support_pdl()
 
 ---
 
+## 2.3 CPU 引擎的 CUDA runtime 依赖（关键）
+
+我们的 CPU expert 引擎原生 `cpu_decode` 在 C++ 里直接使用：
+
+```text
+cudaMemcpyAsync / cudaStreamSynchronize / cudaStreamIsCapturing
+```
+
+MUSA 没有 CUDA runtime，所以 **CPU 引擎不能直接走 `cpu_decode`**。
+
+已在 `vllm_xiaotu_moe/mixed_experts.py` 增加 MUSA 正确性回退：
+
+```text
+hidden/ids/weights → CPU
+engine.cpu_prefill(...)          # stream-free, 只做 host forward_many
+out_cpu → MUSA device
+```
+
+特点：
+
+- 不依赖 CUDA runtime / CUDA graph；
+- 单 rank，EP 关闭；
+- 比原生 `cpu_decode` 慢，但正确性优先；
+- 只在 `current_platform.is_musa()` 时启用，CUDA 路径不变。
+
+这是 MUSA 上能跑通 CPU 专家的关键改动之一。
+
+---
+
 ## 3. 其他依赖
 
 - `qwen_gdn_linear_attn`、`MambaHybridModelState`、`MambaSpec`：MUSA 的 mamba 支持需单独验；

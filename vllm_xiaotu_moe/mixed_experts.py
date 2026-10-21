@@ -77,6 +77,45 @@ import threading as _threading
 _LT_LOCK = _threading.Lock()
 
 
+def _musa_active() -> bool:
+    try:
+        from vllm.platforms import current_platform
+
+        return bool(getattr(current_platform, "is_musa", lambda: False)())
+    except Exception:  # noqa: BLE001
+        return False
+
+
+def _musa_cpu_forward(engine, qlen: int, top_k: int, hidden, ids, weights, out) -> None:
+    """MUSA correctness fallback: no CUDA runtime in the native engine.
+
+    ``cpu_decode`` uses cudaMemcpyAsync/cudaStream* internally.  MUSA does not
+    provide the CUDA runtime, so stage through host tensors and call the
+    stream-free ``cpu_prefill`` entry point instead.  Correctness first; this is
+    slower than the CUDA path.
+    """
+    if torch.cuda.is_current_stream_capturing():
+        raise RuntimeError(
+            "MUSA correctness fallback does not support CUDA-graph capture; "
+            "disable graph capture for the first correctness pass"
+        )
+    try:
+        if engine.ep_enabled():
+            raise RuntimeError(
+                "MUSA correctness fallback does not implement EP reduction; "
+                "run single-rank / disable expert parallelism"
+            )
+    except AttributeError:
+        pass
+    hid = hidden.detach().to("cpu", non_blocking=False).contiguous()
+    ids_cpu = ids.detach().to(dtype=torch.int32, device="cpu").contiguous()
+    w_cpu = weights.detach().to(dtype=torch.float32, device="cpu").contiguous()
+    h = int(hidden.shape[-1])
+    out_cpu = torch.empty((int(qlen), h), dtype=torch.float32, device="cpu")
+    engine.cpu_prefill(int(qlen), int(top_k), ids_cpu, w_cpu, hid, out_cpu)
+    out.copy_(out_cpu.to(device=out.device, dtype=out.dtype, non_blocking=False))
+
+
 def _lt_record(pre_ms: float, eng_ms: float, post_ms: float, name: str = "") -> None:
     if not _LT_ON:
         return
@@ -2857,20 +2896,30 @@ class _XiaotuExpertsMixin:
                         self._pin_ev_done = _ev_done
                     _ev_done.record(_side)
                 torch.cuda.current_stream().wait_event(_ev_mask)
-                engine.cpu_decode(
-                    stream.cuda_stream, qlen,
-                    self.moe_config.experts_per_token,
-                    h_bf16.data_ptr(), cpu_ids.data_ptr(), cpu_w.data_ptr(),
-                    out.data_ptr(),
-                )
+                if _musa_active():
+                    _musa_cpu_forward(
+                        engine, qlen, self.moe_config.experts_per_token,
+                        h_bf16, cpu_ids, cpu_w, out)
+                else:
+                    engine.cpu_decode(
+                        stream.cuda_stream, qlen,
+                        self.moe_config.experts_per_token,
+                        h_bf16.data_ptr(), cpu_ids.data_ptr(), cpu_w.data_ptr(),
+                        out.data_ptr(),
+                    )
                 torch.cuda.current_stream().wait_event(_ev_done)
                 out.add_(_partial.to(out.dtype))
             else:
-                engine.cpu_decode(
-                    stream.cuda_stream, qlen, self.moe_config.experts_per_token,
-                    h_bf16.data_ptr(), ids_i32.data_ptr(), wts_f32.data_ptr(),
-                    out.data_ptr(),
-                )
+                if _musa_active():
+                    _musa_cpu_forward(
+                        engine, qlen, self.moe_config.experts_per_token,
+                        h_bf16, ids_i32, wts_f32, out)
+                else:
+                    engine.cpu_decode(
+                        stream.cuda_stream, qlen, self.moe_config.experts_per_token,
+                        h_bf16.data_ptr(), ids_i32.data_ptr(), wts_f32.data_ptr(),
+                        out.data_ptr(),
+                    )
         _lt_t2 = time.perf_counter() if _LT_ON else 0.0
         if _sync == "post":
             torch.cuda.synchronize()

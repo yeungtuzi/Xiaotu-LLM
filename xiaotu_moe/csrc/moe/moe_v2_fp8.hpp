@@ -96,7 +96,9 @@ inline int fp8_pf_rows() {
 
 inline void matmul_fp8_quant_range(const uint16_t* A, const uint8_t* W, const float* S,
                                    float* C, int M, int N, int K,
-                                   int groupN, int groupK, int n0, int n1) {
+                                   int groupN, int groupK, int n0, int n1,
+                                   int rowshift = 0,
+                                   const uint32_t* rowmap = nullptr) {
     const int gn = groupN > 0 ? groupN : 1;
     const int gk = groupK > 0 ? groupK : 1;
     if (n0 < 0) n0 = 0;
@@ -105,10 +107,12 @@ inline void matmul_fp8_quant_range(const uint16_t* A, const uint8_t* W, const fl
 #if defined(__AVX2__)
     const int pf = fp8_pf_rows();   // ⭐ 只有 AVX2/AVX512 路径用到
     for (int i = 0; i < M; ++i) {
-        const uint16_t* Arow = A + (size_t)i * K;
+        const uint16_t* Arow = A + (size_t)(rowmap ? rowmap[i] : (uint32_t)i) * K;
         float* Crow = C + (size_t)i * N;
         for (int j = n0; j < n1; ++j) {
-            const uint8_t* Wrow = W + (size_t)j * K;
+            const int local_j = j - rowshift;
+            if (local_j < 0) continue;
+            const uint8_t* Wrow = W + (size_t)local_j * K;
             const float* Srow = S + (size_t)(j / gn) * ((K + gk - 1) / gk);
             Vec total = vzero();
             float tail = 0.f;   // 标量尾巴(不足一个向量的部分),最后一起加
@@ -526,7 +530,8 @@ inline void matmul_fp8_tiled_range(const uint16_t* A, const uint8_t* W, const fl
     fp8_tile_sweep<MR, NR>(A, W, S, C, M, N, K, gn, gk, n0, n1, rowshift, rowmap);
 #else
     // Non-AVX512 ISA: keep the portable legacy kernel.
-    matmul_fp8_quant_range(A, W, S, C, M, N, K, groupN, groupK, n0, n1);
+    matmul_fp8_quant_range(A, W, S, C, M, N, K, groupN, groupK, n0, n1,
+                           rowshift, rowmap);
 #endif
 }
 

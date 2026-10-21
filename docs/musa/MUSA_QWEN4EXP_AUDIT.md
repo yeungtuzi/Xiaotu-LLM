@@ -183,6 +183,15 @@ heap-buffer-overflow READ of size 16
 `A + i*K`，但 N-sliced 传入的 gathered 输入只有 `M` 行。根因在 batch 路径的
 行指针/行数契约，不是 FP8 反量化。
 
+已在 **AVX2** 上修复：
+
+- `matmul_fp8_quant_range` 现在接受 `rowmap`，按 `rowmap[i]` 取输入行；
+- 接受 `rowshift`，按 `j - rowshift` 取 shard-local 权重行；
+- 真实维度 `H=2560/I=640/qlen=1/top_k=2`：不再 SIGSEGV，`rel=0.104%`。
+
+⚠️ **scalar 构建仍会崩**（同一路径的另一个问题）；正确性模式继续关闭
+`XIAOTU_MOE_NSLICE_SMALL`，直到 scalar 修复。
+
 规避：
 
 ```bash

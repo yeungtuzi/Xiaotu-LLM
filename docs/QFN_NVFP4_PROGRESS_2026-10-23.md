@@ -125,6 +125,18 @@ setsid env ALLOW_PROD_GPU=1 XTU_NVFP4_GPU=1 VLLM_EXPERTS_LOAD_DEVICE=gpu \
 - 0GB 不可行 ⇒ **至少需要 1GB CPU 兜底**；TP=3 被 16 head 卡死、PP=3 被 PLE 卡死，
   所以“纯 GPU 全驻留”在 2 卡上做不到。
 
+## 6. 2026-10-23 23:40 并发基准（1GB offload，MAXLEN=512，短 prompt 32 tokens）
+
+| 并发 | wall | 单请求 | 聚合 tok/s | 单请求 tok/s |
+|---|---|---|---|---|
+| C=1 | 0.599 s | 0.599 s | **53.5** | 53.5 |
+| C=2 | 0.690 s | 0.345 s | **92.7** | 46.4 |
+| C=4 | 1.215 s | 0.304 s | **105.3** | 26.3 |
+
+- 长 prompt（260）C=1 为 **68.0 tok/s**；短 prompt 含 prefill，数字偏低；
+- C=4 聚合 105 tok/s，扩展性正常；
+- ⚠️ `MAXLEN=4096` 时 KV 只剩 **0.05 GiB**（activation 随 MAXLEN 增长）⇒ 长上下文需更多 offload。
+
 ## 4.4 下一步
 
 1. needle / greedy 一致性留档；

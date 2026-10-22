@@ -875,3 +875,13 @@ pwal 后 `layer.w13_weight` 是 cuda，但 kernel 收到的 w1 是 CPU ⇒ **w1 
 - 1GB vs 2GB：needle 最终答案一致，reasoning 长度不同（非 bit-identical，符合“needle 语义一致”）；
 - GPU0 始终 0 MiB ⇒ 撤除天然成立；
 - 0GB 不可行 ⇒ 2 卡上“纯 GPU 全驻留”做不到；TP=3/PP=3 均被模型结构卡死。
+
+### 24.2 并发基准（1GB offload，MAXLEN=512）
+
+| 并发 | 聚合 tok/s | 单请求 tok/s |
+|---|---|---|
+| C=1 | 53.5（短 prompt；长 prompt 68.0） | 53.5 |
+| C=2 | **92.7** | 46.4 |
+| C=4 | **105.3** | 26.3 |
+
+`MAXLEN=4096` 时 KV 仅 0.05 GiB（activation 随 MAXLEN 增长）⇒ 长上下文需更多 offload。

@@ -48,6 +48,7 @@
 #include "../moe/moe_v2.hpp"
 #include "../moe/moe_v2_fp8.hpp"
 #include "../moe/moe_v2_packed4.hpp"
+#include "../moe/sidecar_ctl.hpp"
 
 namespace py = pybind11;
 using namespace xiaotu_moe;
@@ -285,6 +286,9 @@ bool auto_ep_setup(const void* key, const MOEConfigV2& cfg) {
 // MOE* identity; every MOE instance across every type has a unique address, so
 // sharing one map across all template instantiations is safe.
 std::mutex g_cd_mtx;
+
+// 辅助 GPU（侧车）全局控制块；由 Python 通过 sidecar_attach 注册，默认 nullptr。
+static xiaotu_sidecar::SidecarCtl* g_sidecar = nullptr;
 // 故意"泄漏"到进程退出(`*new`):常驻 async worker 线程在**静态析构期**仍可能轮询
 // 这些 state,若此时 vector/map 已析构就会 SIGSEGV(实测,harness 退出时必崩)。
 // 泄漏的只是几十个 pinned 缓冲,进程退出后由 OS 回收。
@@ -786,7 +790,7 @@ static void bind_moe_class(py::module& m, const char* name) {
                               py::object stream_obj,
                               int qlen, int top_k,
                               py::object hidden, py::object expert_ids,
-                              py::object weights, py::object out_gpu) {
+                              py::object weights, py::object out_gpu, int layer) {
             // Capture-safe API mirroring lk_moe.cpu_decode(stream_ptr, ...).
             //   hidden:  [qlen, hidden] bf16 (uint16 storage) DEVICE
             //   expert_ids/weights: [qlen, top_k] int32 / fp32 DEVICE
@@ -896,9 +900,10 @@ static void bind_moe_class(py::module& m, const char* name) {
                 int k;
                 const uint16_t* hid;
                 const uint32_t* ids;
-                const float* wts;
+                float* wts;
                 float* out;
                 bool graph_owned;   // true: 由 graph 节点持有,回调不得释放
+                int layer;          // -1 = 侧车未启用/该层无表
             };
 
             // ---- 异步握手路径(item 1/3)---------------------------------
@@ -963,9 +968,10 @@ static void bind_moe_class(py::module& m, const char* name) {
                 &self, qlen, top_k,
                 (const uint16_t*)st->pin_hidden,
                 (const uint32_t*)st->pin_ids,
-                (const float*)st->pin_weights,
+                (float*)st->pin_weights,
                 (float*)st->pin_out,
                 capturing,
+                layer,
             };
             st->host_fn = [](void* arg) {
                 std::unique_ptr<CpuDecodeCall> c(
@@ -986,8 +992,15 @@ static void bind_moe_class(py::module& m, const char* name) {
                 const int qlen = c->qlen, k = c->k;
                 const uint16_t* hid = c->hid;
                 const uint32_t* ids = c->ids;
-                const float* wts = c->wts;
+                float* wts = c->wts;  // 侧车会把命中项置 0
                 float* out = c->out;
+                // ---- 侧车阶段 1：命中项置 0 + 发请求（与下面的 CPU MoE 并行）----
+                uint32_t side_hits = 0;
+                if (c->layer >= 0 && g_sidecar) {
+                    side_hits = xiaotu_sidecar::host_begin(
+                        g_sidecar, (uint32_t)c->layer, (uint32_t)qlen, (uint32_t)k,
+                        ids, wts, hid);
+                }
                 // ---- per-layer segmentation (XIAOTU_CD_TIMING=1) -------------
                 // period = callback-entry to callback-entry: the TRUE serialized
                 // per-layer time (the decode path is a strict layer-by-layer
@@ -1018,6 +1031,13 @@ static void bind_moe_class(py::module& m, const char* name) {
                 //   ⚠️ 必须在 run_moe_and_ep 之前写:同一次调用的所有 worker 看到同一个值 ✓
                 xiaotu_int8::set_cur_tokens(qlen);
                 run_moe_and_ep(engine, qlen, k, hid, ids, wts, out, &ep_ms_last, &fwd_ms_last);
+                // ---- 侧车阶段 2：等 worker 并合并 partial ----
+                if (side_hits && g_sidecar) {
+                    if (!xiaotu_sidecar::host_end(g_sidecar, out)) {
+                        fprintf(stderr, "[cd] sidecar TIMEOUT layer=%d (fail-closed)\n",
+                                c->layer);
+                    }
+                }
                 if (timing) {
                     auto t_end = std::chrono::steady_clock::now();
                     const double compute_ms =
@@ -1065,7 +1085,45 @@ static void bind_moe_class(py::module& m, const char* name) {
 #endif
         }, py::arg("stream"), py::arg("qlen"), py::arg("top_k"),
            py::arg("hidden"), py::arg("expert_ids"), py::arg("weights"),
-           py::arg("out_gpu"))
+           py::arg("out_gpu"), py::arg("layer") = -1)
+        .def("sidecar_attach", [](MOE&, uint64_t addr) {
+            g_sidecar = reinterpret_cast<xiaotu_sidecar::SidecarCtl*>(addr);
+        }, py::arg("ctl_addr"))
+        .def("sidecar_detach", [](MOE&) { g_sidecar = nullptr; })
+        .def("sidecar_new", [](MOE&) -> uint64_t {
+            return (uint64_t) new xiaotu_sidecar::SidecarCtl();
+        })
+        .def("sidecar_free", [](MOE&, uint64_t addr) {
+            delete reinterpret_cast<xiaotu_sidecar::SidecarCtl*>(addr);
+        }, py::arg("ctl_addr"))
+        .def("sidecar_config", [](MOE&, uint64_t addr, uint32_t n_layers, uint32_t n_experts,
+                                  uint32_t hidden, uint32_t max_qlen, uint32_t max_k,
+                                  uint64_t masks, uint64_t ids, uint64_t wts, uint64_t out) {
+            auto* c = reinterpret_cast<xiaotu_sidecar::SidecarCtl*>(addr);
+            c->n_layers = n_layers; c->n_experts = n_experts;
+            c->n_words = (n_experts + 63) / 64; c->hidden = hidden;
+            c->max_qlen = max_qlen; c->max_k = max_k;
+            c->hit_masks = (const uint64_t*)masks;
+            c->ids = (uint32_t*)ids; c->wts = (float*)wts; c->side_out = (float*)out;
+        }, py::arg("ctl_addr"), py::arg("n_layers"), py::arg("n_experts"),
+           py::arg("hidden"), py::arg("max_qlen"), py::arg("max_k"),
+           py::arg("masks"), py::arg("ids"), py::arg("wts"), py::arg("out"))
+        .def("sidecar_set_enabled", [](MOE&, uint64_t addr, bool e) {
+            reinterpret_cast<xiaotu_sidecar::SidecarCtl*>(addr)->enabled.store(e ? 1 : 0);
+        }, py::arg("ctl_addr"), py::arg("enabled"))
+        .def("sidecar_seq", [](MOE&, uint64_t addr) {
+            auto* c = reinterpret_cast<xiaotu_sidecar::SidecarCtl*>(addr);
+            return py::make_tuple(c->req_seq.load(), c->done_seq.load());
+        }, py::arg("ctl_addr"))
+        .def("sidecar_request", [](MOE&, uint64_t addr) {
+            auto* c = reinterpret_cast<xiaotu_sidecar::SidecarCtl*>(addr);
+            return py::make_tuple(c->layer, c->qlen, c->k,
+                                  (uint64_t)c->ids, (uint64_t)c->wts,
+                                  (uint64_t)c->hid, (uint64_t)c->side_out);
+        }, py::arg("ctl_addr"))
+        .def("sidecar_done", [](MOE&, uint64_t addr, uint32_t seq) {
+            reinterpret_cast<xiaotu_sidecar::SidecarCtl*>(addr)->done_seq.store(seq);
+        }, py::arg("ctl_addr"), py::arg("seq"))
         // ---- GPU 流式 prefill:让 Python 能 DMA 引擎自有的主机缓冲 -------------
         // 动机(NOTES §459):GPU prefill 原先要求保留 checkpoint 源张量才能逐层
         // 流式权重,代价是 +269 GiB 主机内存,本机放不下。而引擎的每 node 紧凑分片

@@ -407,3 +407,35 @@ DSpark k=5、8 会话、40,880 条 decode、40 层；**split-half held-out**（�
   ⇒ 两卡 ≈36–40 GB ⇒ 覆盖约 **55–60%** 专家，其余 CPU；
 - GPU0 加入 ⇒ 100%；
 - 具体数字以 P4 实测为准（不写死）。
+
+---
+
+## 13. 2026-10-23 qfn NVFP4 下载完成 + 审计结论
+
+- 快照 **129.0 GB**（索引 total_size 128.72 GB），**208/208 分片**，config 已落盘。
+- `quantized_layers` **205**：**156 × `FP8_PB_WO`** + **49 × `W4A16_NVFP4`（group 16）**；
+  `quant_method: modelopt`，`quant_algo: MIXED_PRECISION`。
+- 索引侧 **156 个 `weight_scale_inv`**，与 156 个 FP8 投影精确对应。
+- 已知 blocker（P4 必须先解）：
+  1. 156 个 FP8 投影用 **rank-2 `weight_scale_inv`**，主线只注册 `weight_scale`（issue #54126）；
+  2. 49 个 NVFP4 层需 `prepare_moe_fp4_layer_for_marlin` 覆盖 **g16 + E4M3**，
+     stock fallback 会**静默乱码**。
+- 详细审计：`dev-docs/QFN_NVFP4_AUDIT_2026-10-23.md`。
+
+### 13.1 qfn 的两种表（统一机制）
+
+- **全驻留表**：GPU1/2 + GPU0 覆盖全部专家；GPU0 撤除 ⇒ 换 **部分驻留表** 重启；
+- 部分驻留表：只保留 GPU1/2 放得下的专家（约 55–60%），其余 CPU；
+- 两种表共用同一 host-function 侧车协议与 worker。
+
+### 13.2 当前代码状态（可回滚）
+
+| 提交 | 内容 | 默认行为 |
+|---|---|---|
+| `47a6dd8` | 计划 + 预算器 + 协议头 | 无变化 |
+| `ab2ce8d` | binding 接线（`cpu_decode(layer=-1)` + host_begin/end） | 无变化 |
+| `c7ac96e` | Python worker（`XTU_SIDECAR=gpu0`） | 无变化 |
+
+- 远端已用 `ONLY=avx512_bf16_vbmi` 重建 `.so`（2.61 MB，15:58），API 已验证；
+- 旧 `.so` 备份：`/home/user/lvllm/tmp/sidecar_backup/so_before.tgz`；
+- **尚未做**：真实 GPU0 compute（pool + kernel）、单层 on/off、C=1 A/B。

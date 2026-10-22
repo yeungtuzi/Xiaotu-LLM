@@ -19,6 +19,7 @@ import threading
 import torch
 
 from vllm_xiaotu_moe import sidecar as _sc
+from vllm_xiaotu_moe import sidecar_nmajor as _nm
 
 _RT = None
 _RT_LOCK = threading.Lock()
@@ -49,6 +50,7 @@ class SidecarRuntime:
         self.device = int(device)
         self.swiglu_limit = float(swiglu_limit or 0.0)
         self.pools: dict[int, object] = {}
+        self._slotmap_cpu: dict[int, object] = {}
         self._bufs: dict[int, tuple] = {}
         self._worker = _sc.SidecarWorker(
             engine, table, n_layers, n_experts, hidden, max_qlen, max_k,
@@ -57,7 +59,23 @@ class SidecarRuntime:
         self._dev = f"cuda:{self.device}"
 
     def add_pool(self, layer: int, pool) -> None:
-        self.pools[int(layer)] = pool
+        layer = int(layer)
+        # MXFP4：转成 N-major（[S,N,K]），并释放 K-major，避免 2× 常驻
+        if not self.use_fp8:
+            try:
+                pool.planes = _nm.transpose_planes(pool)
+            except Exception as e:  # noqa: BLE001
+                print(f"[xtu-sidecar] layer{layer} transpose 失败: {e}", flush=True)
+        self.pools[layer] = pool
+        self._slotmap_cpu[layer] = pool.slotmap.detach().cpu()
+        # 预编译 Triton 内核（首次 launch 会编译数秒，不能落在 host-function 里）
+        try:
+            h = torch.zeros(self.hidden, dtype=torch.bfloat16, device=self._dev)
+            st = torch.zeros(1, dtype=torch.int32, device=self._dev)
+            wt = torch.ones(1, dtype=torch.float32, device=self._dev)
+            _nm.forward(h, st, wt, pool.planes, self.hidden, self.inter, int(pool.gk))
+        except Exception as e:  # noqa: BLE001
+            print(f"[xtu-sidecar] layer{layer} warmup 失败: {e}", flush=True)
 
     def _buf(self, qlen: int):
         b = self._bufs.get(qlen)
@@ -76,8 +94,32 @@ class SidecarRuntime:
         if pool is None:
             out_host.zero_()
             return
-        h_gpu, ids_gpu, wts_gpu = self._buf(qlen)
         torch.cuda.set_device(self.device)
+        # MXFP4 只支持 qlen=1（N-major GEMV）；其它形状 fail-closed
+        if not self.use_fp8:
+            if qlen != 1:
+                out_host.zero_(); return
+        # MXFP4 + qlen=1：N-major 行 GEMV，只算命中 slot
+        if (not self.use_fp8) and qlen == 1:
+            sm = self._slotmap_cpu.get(int(layer))
+            if sm is None:
+                out_host.zero_(); return
+            slots, ws = [], []
+            for j in range(k):
+                e = int(ids_host[j]); w = float(wts_host[j])
+                if 0 <= e < sm.numel():
+                    s = int(sm[e])
+                    if s >= pool.n_local:
+                        slots.append(s - pool.n_local); ws.append(w)
+            if not slots:
+                out_host.zero_(); return
+            h = _hid_view(hid_ptr, 1, self.hidden)[0].to(self._dev)
+            st = torch.tensor(slots, dtype=torch.int32, device=self._dev)
+            wt = torch.tensor(ws, dtype=torch.float32, device=self._dev)
+            o = _nm.forward(h, st, wt, pool.planes, self.hidden, self.inter, int(pool.gk))
+            out_host[: self.hidden].copy_(o)
+            return
+        h_gpu, ids_gpu, wts_gpu = self._buf(qlen)
         h_gpu.copy_(_hid_view(hid_ptr, qlen, self.hidden))
         ids_gpu.copy_(ids_host[: qlen * k].view(qlen, k))
         wts_gpu.copy_(wts_host[: qlen * k].view(qlen, k))
@@ -123,6 +165,6 @@ def get_sidecar_runtime(engine, hidden: int, inter: int, topk: int, table: str,
         if _RT is None:
             _RT = SidecarRuntime(
                 engine, hidden, inter, topk, table, n_layers, n_experts,
-                use_fp8=use_fp8, swiglu_limit=swiglu_limit,
+                use_fp8=use_fp8, device=int(_sc.sidecar_device()), swiglu_limit=swiglu_limit,
             )
         return _RT

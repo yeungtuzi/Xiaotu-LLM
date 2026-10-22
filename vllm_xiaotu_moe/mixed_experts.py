@@ -2655,13 +2655,19 @@ class _XiaotuExpertsMixin:
                                 swiglu_limit=float(getattr(self, "swiglu_limit", 0.0) or 0.0),
                             )
                             if _rt is not None:
-                                _pool2 = _xp2.build_layer_pool(
-                                    engine, torch.device(f"cuda:{_sc.sidecar_device()}"),
+                                # loader 内部用 current device；必须切到侧车卡再建池
+                                _prev_dev = torch.cuda.current_device()
+                                torch.cuda.set_device(_sc.sidecar_device())
+                                try:
+                                    _pool2 = _xp2.build_layer_pool(
+                                        engine, torch.device(f"cuda:{_sc.sidecar_device()}"),
                                     hidden_size, int(self._I_eng), int(self._group_k),
                                     int(self._E_eng), _li, expert_map,
                                     topk=int(self.moe_config.experts_per_token),
                                     layout=("fp8" if getattr(self, "_engine_attr", "") == "MOE_FP8" else "mxfp4"),
-                                    table_path=_tab, require_pin=False)
+                                        table_path=_tab, require_pin=False)
+                                finally:
+                                    torch.cuda.set_device(_prev_dev)
                                 if _pool2 is not None:
                                     _rt.add_pool(_li, _pool2)
                                     self._side_pool = _pool2

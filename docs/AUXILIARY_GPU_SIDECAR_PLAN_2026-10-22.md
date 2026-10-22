@@ -711,3 +711,33 @@ N-major Triton 实测（1 token）：`GPU(S) ≈ 0.09·S + 0.02` ms；CPU 全量
 - §15–§18 的“C=1 净负”结论**作废**（前提错了）；
 - 现有 N-major Triton 内核足够；预计 **+8～12%**；
 - 新内核工程（3–5 天）**不再需要**，除非要冲 +15%。
+
+---
+
+## 20. 2026-10-23 N-major 侧车集成冒烟（部分成功）
+
+### 20.1 已打通的
+
+- **池 loader 设备问题已解决**：在 `build_layer_pool` 外包 `torch.cuda.set_device(side)`，
+  40/40 层池都建在 GPU0（4.7 GiB）；
+- `SidecarRuntime` 的 device 改为 `sidecar_device()`（此前误用 logical 0 = 物理 1）；
+- 服务 `Application startup complete`，layer 22 的 host-function 侧车 compute 能跑（0.85ms）。
+
+### 20.2 仍失败的
+
+- 部分层（35–39）warmup 报 `Pointer argument cannot be accessed from Triton (cpu tensor?)`；
+  说明这些层的 `pool.planes` 与 runtime 的 device 仍不一致（或 transpose 未生效）；
+- layer 22 的 0.85ms 更像**旧 gpu_moe_layer**（1.07ms 量级），不是 N-major 的 ~0.45ms
+  ⇒ N-major 路径是否真正生效**未确认**。
+
+### 20.3 下一步（明确）
+
+1. 在 `add_pool` 里断言 `pool.planes[0].device == torch.device(f"cuda:{side}")`，不一致就报错；
+2. transpose 后打印一层 `planes[0].shape`（应为 `[S, 2I, H//2]`）；
+3. 确认 `compute` 走的是 `nm.forward`（加一行 debug）；
+4. 单层 on/off 对拍，再 200 → 1,900 槽 A/B。
+
+### 20.4 经济性（已更正，§19）
+
+CPU/GPU 算不相交专家 ⇒ `max(GPU(hit), CPU(miss))`；62.6% 命中下预计 **+8～12%**；
+N-major 内核是正确方向，剩下是集成调试，不是新内核研究。

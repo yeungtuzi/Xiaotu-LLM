@@ -885,3 +885,30 @@ pwal 后 `layer.w13_weight` 是 cuda，但 kernel 收到的 w1 是 CPU ⇒ **w1 
 | C=4 | **105.3** | 26.3 |
 
 `MAXLEN=4096` 时 KV 仅 0.05 GiB（activation 随 MAXLEN 增长）⇒ 长上下文需更多 offload。
+
+---
+
+## 25. 2026-10-23 qfn NVFP4 交付状态与 ② 的选项
+
+### 25.1 已交付（①③④）
+
+- ① 两个 blocker 已解：2D block scale→4D、`orig_dtype` 回落、NVFP4 CPU pwal 绕过；
+- ③ GPU0 始终 0 MiB（可撤除）；1GB 与 2GB 两种驻留表 needle 最终答案一致；
+- ④ 基准：C=1 **68.0**（长 prompt）/53.5（短）、C=2 **92.7**、C=4 **105.3** tok/s；
+  KV 0.41 GiB（MAXLEN=512）；`MAXLEN=4096` 时 KV 仅 0.05 GiB。
+
+### 25.2 ② 未达成：GPU0 没有参与 NVFP4 计算
+
+原因：qfn 的 MoE 走 vLLM **native Marlin TP=2**，不是插件的 CPU/侧车引擎；
+GPU0 要参与，需要以下之一：
+
+| 方案 | 内容 | 工作量 |
+|---|---|---|
+| A. NVFP4 侧车 | GPU0 存部分专家 + host-function 里用 NVFP4 GEMV 算命中项，再并回 Marlin 输出 | 大（新内核 + 混合路由） |
+| B. GPU0 作为 offload 目标 | 把 vLLM 的 `cpu_offload_gb` 目标从 CPU 改成 GPU0，按层 P2P 预取 | 中，但每层 PCIe 拷贝 ~GB 级，可能得不偿失 |
+| C. 接受现状 | GPU1/2 全驻留 + 1GB CPU 兜底，GPU0 不参与 | 0 |
+
+### 25.3 建议
+
+先做 **B 的可行性测量**（只测 PCIe 拷贝带宽与一层预取耗时），若 >0.2ms/层就放弃 B；
+A 需要 3–5 天，且要重写 NVFP4 反量化内核（E2M1 + E4M3 g16）。

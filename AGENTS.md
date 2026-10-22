@@ -1,5 +1,39 @@
 # AGENTS.md —— 本仓库对自动化代理的强制纪律
 
+## ⭐⭐ 【双开发线纪律 · 2026-10-22】musa 线与主线并行,不许互相污染
+
+> 用户 2026-10-22 定:**A100 那台只跑主线,musa 只在本地开发**(musa 目标硬件是 mtts4000,
+> A100 上**无法验证**,所以永远不在 A100 上验证 musa)。
+
+**本地两个工作区(一套 `.git`,用 worktree,不切分支、不 stash):**
+
+| 线 | 路径 | 分支 | 说明 |
+|---|---|---|---|
+| 主线(GL M/DeepSeek) | `/root/lvllm/repos/vllm-xiaotu-moe` | 见 `git worktree list` | ⚠️ 2026-10-22 状态见下行 |
+| musa | 同上或独立 worktree | `feature/musa-correctness` | 仅本地开发,不部署到 A100 |
+| 主线 | `/root/lvllm/repos/vllm-mainline` | `dev/mainline` | 2026-10-22 由 `git worktree add` 建立 |
+
+**远端(A100)`/home/user/lvllm/vllm-xiaotu-moe`:只放主线,一个 env。**
+
+- env 只有 **`vllm-xiaotu-moe`**(python 3.12.14),editable 安装指向**唯一目录**
+  `/home/user/lvllm/vllm-xiaotu-moe` ⇒ **不要为第二条线复制 env**(A100 不跑 musa)✓
+- ⚠️ **该远端机器连不上 GitHub**(`git fetch` 130 s 后超时)⇒ **同步只能 scp / `git bundle`**,
+  不要指望在远端 `git pull` ✗
+- ⚠️ 远端是**编译调试环境**,代码由本地 scp 覆盖 ⇒ 它的 `git status` 经常显示大量"已修改",
+  **那是部署差异,不是远端有更新**。判断"远端是否落后"要看 **HEAD**,不看 status ✓
+  (2026-10-22 曾出现「旧 HEAD + musa 版 `gpu_prefill.py`/`expert_pool.py`」的混合态,
+  已 reset 回 `b6a30b9`,md5 与 `origin/main` 逐一对齐)
+
+**部署纪律(硬):**
+1. ⛔ **musa 的代码永远不部署到 A100** —— 否则主线基准实际跑的是 musa 路径,数据全不可信 ✗
+2. 部署前先确认**当前在哪个 worktree/分支**(`git worktree list` + `git rev-parse --abbrev-ref HEAD`)
+3. 主线基准必须在**主线工作区**发起部署
+
+**合并策略:**
+- musa 是 `origin/main` 的直系后代 ⇒ **让 musa 定期 `git merge origin/main`**,冲突小步解决
+- ⛔ 不要 squash musa 的提交(含 Revert,有语义)
+- 必然冲突的 5 个文件:`gpu_prefill.py`、`mixed_experts.py`、`moe_v2.hpp`、`moe_v2_fp8.hpp`、`binding.cpp`
+
 ## ⛔⛔⛔ 【环境事实 · 2026-10-15】这是**两台机器**,别搞混 ⇒ 先读 `dev-docs/ENV_TWO_MACHINES.md`
 
 > **用户原话(2026-10-15)**:"你先把**远程开发环境**和**本地 DSH 环境**这个问题**醒目记录**下来,**免得后续每次会话我都要解释一下**"

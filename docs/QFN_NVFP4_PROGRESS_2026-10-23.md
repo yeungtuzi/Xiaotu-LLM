@@ -150,6 +150,21 @@ setsid env ALLOW_PROD_GPU=1 XTU_NVFP4_GPU=1 VLLM_EXPERTS_LOAD_DEVICE=gpu \
 - 反量化 = e2m1 bitcast + E4M3 算术（无 LUT/常量内存）；
 - ⚠️ 这是**单层内核原型**，还不是侧车集成；但说明 A 方案在性能上可行。
 
+## 8. 2026-10-24 00:05 NVFP4 内核在**真实权重**上验证通过
+
+脚本：`dev-docs/nvfp4_real_check.py`（layer0, experts 0–5，真实 checkpoint）。
+
+| 项 | 结果 |
+|---|---|
+| w13 形状 / 尺度 | [1280,1280] U8 / [1280,160] F8_E4M3 |
+| w2 形状 / 尺度 | [2560,320] U8 / [2560,40] F8_E4M3 |
+| gate/up 相对误差 | **0.0**（6/6 专家） |
+| down 相对误差 | **0.0**（6/6 专家） |
+| **6 专家全层耗时** | **0.2496 ms**（gate/up+down，无 act） |
+
+⇒ 布局/尺度语义（E2M1 + E4M3 g16）**与真实 checkpoint 完全一致**，
+且 6 专家 < 0.3ms ⇒ A 方案的**计算内核已就绪**；剩下是模型层集成。
+
 ## 4.4 下一步
 
 1. needle / greedy 一致性留档；

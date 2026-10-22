@@ -640,8 +640,11 @@ def _already_notifies(func) -> bool:
 
 def _patch_quant_method_cls(cls) -> list[str]:
     # qfn NVFP4 全驻留：native pwal（GPU Marlin repack），之后把仍留在 CPU 的权重搬上 GPU
-    if cls.__name__ == "ModelOptNvFp4FusedMoE" and __import__("os").environ.get("XTU_NVFP4_GPU") == "1":
+    if "NvFp4" in cls.__name__ and __import__("os").environ.get("XTU_NVFP4_GPU") == "1":
         pwal0 = cls.__dict__.get("process_weights_after_loading")
+        if pwal0 is not None and getattr(pwal0, "_xtu_shim", False):
+            # 已被通用 CPU 包装过：取回原始 pwal，避免 _ensure_engine 把权重搬 CPU
+            pwal0 = getattr(pwal0, "__wrapped__", pwal0)
         if pwal0 is not None and not getattr(pwal0, "_xtu_gpu_fix", False):
             @functools.wraps(pwal0)
             def pwal_gpu(self, layer, *a, **kw):
@@ -667,6 +670,10 @@ def _patch_quant_method_cls(cls) -> list[str]:
                         self._build_moe_kernel(layer)
                 except Exception as _e:  # noqa: BLE001
                     print(f"[xtu-nvfp4] rebuild failed: {_e}", flush=True)
+                if not getattr(type(self), "_pwal_seen", False):
+                    type(self)._pwal_seen = True
+                    print(f"[qfn-w1] pwal layer_id={id(layer)} w13_id={id(layer.w13_weight)} "
+                          f"dev={layer.w13_weight.device}", flush=True)
                 if getattr(layer, "_xtu_nvdbg", 0) < 1:
                     layer._xtu_nvdbg = 1
                     _after = {n: getattr(getattr(layer, n, None), "device", None) for n in _names}
@@ -2032,6 +2039,33 @@ def _install_ds_mla_prefill_stride_guard() -> list[str]:
     return [f"gather_dequant_fp8ds_nope[page->row stride guard: {','.join(patched)}]"]
 
 
+def _install_qfn_apply_watch() -> list[str]:
+    """qfn NVFP4 全驻留：监视 Module._apply，找出谁把 w13_weight 搬到 CPU。"""
+    if os.environ.get("XTU_NVFP4_GPU") != "1":
+        return []
+    orig = torch.nn.Module._apply
+    if getattr(orig, "_qfn_watch", False):
+        return []
+
+    def _apply(self, fn, *a, **k):
+        before = getattr(self, "w13_weight", None)
+        bd = before.device if isinstance(before, torch.Tensor) else None
+        r = orig(self, fn, *a, **k)
+        after = getattr(self, "w13_weight", None)
+        ad = after.device if isinstance(after, torch.Tensor) else None
+        if (bd is not None and ad is not None and bd != ad
+                and not getattr(self, "_qfn_apply_logged", False)):
+            self._qfn_apply_logged = True
+            import traceback
+            print(f"[qfn-apply] {type(self).__name__} {bd}->{ad}", flush=True)
+            traceback.print_stack(limit=8)
+        return r
+
+    _apply._qfn_watch = True
+    torch.nn.Module._apply = _apply
+    return ["Module._apply watch"]
+
+
 def apply_mainline_shims() -> list[str]:
     """Idempotently install all shims; returns the list of things applied."""
     if not mixed_mode_enabled():
@@ -2065,6 +2099,7 @@ def apply_mainline_shims() -> list[str]:
         _install_gpu_prefill_profile_guard,
         _install_lvllm_engine_substitution,
         _install_ds_mla_prefill_stride_guard,
+        _install_qfn_apply_watch,
     ):
         try:
             applied += step()

@@ -827,3 +827,11 @@ pwal 后 `layer.w13_weight` 是 cuda，但 kernel 收到的 w1 是 CPU ⇒ **w1 
 给 `device_loading_context` 加 `XTU_NVFP4_GPU=1` 直通后重跑，仍 `b_q_weight is not on GPU`
 ⇒ 不是加载期 CPU 往返；下一步在 `fused_moe_modular_method.py` 打印 `w1=layer.w13_weight`
 的 device/id，与 pwal 后对比，定位“被谁替换成 CPU”。
+
+### 23.3 PP=3 被 PLE 锁死；改走 CPU NVFP4 引擎
+
+- `PP=3, TP=1` 被 vLLM 拒绝：`Qwen4Exp N-gram PLE embedding requires pipeline_parallel_size=1`；
+- TP=2 每 rank 专家 ~34GB + 非专家 ~6.5GB > 40GB ⇒ 权重被退到 CPU ⇒ native Marlin 报
+  `b_q_weight is not on GPU`（pwal 与 kernel 入口 id 相同、device 不同，证实是搬 CPU）；
+- ⇒ 下一步实现 **NVFP4 CPU 专家引擎**（e2m1 codebook + E4M3 g16 scale），
+  它同时是“撤 GPU0 → CPU 兜底”的前提；之后再谈 3 卡侧车全驻留。

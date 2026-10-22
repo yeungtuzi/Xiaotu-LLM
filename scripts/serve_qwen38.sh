@@ -45,6 +45,7 @@ PORT="${PORT:-8140}"        # ⚠️ 不能是 8070(生产)
 #      ⇒ 默认改 **0**;并显式拒绝踩生产的 1/2(除非当次显式 ALLOW_PROD_GPU=1)✗
 GPUS="${GPUS:-0}"           # 【纪律】调试只用 GPU0(生产占 GPU1+GPU2)
 TP="${TP:-1}"               # 【纪律】TP=1
+PP="${PP:-1}"               # PP:管线并行(qfn 3 卡全驻留用 PP=3)
 MAXLEN="${MAXLEN:-262144}"  # ⭐ 0.2.9 实测最优:256K 上下文(KV 足够大)
 MBT="${MBT:-8192}"   # ⭐ 0.2.9 实测最优
 SEQS="${SEQS:-4}"     # ⭐ 0.2.9 实测最优(ds/glm 同为 4)
@@ -116,7 +117,8 @@ ARGS=(
   --model "$CKPT"
   --served-model-name Qwen3.8-Flash-Next
   --host 127.0.0.1 --port "$PORT"
-  --tensor-parallel-size "$TP"
+  --tensor-parallel-size "$TP" \
+  --pipeline-parallel-size "$PP"
   --dtype bfloat16
   --max-model-len "$MAXLEN"
   --max-num-batched-tokens "$MBT"

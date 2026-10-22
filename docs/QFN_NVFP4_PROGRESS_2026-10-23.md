@@ -39,10 +39,29 @@
 仍然 `b_q_weight is not on GPU` ⇒ **不是加载期的 CPU 往返**，是 pwal 之后另有代码
 把 `layer.w13_weight` 换成 CPU 张量（或模块级 `w13_weight` 与 pwal 的不是同一个）。
 
+## 2.3 PP=3 不可行（PLE 限制）
+
+尝试 `PP=3, TP=1` 让 3 卡各放 16 层专家（每卡 ~23GB）以避开 CPU 权重，vLLM 直接拒绝：
+
+```
+NotImplementedError: Qwen4Exp N-gram PLE embedding requires pipeline_parallel_size=1
+because non-first pipeline ranks do not receive the raw input_ids it needs.
+```
+
+⇒ qfn 的 PLE 嵌入把 PP 锁死为 1；**不能用 PP 做 3 卡全驻留**。
+
+## 2.4 结论：TP=2 装不下全部 NVFP4 专家
+
+- 每 rank 专家 ~34GB + 非专家 ~6.5GB + KV ⇒ 超过 40GB；
+- vLLM/插件因此把专家权重退到 CPU（这就是 `w1=cpu` 的来源），
+  但 native Marlin 只接受 GPU 权重；
+- ⇒ **必须实现 NVFP4 的 CPU 专家引擎**（W4A16、group 16、E4M3 scale），
+  它同时就是"撤 GPU0 → CPU 兜底"所需要的那块。
+
 ## 3. 下一步
 
-1. 在 `fused_moe_modular_method.py` 的 `w1=layer.w13_weight` 处打印 device/id，
-   与 pwal 后的 device/id 对比，定位“被谁换掉”；
+0. **实现 NVFP4 CPU 专家引擎**（复用 e2m1 codebook，scale 从 e8m0 换成 E4M3 g16）——
+   这是 TP=2 部分驻留与 GPU0 撤除兜底的共同前提；
    `XTU_NVFP4_GPU=1` 时让 NVFP4 层**完全不进 CPU staging**（权重常驻 GPU）；
 2. 或给 NVFP4 单独实现 full-residency 的 `FusedMoE` 路径（不经插件 CPU engine）；
 3. 再跑 TP=2 起步，随后做 GPU0+1+2 的侧车全驻留与“撤 GPU0 → 部分表”验证。

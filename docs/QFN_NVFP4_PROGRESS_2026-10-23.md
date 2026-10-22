@@ -137,6 +137,19 @@ setsid env ALLOW_PROD_GPU=1 XTU_NVFP4_GPU=1 VLLM_EXPERTS_LOAD_DEVICE=gpu \
 - C=4 聚合 105 tok/s，扩展性正常；
 - ⚠️ `MAXLEN=4096` 时 KV 只剩 **0.05 GiB**（activation 随 MAXLEN 增长）⇒ 长上下文需更多 offload。
 
+## 7. 2026-10-23 23:55 NVFP4 GEMV 原型跑通（E2M1 + E4M3 g16）
+
+脚本：`dev-docs/nvfp4_gemv_prototype.py`（N-major，1 token/专家）。
+
+| 形状 | 耗时/专家 | 相对误差 |
+|---|---|---|
+| gate/up (N=1280,K=2560) | **0.030 ms** | 0.0 |
+| down (N=2560,K=640) | **0.012 ms** | 0.0 |
+
+- 6 专家全层 ≈ 6×0.030 + 6×0.012 + act ≈ **0.27 ms**（< 0.3ms）；
+- 反量化 = e2m1 bitcast + E4M3 算术（无 LUT/常量内存）；
+- ⚠️ 这是**单层内核原型**，还不是侧车集成；但说明 A 方案在性能上可行。
+
 ## 4.4 下一步
 
 1. needle / greedy 一致性留档；

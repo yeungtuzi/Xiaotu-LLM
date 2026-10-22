@@ -45,6 +45,7 @@ class SidecarRuntime:
         self.hidden = int(hidden)
         self.inter = int(inter)
         self.topk = int(topk)
+        self.max_k = int(max_k)
         self.table = table
         self.use_fp8 = bool(use_fp8)
         self.device = int(device)
@@ -57,6 +58,22 @@ class SidecarRuntime:
             compute=self.compute,
         )
         self._dev = f"cuda:{self.device}"
+        K = self.max_k
+        with torch.inference_mode(False):
+            self._nbuf = (
+                torch.empty(K, 2 * self.inter, dtype=torch.float32, device=self._dev),
+                torch.empty(K, self.inter, dtype=torch.bfloat16, device=self._dev),
+                torch.empty(K, self.hidden, dtype=torch.float32, device=self._dev),
+                torch.empty(self.hidden, dtype=torch.float32, device=self._dev),
+            )
+            self.slots_dev = torch.empty(K, dtype=torch.int32, device=self._dev)
+            self.wts_dev = torch.empty(K, dtype=torch.float32, device=self._dev)
+            self.h_gpu = torch.empty(self.hidden, dtype=torch.bfloat16, device=self._dev)
+            self.slots_cpu = torch.empty(K, dtype=torch.int32, pin_memory=True)
+            self.wts_cpu = torch.empty(K, dtype=torch.float32, pin_memory=True)
+            self.slots_np = self.slots_cpu.numpy()
+            self.wts_np = self.wts_cpu.numpy()
+        self._t_dbg = __import__("os").environ.get("XTU_SIDECAR_DEBUG") == "2"
         self._warm_kernels()
 
     def _warm_kernels(self) -> None:
@@ -128,17 +145,22 @@ class SidecarRuntime:
                         slots.append(s - pool.n_local); ws.append(w)
             if not slots:
                 out_host.zero_(); return
-            h = _hid_view(hid_ptr, 1, self.hidden)[0].to(self._dev)
-            st = torch.tensor(slots, dtype=torch.int32, device=self._dev)
-            wt = torch.tensor(ws, dtype=torch.float32, device=self._dev)
-            if not getattr(self, "_dbg_n", 0) < 40:
-                pass
-            else:
-                self._dbg_n = getattr(self, "_dbg_n", 0) + 1
-                print(f"[xtu-sidecar] nmajor layer={layer} hits={len(slots)} w={ws}",
-                      flush=True)
-            o = _nm.forward(h, st, wt, pool.planes, self.hidden, self.inter, int(pool.gk))
-            out_host[: self.hidden].copy_(o)
+            import time as _t
+            _t0 = _t.perf_counter()
+            n = len(slots)
+            self.slots_np[:n] = slots
+            self.wts_np[:n] = ws
+            self.h_gpu.copy_(_hid_view(hid_ptr, 1, self.hidden)[0])
+            self.slots_dev[:n].copy_(self.slots_cpu[:n], non_blocking=True)
+            self.wts_dev[:n].copy_(self.wts_cpu[:n], non_blocking=True)
+            _t1 = _t.perf_counter()
+            _nm.forward(self.h_gpu, self.slots_dev[:n], self.wts_dev[:n], pool.planes,
+                        self.hidden, self.inter, int(pool.gk), bufs=self._nbuf)
+            _t2 = _t.perf_counter()
+            out_host[: self.hidden].copy_(self._nbuf[3])
+            if self._t_dbg:
+                print(f"[xtu-sidecar] layer={layer} hits={n} io={( _t1-_t0)*1e3:.3f}ms "
+                      f"kernels={(_t2-_t1)*1e3:.3f}ms", flush=True)
             return
         h_gpu, ids_gpu, wts_gpu = self._buf(qlen)
         h_gpu.copy_(_hid_view(hid_ptr, qlen, self.hidden))

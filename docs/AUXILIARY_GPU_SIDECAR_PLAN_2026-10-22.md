@@ -814,3 +814,10 @@ sc200l 实测（200 槽，TP=1，N-major 路径，I/O 已预分配）：
 - 当前卡在 `moe_wna16_marlin_gemm: b_q_weight is not on GPU`（权重在 pwal 后已在 GPU，
   疑为 experts/apply 仍走插件 CPU MoE 或缓存了搬卡前张量）；
 - 下一步：qfn 全驻留时禁用 CPU MoE，再跑 TP=2 → GPU0+1+2 侧车全驻留 → 撤 GPU0 部分表。
+
+### 23.1 定位（21:51）
+
+`_fused_marlin_moe` 入口探针：`w1=cpu w2=cpu s1=cpu hs=cuda:0/1`。
+pwal 后 `layer.w13_weight` 是 cuda，但 kernel 收到的 w1 是 CPU ⇒ **w1 来自另一处缓存
+（FusedMoE 外层引用或插件 CPU staging）**；capture 内搬卡会 `cudaErrorStreamCaptureInvalidated`。
+下一步：让 NVFP4 层完全不进 CPU staging（`XTU_NVFP4_GPU=1` 全域生效），再跑 TP=2。

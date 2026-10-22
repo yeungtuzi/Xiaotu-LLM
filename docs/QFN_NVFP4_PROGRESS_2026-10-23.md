@@ -20,10 +20,24 @@
 - 诊断打印显示 pwal 之后 `w13_weight/w2_weight/scale` 都在 `cuda:0/1`，但 kernel 拿到的
   `b_q_weight` 仍是 CPU ⇒ **不是 pwal 的 device，而是 experts/kernel 缓存或 apply 路径**。
 
+## 2.1 2026-10-23 21:51 已定位：运行时 w1/w2/scale 都是 CPU
+
+在 `_fused_marlin_moe` 入口打印（临时探针，已回滚）：
+
+```
+[qfn-marlin] w1=cpu w2=cpu s1=cpu hs=cuda:0
+[qfn-marlin] w1=cpu w2=cpu s1=cpu hs=cuda:1
+```
+
+- pwal 之后 `layer.w13_weight` 是 cuda，但 **kernel 实际收到的 w1 是 CPU**；
+- 说明 w1 来自另一处缓存（FusedMoE 外层引用/插件 CPU staging），不是 pwal 改的那个属性；
+- 在 capture 里做 `.to(cuda)` 会触发 `cudaErrorStreamCaptureInvalidated`，不能靠 kernel 内搬。
+
 ## 3. 下一步
 
-1. 查 `FusedMoEMethodBase.apply` / experts 在 qfn 下是否仍走插件的 CPU MoE（`CpuXiaotuMoE`）；
-2. 若是：给 NVFP4 全驻留加“跳过 CPU MoE”的分支（`XTU_NVFP4_GPU=1` 时 `mixed_mode_enabled()` 对该层返回 False）；
+1. 查 `FusedMoE` 外层把哪个 `w13_weight` 传给 `experts.apply`（CPU staging 的来源），
+   `XTU_NVFP4_GPU=1` 时让 NVFP4 层**完全不进 CPU staging**（权重常驻 GPU）；
+2. 或给 NVFP4 单独实现 full-residency 的 `FusedMoE` 路径（不经插件 CPU engine）；
 3. 再跑 TP=2 起步，随后做 GPU0+1+2 的侧车全驻留与“撤 GPU0 → 部分表”验证。
 
 ## 4. 复现

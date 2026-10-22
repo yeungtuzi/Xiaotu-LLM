@@ -835,3 +835,12 @@ pwal 后 `layer.w13_weight` 是 cuda，但 kernel 收到的 w1 是 CPU ⇒ **w1 
   `b_q_weight is not on GPU`（pwal 与 kernel 入口 id 相同、device 不同，证实是搬 CPU）；
 - ⇒ 下一步实现 **NVFP4 CPU 专家引擎**（e2m1 codebook + E4M3 g16 scale），
   它同时是“撤 GPU0 → CPU 兜底”的前提；之后再谈 3 卡侧车全驻留。
+
+### 23.4 create_weights 把 NVFP4 专家建在 CPU（23:00）
+
+- `ModelOptNvFp4FusedMoE.create_weights` 用 `torch.empty(...)`（无 device）⇒ CPU；
+- loader 的 `device_loading_context` 按设计把参数搬回 CPU；pwal 期间是 cuda，
+  但每卡加载统计仅 **4.92 GiB**、GPU 峰值 10.7GB ⇒ 34GB 专家从未驻留；
+- 尝试 `base_loader.load_model` 后统一搬卡，shim 未出现在引擎进程的 applied 列表
+  （只看到 pwal gpu_fix）⇒ 落点/安装时机需改；
+- 容量：34+5=39GB vs 39.49GB 可用 ⇒ 只剩 ~0.5GB KV，即使搬上去也极紧。

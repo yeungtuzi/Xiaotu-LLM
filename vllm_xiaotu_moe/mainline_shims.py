@@ -2066,6 +2066,59 @@ def _install_qfn_apply_watch() -> list[str]:
     return ["Module._apply watch"]
 
 
+def _install_qfn_experts_gpu_shim() -> list[str]:
+    """qfn NVFP4 全驻留：模型加载完成后把仍留在 CPU 的 NVFP4 专家权重搬到 GPU。
+
+    为什么需要：native create_weights 用 `torch.empty(...)`(CPU) 建专家，
+    loader 的 device_loading_context 在加载结束后又把它们搬回 CPU；
+    native Marlin 只接受 GPU 权重 ⇒ 在 load_model 返回后统一搬一次。
+    """
+    if os.environ.get("XTU_NVFP4_GPU") != "1":
+        return []
+    try:
+        from vllm.model_executor.model_loader import base_loader as _bl
+    except Exception as exc:  # noqa: BLE001
+        _log(f"skip qfn experts-gpu shim: {type(exc).__name__}: {exc}")
+        return []
+    orig = getattr(_bl, "load_model", None)
+    if orig is None or getattr(orig, "_qfn_gpu_shim", False):
+        return []
+
+    def load_model(*a, **k):
+        model = orig(*a, **k)
+        try:
+            dev = torch.device("cuda", torch.cuda.current_device())
+            names = ("w13_weight", "w2_weight", "w13_weight_scale", "w2_weight_scale",
+                     "w13_weight_scale_2", "w2_weight_scale_2",
+                     "w13_input_scale", "w2_input_scale")
+            moved = 0
+            for m in model.modules():
+                for nm in names:
+                    p = getattr(m, nm, None)
+                    if not isinstance(p, torch.Tensor) or p.device.type != "cpu":
+                        continue
+                    p.data = p.data.to(dev)
+                    moved += 1
+            if moved:
+                torch.cuda.synchronize()
+                print(f"[qfn-gpu] moved {moved} expert tensors to {dev}", flush=True)
+        except Exception as exc:  # noqa: BLE001
+            print(f"[qfn-gpu] move failed: {type(exc).__name__}: {exc}", flush=True)
+        return model
+
+    load_model._qfn_gpu_shim = True
+    _bl.load_model = load_model
+    # 其他模块可能已经 `from ... import load_model`，逐个替换同一引用
+    import sys as _sys
+    for _m in list(_sys.modules.values()):
+        try:
+            if getattr(_m, "load_model", None) is orig:
+                setattr(_m, "load_model", load_model)
+        except Exception:  # noqa: BLE001
+            pass
+    return ["base_loader.load_model(qfn experts->gpu)"]
+
+
 def apply_mainline_shims() -> list[str]:
     """Idempotently install all shims; returns the list of things applied."""
     if not mixed_mode_enabled():
@@ -2100,6 +2153,7 @@ def apply_mainline_shims() -> list[str]:
         _install_lvllm_engine_substitution,
         _install_ds_mla_prefill_stride_guard,
         _install_qfn_apply_watch,
+        _install_qfn_experts_gpu_shim,
     ):
         try:
             applied += step()

@@ -58,9 +58,26 @@ because non-first pipeline ranks do not receive the raw input_ids it needs.
 - ⇒ **必须实现 NVFP4 的 CPU 专家引擎**（W4A16、group 16、E4M3 scale），
   它同时就是"撤 GPU0 → CPU 兜底"所需要的那块。
 
+## 2.5 2026-10-23 23:00 定位到 create_weights：专家天生就在 CPU
+
+vLLM `ModelOptNvFp4FusedMoE.create_weights` 里是：
+
+```python
+data=torch.empty(num_experts, ..., dtype=torch.uint8)   # 没有 device ⇒ CPU
+```
+
+loader 的 `device_loading_context` 在加载结束后按设计把参数搬回 CPU；
+pwal 期间看到 cuda，但模型加载统计只有 **4.92 GiB/卡**，GPU 峰值 10.7GB
+⇒ **34GB 专家从未真正驻留 GPU**。
+
+尝试在 `base_loader.load_model` 之后统一搬卡（`_install_qfn_experts_gpu_shim`），
+但该 shim 没有出现在引擎进程的 `mainline shims applied` 列表里（只看到 pwal 的 gpu_fix），
+说明 hook 落点/安装时机还不对；且 34+5=39GB 对 39.49GB 只剩 ~0.5GB KV，本身也极紧。
+
 ## 3. 下一步
 
-0. **实现 NVFP4 CPU 专家引擎**（复用 e2m1 codebook，scale 从 e8m0 换成 E4M3 g16）——
+0. 换可靠落点（`Worker.load_model` / `EngineCore` 之后）把 NVFP4 专家搬 GPU，并确认 shim 真被安装；
+1. **实现 NVFP4 CPU 专家引擎**（复用 e2m1 codebook，scale 从 e8m0 换成 E4M3 g16）——
    这是 TP=2 部分驻留与 GPU0 撤除兜底的共同前提；
    `XTU_NVFP4_GPU=1` 时让 NVFP4 层**完全不进 CPU staging**（权重常驻 GPU）；
 2. 或给 NVFP4 单独实现 full-residency 的 `FusedMoE` 路径（不经插件 CPU engine）；

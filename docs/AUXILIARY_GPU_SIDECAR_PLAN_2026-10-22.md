@@ -513,3 +513,19 @@ DSpark k=5、8 会话、40,880 条 decode、40 层；**split-half held-out**（�
 | 若只到 0.5ms | 收益 ≈0.05ms/层 ⇒ +2%，不值得 |
 
 ⇒ **P2 的前置条件已改为“先有 decode MXFP4 内核”**；在此之前不再跑 A/B（避免浪费机时）。
+
+### 15.4 调参最优（仍不够）
+
+在 `gpu_moe_layer` 上调 `KERNEL=split / BM / BN / WARPS / STAGES` 全扫描：
+
+| 配置 | q1 |
+|---|---|
+| 默认 base BM=64/BN=64 | 1.07 ms |
+| base BM=8/BN=64 | 0.83 ms |
+| **split BM=16/BN=32/NW=4** | **0.642 ms**（最优）|
+| split BM=8/BN=32/NW=4 | 0.651 ms |
+| CPU fwd | **0.55 ms** |
+
+⇒ 调参把 1.07 → **0.642ms**，但仍 > CPU 0.55ms；**调参无法跨过闸门**。
+⇒ 必须写 decode 专用内核（GEMV 型 / 权重常驻 / 按 expert-pair 调度），
+目标 ≤0.30ms/层；现有内核不再投入调参。

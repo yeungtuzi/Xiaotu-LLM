@@ -29,7 +29,22 @@ def sidecar_device() -> int | None:
     if v in _DISABLED:
         return None
     if v == "gpu0":
-        return 0
+        # "gpu0" 指【物理 GPU0】，必须按 CUDA_VISIBLE_DEVICES 换算成进程内 logical id。
+        # 例：CUDA_VISIBLE_DEVICES=1,0 ⇒ 物理0 在 logical 1（主服务占 logical 0 = 物理1）。
+        cvd = os.environ.get("CUDA_VISIBLE_DEVICES", "").strip()
+        if not cvd:
+            return 0
+        parts = [p.strip() for p in cvd.split(",") if p.strip()]
+        try:
+            phys = [int(p) for p in parts]
+        except ValueError:
+            return 0  # UUID/MIG 形式：退回旧行为
+        if 0 in phys:
+            return phys.index(0)
+        raise ValueError(
+            "XTU_SIDECAR=gpu0 但物理 GPU0 不在 CUDA_VISIBLE_DEVICES="
+            f"{cvd!r} 中；请用 GPUS=1,0 这类顺序让主服务占物理1、侧车占物理0"
+        )
     raise ValueError(
         f"XTU_SIDECAR={v!r} 不认识；只支持 'gpu0'，或 none/0/off 表示关闭"
     )
@@ -72,10 +87,14 @@ class SidecarWorker:
         self.hidden = int(hidden)
         self.max_qlen = int(max_qlen)
         self.max_k = int(max_k)
-        self.masks = load_hit_masks(table_path, n_layers, n_experts)
-        self.ids = torch.zeros(max_qlen * max_k, dtype=torch.int32, pin_memory=True)
-        self.wts = torch.zeros(max_qlen * max_k, dtype=torch.float32, pin_memory=True)
-        self.out = torch.zeros(max_qlen * hidden, dtype=torch.float32, pin_memory=True)
+        # 必须在 InferenceMode(False) 下分配：worker 常在模型 forward 里首次创建，
+        # 否则 pinned 缓冲会变成 inference tensor，之后 copy_ 会报
+        # "Inplace update to inference tensor outside InferenceMode is not allowed"。
+        with torch.inference_mode(False):
+            self.masks = load_hit_masks(table_path, n_layers, n_experts)
+            self.ids = torch.zeros(max_qlen * max_k, dtype=torch.int32, pin_memory=True)
+            self.wts = torch.zeros(max_qlen * max_k, dtype=torch.float32, pin_memory=True)
+            self.out = torch.zeros(max_qlen * hidden, dtype=torch.float32, pin_memory=True)
 
         self.ctl = engine.sidecar_new()
         engine.sidecar_config(
@@ -101,7 +120,15 @@ class SidecarWorker:
             last = req
             layer, qlen, k, ids_ptr, wts_ptr, hid_ptr, out_ptr = \
                 self.engine.sidecar_request(self.ctl)
-            self.compute(layer, qlen, k, self.ids, self.wts, self.out, hid_ptr)
+            try:
+                _t0 = time.perf_counter()
+                self.compute(layer, qlen, k, self.ids, self.wts, self.out, hid_ptr)
+                if os.environ.get("XTU_SIDECAR_DEBUG"):
+                    print(f"[xtu-sidecar] layer={layer} qlen={qlen} k={k} "
+                          f"{(time.perf_counter()-_t0)*1e3:.2f}ms", flush=True)
+            except Exception as _e:  # noqa: BLE001
+                print(f"[xtu-sidecar] compute FAILED layer={layer}: "
+                      f"{type(_e).__name__}: {_e}", flush=True)
             self.engine.sidecar_done(self.ctl, req)
 
     def close(self):

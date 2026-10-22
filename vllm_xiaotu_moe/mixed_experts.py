@@ -2632,6 +2632,51 @@ class _XiaotuExpertsMixin:
             #   ⇒ `XIAOTU_PIN_MIN_QLEN`(默认 0=不限制)以下直接走 CPU 路径,
             #      不做 partial、也不触发自适应 ⇒ 小并发零代价 ✓
             #   ⚠️ 池本身仍在 profile 期建好(图捕获前),这里只控制"用不用" ✓
+            # ---- XTU_SIDECAR=gpu0：本层 GPU0 池（只建一次；非捕获）----
+            if (not torch.cuda.is_current_stream_capturing()
+                    and not getattr(self, "_side_inited", False)):
+                self._side_inited = True
+                self._side_layer_idx = -1
+                try:
+                    from vllm_xiaotu_moe import sidecar as _sc
+                    if _sc.sidecar_device() is not None:
+                        import re as _re2
+                        _m2 = _re2.search(r"layers\.(\d+)", getattr(layer, "layer_name", ""))
+                        _tab = os.environ.get("XTU_SIDECAR_TABLE", "")
+                        if _m2 and _tab and os.path.exists(_tab) and expert_map is None:
+                            from vllm_xiaotu_moe import expert_pool as _xp2
+                            from vllm_xiaotu_moe.sidecar_gpu0 import get_sidecar_runtime
+                            _li = int(_m2.group(1))
+                            _rt = get_sidecar_runtime(
+                                engine, hidden_size, int(self._I_eng),
+                                int(self.moe_config.experts_per_token), _tab,
+                                n_layers=0, n_experts=int(self._E_eng),
+                                use_fp8=(getattr(self, "_engine_attr", "") == "MOE_FP8"),
+                                swiglu_limit=float(getattr(self, "swiglu_limit", 0.0) or 0.0),
+                            )
+                            if _rt is not None:
+                                _pool2 = _xp2.build_layer_pool(
+                                    engine, torch.device(f"cuda:{_sc.sidecar_device()}"),
+                                    hidden_size, int(self._I_eng), int(self._group_k),
+                                    int(self._E_eng), _li, expert_map,
+                                    topk=int(self.moe_config.experts_per_token),
+                                    layout=("fp8" if getattr(self, "_engine_attr", "") == "MOE_FP8" else "mxfp4"),
+                                    table_path=_tab, require_pin=False)
+                                if _pool2 is not None:
+                                    _rt.add_pool(_li, _pool2)
+                                    self._side_pool = _pool2
+                                    self._side_layer_idx = _li
+                                    _pinp = None   # 侧车与 GPU1/2 PIN 互斥，避免重复计算
+                        elif _m2 and _tab and expert_map is not None:
+                            if not getattr(self, "_side_tp_warned", False):
+                                self._side_tp_warned = True
+                                print("[xtu-sidecar] TP>1 暂不支持 per-rank 半专家"
+                                      "（需 full-expert 表或引擎 EP 集成）⇒ 本层走标准路径",
+                                      flush=True)
+                except Exception as _se:  # noqa: BLE001
+                    print(f"[xtu-sidecar] 本层初始化失败（走标准路径）: "
+                          f"{type(_se).__name__}: {_se}", flush=True)
+
             _minq = int(os.environ.get("XIAOTU_PIN_MIN_QLEN", "0") or 0)
             if _pinp and _minq > 1 and qlen < _minq:
                 _pinp = None
@@ -2845,7 +2890,7 @@ class _XiaotuExpertsMixin:
                     stream.cuda_stream, qlen,
                     self.moe_config.experts_per_token,
                     h_bf16.data_ptr(), cpu_ids.data_ptr(), cpu_w.data_ptr(),
-                    out.data_ptr(),
+                    out.data_ptr(), layer=getattr(self, "_side_layer_idx", -1),
                 )
                 torch.cuda.current_stream().wait_event(_ev_done)
                 out.add_(_partial.to(out.dtype))
@@ -2853,7 +2898,7 @@ class _XiaotuExpertsMixin:
                 engine.cpu_decode(
                     stream.cuda_stream, qlen, self.moe_config.experts_per_token,
                     h_bf16.data_ptr(), ids_i32.data_ptr(), wts_f32.data_ptr(),
-                    out.data_ptr(),
+                    out.data_ptr(), layer=getattr(self, "_side_layer_idx", -1),
                 )
         _lt_t2 = time.perf_counter() if _LT_ON else 0.0
         if _sync == "post":

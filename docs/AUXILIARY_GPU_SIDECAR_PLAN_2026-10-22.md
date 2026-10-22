@@ -439,3 +439,41 @@ DSpark k=5、8 会话、40,880 条 decode、40 层；**split-half held-out**（�
 - 远端已用 `ONLY=avx512_bf16_vbmi` 重建 `.so`（2.61 MB，15:58），API 已验证；
 - 旧 `.so` 备份：`/home/user/lvllm/tmp/sidecar_backup/so_before.tgz`；
 - **尚未做**：真实 GPU0 compute（pool + kernel）、单层 on/off、C=1 A/B。
+
+---
+
+## 14. 2026-10-23 P2 实机冒烟：两个硬 blocker（C=1 结论反转）
+
+在 ds41f TP=1（GPU1 主 + GPU0 侧车，200 槽表，128K）上实跑，得到两个必须先解决的 blocker：
+
+### 14.1 GPU0 池装载失败（loader 不是 device-agnostic）
+
+- `build_layer_pool(..., device="cuda:0")` 只成功了前 ~10 层（GPU0 ≈919 MiB），
+  后续层报：
+  `ValueError: Pointer argument cannot be accessed from Triton (cpu tensor?)`
+- 根因：`gpu_prefill.kmajor_from_engine_shards_noraw` 的装配路径假设“目标设备 = 当前设备”，
+  在非当前设备（物理 GPU0 / logical 1）上把 CPU 分片指针交给 Triton ⇒ 失败。
+- ⇒ 需要：loader 显式按 `device` 建流/拷入，或把侧车池放到**独立进程**里建。
+
+### 14.2 MXFP4 池内核在 C=1 太慢（决定性）
+
+| 项 | 实测 |
+|---|---|
+| `gpu_prefill.gpu_moe_layer`（MXFP4，qlen=1） | **1.07 ms/层** |
+| 同上 qlen=4 | 1.06 ms/层（固定开销主导） |
+| CPU MoE 每层 | ≈0.55 ms（fwd） |
+
+⇒ 侧车**关键路径 1.07ms > 被替代的 CPU 0.55ms** ⇒ 即使完全重叠，
+每层还要多等 ≈0.5ms ⇒ 40 层 ≈ +20ms，而命中只省 ≈13.8ms ⇒ **C=1 净负**。
+（这也解释了 B1058 为什么 ds41f PIN 在 C=1 净负、C≥4 才转正：固定开销被摊薄。）
+
+### 14.3 结论与下一步
+
+- **P2 暂停**：当前 MXFP4 池内核不能支撑 C=1 目标；
+- 必须先做**decode 专用 MXFP4 内核**（目标 <0.3ms/层，固定开销主导 ⇒ 需持久化/批内合并），
+  或把侧车限定在 C≥4（但那不是本项目的主目标）；
+- 另需修 **GPU0 池 loader**（14.1）；
+- 已修的坑：`CUDA_VISIBLE_DEVICES` 物理/逻辑换算（`gpu0` 必须解析物理 0）、
+  首次调用 1.9s 需预热、pinned 缓冲需在 `inference_mode(False)` 下分配。
+
+⇒ **P0/P1 结论仍有效**；P2 的“+10~14%”在当前内核下**不成立**，等新内核再评估。

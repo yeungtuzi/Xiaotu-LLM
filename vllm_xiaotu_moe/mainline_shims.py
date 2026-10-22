@@ -118,6 +118,11 @@ def _install_device_loading_shim() -> list[str]:
 
     @contextlib.contextmanager
     def device_loading_context(module, target_device):
+        # qfn NVFP4 全驻留：不做 CPU 往返（否则 pwal 后又被搬回 CPU）
+        if __import__("os").environ.get("XTU_NVFP4_GPU") == "1":
+            with orig(module, target_device) as m:
+                yield m
+            return
         if not mixed_mode_enabled() or target_device.type == "cpu":
             with orig(module, target_device) as m:
                 yield m

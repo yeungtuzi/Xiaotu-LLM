@@ -821,3 +821,9 @@ sc200l 实测（200 槽，TP=1，N-major 路径，I/O 已预分配）：
 pwal 后 `layer.w13_weight` 是 cuda，但 kernel 收到的 w1 是 CPU ⇒ **w1 来自另一处缓存
 （FusedMoE 外层引用或插件 CPU staging）**；capture 内搬卡会 `cudaErrorStreamCaptureInvalidated`。
 下一步：让 NVFP4 层完全不进 CPU staging（`XTU_NVFP4_GPU=1` 全域生效），再跑 TP=2。
+
+### 23.2 排除 device_loading_context（21:57）
+
+给 `device_loading_context` 加 `XTU_NVFP4_GPU=1` 直通后重跑，仍 `b_q_weight is not on GPU`
+⇒ 不是加载期 CPU 往返；下一步在 `fused_moe_modular_method.py` 打印 `w1=layer.w13_weight`
+的 device/id，与 pwal 后对比，定位“被谁替换成 CPU”。

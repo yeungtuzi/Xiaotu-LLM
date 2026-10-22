@@ -33,9 +33,16 @@
 - 说明 w1 来自另一处缓存（FusedMoE 外层引用/插件 CPU staging），不是 pwal 改的那个属性；
 - 在 capture 里做 `.to(cuda)` 会触发 `cudaErrorStreamCaptureInvalidated`，不能靠 kernel 内搬。
 
+## 2.2 2026-10-23 21:57 排除 `device_loading_context`
+
+给 `device_loading_context` 加 `XTU_NVFP4_GPU=1` 直通（不做 CPU 往返）后重跑 TP=2，
+仍然 `b_q_weight is not on GPU` ⇒ **不是加载期的 CPU 往返**，是 pwal 之后另有代码
+把 `layer.w13_weight` 换成 CPU 张量（或模块级 `w13_weight` 与 pwal 的不是同一个）。
+
 ## 3. 下一步
 
-1. 查 `FusedMoE` 外层把哪个 `w13_weight` 传给 `experts.apply`（CPU staging 的来源），
+1. 在 `fused_moe_modular_method.py` 的 `w1=layer.w13_weight` 处打印 device/id，
+   与 pwal 后的 device/id 对比，定位“被谁换掉”；
    `XTU_NVFP4_GPU=1` 时让 NVFP4 层**完全不进 CPU staging**（权重常驻 GPU）；
 2. 或给 NVFP4 单独实现 full-residency 的 `FusedMoE` 路径（不经插件 CPU engine）；
 3. 再跑 TP=2 起步，随后做 GPU0+1+2 的侧车全驻留与“撤 GPU0 → 部分表”验证。

@@ -2084,27 +2084,32 @@ def _install_qfn_experts_gpu_shim() -> list[str]:
     if orig is None or getattr(orig, "_qfn_gpu_shim", False):
         return []
 
+    def _qfn_move(model):
+        dev = torch.device("cuda", torch.cuda.current_device())
+        names = ("w13_weight", "w2_weight", "w13_weight_scale", "w2_weight_scale",
+                 "w13_weight_scale_2", "w2_weight_scale_2",
+                 "w13_input_scale", "w2_input_scale")
+        moved = 0
+        for m in model.modules():
+            for nm in names:
+                p = getattr(m, nm, None)
+                if not isinstance(p, torch.Tensor) or p.device.type != "cpu":
+                    continue
+                p.data = p.data.to(dev)
+                moved += 1
+        if moved:
+            torch.cuda.synchronize()
+            print(f"[qfn-gpu] moved {moved} expert tensors to {dev}", flush=True)
+        return moved
+
     def load_model(*a, **k):
         model = orig(*a, **k)
         try:
-            dev = torch.device("cuda", torch.cuda.current_device())
-            names = ("w13_weight", "w2_weight", "w13_weight_scale", "w2_weight_scale",
-                     "w13_weight_scale_2", "w2_weight_scale_2",
-                     "w13_input_scale", "w2_input_scale")
-            moved = 0
-            for m in model.modules():
-                for nm in names:
-                    p = getattr(m, nm, None)
-                    if not isinstance(p, torch.Tensor) or p.device.type != "cpu":
-                        continue
-                    p.data = p.data.to(dev)
-                    moved += 1
-            if moved:
-                torch.cuda.synchronize()
-                print(f"[qfn-gpu] moved {moved} expert tensors to {dev}", flush=True)
+            _qfn_move(model)
         except Exception as exc:  # noqa: BLE001
             print(f"[qfn-gpu] move failed: {type(exc).__name__}: {exc}", flush=True)
         return model
+    load_model._qfn_move = _qfn_move
 
     load_model._qfn_gpu_shim = True
     _bl.load_model = load_model
@@ -2116,7 +2121,37 @@ def _install_qfn_experts_gpu_shim() -> list[str]:
                 setattr(_m, "load_model", load_model)
         except Exception:  # noqa: BLE001
             pass
-    return ["base_loader.load_model(qfn experts->gpu)"]
+    # Worker.load_model：模型/pwal 全部结束后再搬（更可靠的落点）
+    applied = ["base_loader.load_model(qfn experts->gpu)"]
+    try:
+        from vllm.v1.worker import gpu_worker as _gw
+    except Exception:  # noqa: BLE001
+        _gw = None
+    if _gw is not None:
+        for _cn in ("Worker", "GPUWorker"):
+            _cls = getattr(_gw, _cn, None)
+            if _cls is None:
+                continue
+            _orig_w = _cls.__dict__.get("load_model")
+            if _orig_w is None or getattr(_orig_w, "_qfn_gpu_shim", False):
+                continue
+
+            @functools.wraps(_orig_w)
+            def _worker_load(self, *a, **k):
+                r = _orig_w(self, *a, **k)
+                try:
+                    mr = getattr(self, "model_runner", None)
+                    model = getattr(mr, "model", None)
+                    if model is not None:
+                        load_model._qfn_move(model)
+                except Exception as exc:  # noqa: BLE001
+                    print(f"[qfn-gpu] worker move failed: {type(exc).__name__}: {exc}", flush=True)
+                return r
+
+            _worker_load._qfn_gpu_shim = True
+            setattr(_cls, "load_model", _worker_load)
+            applied.append(f"{_cn}.load_model(qfn experts->gpu)")
+    return applied
 
 
 def apply_mainline_shims() -> list[str]:

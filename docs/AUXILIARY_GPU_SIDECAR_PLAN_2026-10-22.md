@@ -844,3 +844,11 @@ pwal 后 `layer.w13_weight` 是 cuda，但 kernel 收到的 w1 是 CPU ⇒ **w1 
 - 尝试 `base_loader.load_model` 后统一搬卡，shim 未出现在引擎进程的 applied 列表
   （只看到 pwal gpu_fix）⇒ 落点/安装时机需改；
 - 容量：34+5=39GB vs 39.49GB 可用 ⇒ 只剩 ~0.5GB KV，即使搬上去也极紧。
+
+### 23.5 搬卡 hook 静默未装（23:05）
+
+`base_loader.load_model` 与 `Worker.load_model` 两处 hook 都没出现在引擎进程的 applied 列表，
+且无 skip/failed 日志 ⇒ 在 `XTU_NVFP4_GPU` 检查或 `orig is None` 处静默返回。
+最可能：**worker 子进程没继承该 env**（serve 的 envfile 只桥接已知变量），
+或 base_loader 的 `load_model` 不是模块属性。
+下一步：把变量写进 envfile，或改用 pwal 内注册的 forward-pre-hook（pwal 已证明在 worker 内执行）。

@@ -74,9 +74,19 @@ pwal 期间看到 cuda，但模型加载统计只有 **4.92 GiB/卡**，GPU 峰�
 但该 shim 没有出现在引擎进程的 `mainline shims applied` 列表里（只看到 pwal 的 gpu_fix），
 说明 hook 落点/安装时机还不对；且 34+5=39GB 对 39.49GB 只剩 ~0.5GB KV，本身也极紧。
 
+## 2.6 2026-10-23 23:05 搬卡 hook 仍没装上
+
+- 已把 hook 挂到 `base_loader.load_model` 与 `Worker.load_model` 两处；
+- 但引擎进程的 `mainline shims applied` 列表里**两条都没有**，且无 `skip/failed` 日志
+  ⇒ 函数在 `if os.environ.get("XTU_NVFP4_GPU") != "1"` 或 `orig is None` 处**静默返回 []**；
+- 也就是说：**引擎子进程没有看到 `XTU_NVFP4_GPU=1`**（或 base_loader 没有 `load_model` 属性）；
+- 这个 env 只在 APIServer/父进程生效（之前 pwal 的 gpu_fix 列表来自父进程），
+  worker 是 `spawn` 的，环境可能被 serve 脚本的 envfile **过滤**。
+
 ## 3. 下一步
 
-0. 换可靠落点（`Worker.load_model` / `EngineCore` 之后）把 NVFP4 专家搬 GPU，并确认 shim 真被安装；
+0. 把 `XTU_NVFP4_GPU` 写进 serve 的 envfile（不走“父进程 env”），或改用**进程内**
+   `pwal` 里注册的 forward-pre-hook（pwal 已证明在 worker 内执行）；
 1. **实现 NVFP4 CPU 专家引擎**（复用 e2m1 codebook，scale 从 e8m0 换成 E4M3 g16）——
    这是 TP=2 部分驻留与 GPU0 撤除兜底的共同前提；
    `XTU_NVFP4_GPU=1` 时让 NVFP4 层**完全不进 CPU staging**（权重常驻 GPU）；

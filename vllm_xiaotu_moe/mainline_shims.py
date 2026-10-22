@@ -634,6 +634,42 @@ def _already_notifies(func) -> bool:
 
 
 def _patch_quant_method_cls(cls) -> list[str]:
+    # qfn NVFP4 全驻留：native pwal（GPU Marlin repack），之后把仍留在 CPU 的权重搬上 GPU
+    if cls.__name__ == "ModelOptNvFp4FusedMoE" and __import__("os").environ.get("XTU_NVFP4_GPU") == "1":
+        pwal0 = cls.__dict__.get("process_weights_after_loading")
+        if pwal0 is not None and not getattr(pwal0, "_xtu_gpu_fix", False):
+            @functools.wraps(pwal0)
+            def pwal_gpu(self, layer, *a, **kw):
+                r = pwal0(self, layer, *a, **kw)
+                dev = torch.cuda.current_device()
+                _names = ("w13_weight", "w2_weight", "w13_weight_scale", "w2_weight_scale",
+                          "w13_weight_scale_2", "w2_weight_scale_2",
+                          "w13_input_scale", "w2_input_scale")
+                _before = {n: getattr(getattr(layer, n, None), "device", None) for n in _names}
+                for _n in _names:
+                    _t = getattr(layer, _n, None)
+                    if isinstance(_t, torch.Tensor) and _t.device.type != "cuda":
+                        setattr(layer, _n, _t.to(dev))
+                for _n, _p in list(layer.named_parameters(recurse=False)):
+                    if _p.device.type != "cuda":
+                        _p.data = _p.data.to(dev)
+                for _n, _b in list(layer.named_buffers(recurse=False)):
+                    if _b.device.type != "cuda":
+                        _b.data = _b.data.to(dev)
+                # 权重搬上卡后重建 kernel，避免 experts 缓存住 CPU 张量
+                try:
+                    if hasattr(self, "_build_moe_kernel"):
+                        self._build_moe_kernel(layer)
+                except Exception as _e:  # noqa: BLE001
+                    print(f"[xtu-nvfp4] rebuild failed: {_e}", flush=True)
+                if getattr(layer, "_xtu_nvdbg", 0) < 1:
+                    layer._xtu_nvdbg = 1
+                    _after = {n: getattr(getattr(layer, n, None), "device", None) for n in _names}
+                    print(f"[xtu-nvfp4] before={_before} after={_after}", flush=True)
+                return r
+            pwal_gpu._xtu_gpu_fix = True
+            cls.process_weights_after_loading = pwal_gpu
+        return ["ModelOptNvFp4FusedMoE.gpu_fix"]
     out: list[str] = []
     cw = cls.__dict__.get("create_weights")
     if cw is not None and not getattr(cw, "_xtu_shim", False):

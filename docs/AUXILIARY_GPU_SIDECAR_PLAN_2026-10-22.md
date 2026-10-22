@@ -802,3 +802,15 @@ sc200l 实测（200 槽，TP=1，N-major 路径，I/O 已预分配）：
 - **C=1 侧车不可行**（不是内核问题，是“每层小 batch + 跨设备同步”的结构问题）；
 - C≥4 仍可能（CPU 每层 ~2.2ms，0.7ms 可被遮住），但不是本目标；
 - qfn 全驻留场景不受此结论影响（它本来就不用 CPU 算 MoE）。
+
+---
+
+## 23. 2026-10-23 qfn NVFP4 加载链路（进行中）
+
+详细记录：`docs/QFN_NVFP4_PROGRESS_2026-10-23.md`。
+
+- 已解 4 个 blocker：2D/4D block scale、`orig_dtype`、NVFP4 CPU pwal、TP=3 不支持（改 TP=2）；
+- **208/208 分片加载成功**，已进推理；
+- 当前卡在 `moe_wna16_marlin_gemm: b_q_weight is not on GPU`（权重在 pwal 后已在 GPU，
+  疑为 experts/apply 仍走插件 CPU MoE 或缓存了搬卡前张量）；
+- 下一步：qfn 全驻留时禁用 CPU MoE，再跑 TP=2 → GPU0+1+2 侧车全驻留 → 撤 GPU0 部分表。

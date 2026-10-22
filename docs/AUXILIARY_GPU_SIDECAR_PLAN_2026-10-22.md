@@ -863,3 +863,15 @@ pwal 后 `layer.w13_weight` 是 cuda，但 kernel 收到的 w1 是 CPU ⇒ **w1 
 - **C=1：47.1 tok/s**（260 prompt+64 decode），与官方 FP8 基线 46.3 基本持平；
 - 当前形态 = 部分驻留（2GB 在 CPU）+ GPU0 可撤除；
 - 下一步：needle 一致性、去 offload、C=2/4 与长上下文。
+
+### 24.1 最佳运行点与 0GB 边界（23:30）
+
+| CPU_OFFLOAD_GB | KV | C=1 | needle |
+|---|---|---|---|
+| 0（含 EAGER=1） | — | — | OOM（38.52GB 已用，仅 179MB 空闲）|
+| **1** | 0.41 GiB | **68.0 tok/s** | ✅ ORANGE-7731 |
+| 2 | 1.66 GiB | 47.1 tok/s | ✅ ORANGE-7731 |
+
+- 1GB vs 2GB：needle 最终答案一致，reasoning 长度不同（非 bit-identical，符合“needle 语义一致”）；
+- GPU0 始终 0 MiB ⇒ 撤除天然成立；
+- 0GB 不可行 ⇒ 2 卡上“纯 GPU 全驻留”做不到；TP=3/PP=3 均被模型结构卡死。

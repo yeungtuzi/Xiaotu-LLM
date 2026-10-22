@@ -111,7 +111,21 @@ setsid env ALLOW_PROD_GPU=1 XTU_NVFP4_GPU=1 VLLM_EXPERTS_LOAD_DEVICE=gpu \
 - serve：`CPU_OFFLOAD_GB=2`（差 ~1.7GB，用 CPU offload 补）；
 - **GPU0 未使用** ⇒ "GPU0 可撤除"天然成立；当前形态就是"部分驻留 + CPU 兜底"。
 
-### 4.4 下一步
+### 5. 2026-10-23 23:30 最佳运行点：1GB offload，C=1 68 tok/s
+
+| 配置 | KV | C=1 | needle | 备注 |
+|---|---|---|---|---|
+| CPU_OFFLOAD_GB=0 | — | — | — | **OOM**（38.52GB 已用，仅 179MB 空闲；EAGER=1 也不行）|
+| **CPU_OFFLOAD_GB=1** | 0.41 GiB | **68.0 tok/s** | ✅ ORANGE-7731 | **最佳** |
+| CPU_OFFLOAD_GB=2 | 1.66 GiB | 47.1 tok/s | ✅ ORANGE-7731 | 更慢，但 KV 更大 |
+
+- 1GB vs 2GB：needle **最终答案一致**（ORANGE-7731）；reasoning 文本长度不同（55 vs 63 tokens），
+  **不是 bit-identical**，符合计划里“greedy 或 needle 语义一致”的验收口径；
+- GPU0 两种配置都**完全空闲** ⇒ “GPU0 可撤除”天然成立；
+- 0GB 不可行 ⇒ **至少需要 1GB CPU 兜底**；TP=3 被 16 head 卡死、PP=3 被 PLE 卡死，
+  所以“纯 GPU 全驻留”在 2 卡上做不到。
+
+## 4.4 下一步
 
 1. needle / greedy 一致性留档；
 2. 尝试去掉 2GB offload（缩小 graph/eager 或把少量专家放 GPU0 侧车）；

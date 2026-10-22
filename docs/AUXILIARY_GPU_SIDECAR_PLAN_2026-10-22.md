@@ -637,3 +637,34 @@ DSpark k=5、8 会话、40,880 条 decode、40 层；**split-half held-out**（�
 ⇒ Triton 下 bitcast 已是最优；0.56ms 就是这条路的天花板。
 再往下只能 **CUDA C++**（half2/bf16x2 + 共享内存查表 + 向量化），
 预计 0.25–0.35ms；这是否值得投入 3–5 天，需要用户拍板。
+
+---
+
+## 18. 2026-10-23 CUDA down GEMV 可行性：ALU 反量化 0.275ms，仍不够
+
+按上一轮建议写了最小 CUDA 内核（只做 down，N-major，warp-per-row，uint4 向量加载，
+shared x，6 专家）。脚本：`dev-docs/cuda_down_prototype.py`。
+
+### 18.1 迭代记录（6 专家 down）
+
+| 版本 | 耗时 | 说明 |
+|---|---|---|
+| block-per-row + `__constant__` LUT | 0.80 ms | 常量内存随机索引被串行化 |
+| warp-per-row + constant LUT | 0.77–0.85 ms | 同上 |
+| **ALU 反量化（bitcast，去常量表）** | **0.275 ms** | 正确性 err 0.004 |
+
+- 0.275ms / 35MB ⇒ 129GB/s，仍远低于 1.2TB/s；
+- 说明瓶颈在**每元素 ALU/延迟**，不是带宽；shared x 的加载也占一部分。
+
+### 18.2 对比
+
+- Triton 全层（gate/up+act+down，6 专家）**0.562ms**；
+- CUDA 仅 down 就 **0.275ms**，按 1/3 估算全层 ~0.7–0.8ms，**并未优于 Triton**；
+- ⇒ “CUDA 一定更快”的假设**未被证实**；要真正跨过 0.30ms，需要更系统的内核工程
+  （多行/线程复用、异步流水、FP4 tensor-core 模拟），不是一晚上的事。
+
+### 18.3 结论（写死）
+
+- 访存布局问题已解决；反量化在 Triton 与最小 CUDA 上都是瓶颈；
+- 当前最好全层 **0.56ms**，CPU **0.55ms**，**C=1 闸门未通过**；
+- 继续投入需要专门的 kernel 工程（3–5 天、独立任务），**不应继续在夜间会话里试探**。

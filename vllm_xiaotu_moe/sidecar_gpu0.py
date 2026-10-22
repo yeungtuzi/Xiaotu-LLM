@@ -57,25 +57,40 @@ class SidecarRuntime:
             compute=self.compute,
         )
         self._dev = f"cuda:{self.device}"
+        self._warm_kernels()
+
+    def _warm_kernels(self) -> None:
+        """用合成 planes 编译全部 Triton kernel（一次即可）。"""
+        try:
+            torch.cuda.set_device(self.device)
+            H, I = self.hidden, self.inter
+            z = lambda *sh: torch.zeros(*sh, dtype=torch.uint8, device=self._dev)
+            pl = (z(1, 2 * I, H // 2), z(1, 2 * I, H // 32),
+                  z(1, H, I // 2), z(1, H, I // 32))
+            h = torch.zeros(H, dtype=torch.bfloat16, device=self._dev)
+            st = torch.zeros(1, dtype=torch.int32, device=self._dev)
+            wt = torch.ones(1, dtype=torch.float32, device=self._dev)
+            _nm.forward(h, st, wt, pl, H, I, 32)
+            torch.cuda.synchronize()
+        except Exception as e:  # noqa: BLE001
+            print(f"[xtu-sidecar] warmup 失败: {type(e).__name__}: {e}", flush=True)
 
     def add_pool(self, layer: int, pool) -> None:
         layer = int(layer)
         # MXFP4：转成 N-major（[S,N,K]），并释放 K-major，避免 2× 常驻
         if not self.use_fp8:
             try:
-                pool.planes = _nm.transpose_planes(pool)
+                pt = _nm.transpose_planes(pool)
+                pt = tuple(t.to(self._dev) for t in pt)
+                pool.planes = pt
+                if layer in (0, 22):
+                    print(f"[xtu-sidecar] layer{layer} planes={tuple(t.shape for t in pt)} "
+                          f"dev={pt[0].device}", flush=True)
             except Exception as e:  # noqa: BLE001
                 print(f"[xtu-sidecar] layer{layer} transpose 失败: {e}", flush=True)
         self.pools[layer] = pool
         self._slotmap_cpu[layer] = pool.slotmap.detach().cpu()
-        # 预编译 Triton 内核（首次 launch 会编译数秒，不能落在 host-function 里）
-        try:
-            h = torch.zeros(self.hidden, dtype=torch.bfloat16, device=self._dev)
-            st = torch.zeros(1, dtype=torch.int32, device=self._dev)
-            wt = torch.ones(1, dtype=torch.float32, device=self._dev)
-            _nm.forward(h, st, wt, pool.planes, self.hidden, self.inter, int(pool.gk))
-        except Exception as e:  # noqa: BLE001
-            print(f"[xtu-sidecar] layer{layer} warmup 失败: {e}", flush=True)
+
 
     def _buf(self, qlen: int):
         b = self._bufs.get(qlen)
@@ -116,6 +131,12 @@ class SidecarRuntime:
             h = _hid_view(hid_ptr, 1, self.hidden)[0].to(self._dev)
             st = torch.tensor(slots, dtype=torch.int32, device=self._dev)
             wt = torch.tensor(ws, dtype=torch.float32, device=self._dev)
+            if not getattr(self, "_dbg_n", 0) < 40:
+                pass
+            else:
+                self._dbg_n = getattr(self, "_dbg_n", 0) + 1
+                print(f"[xtu-sidecar] nmajor layer={layer} hits={len(slots)} w={ws}",
+                      flush=True)
             o = _nm.forward(h, st, wt, pool.planes, self.hidden, self.inter, int(pool.gk))
             out_host[: self.hidden].copy_(o)
             return

@@ -741,3 +741,30 @@ N-major Triton 实测（1 token）：`GPU(S) ≈ 0.09·S + 0.02` ms；CPU 全量
 
 CPU/GPU 算不相交专家 ⇒ `max(GPU(hit), CPU(miss))`；62.6% 命中下预计 **+8～12%**；
 N-major 内核是正确方向，剩下是集成调试，不是新内核研究。
+
+---
+
+## 21. 2026-10-23 N-major 已在服务里跑通，但单层 1.95ms（需 profile）
+
+### 21.1 确认
+
+日志逐字：`[xtu-sidecar] nmajor layer=22 hits=1` ⇒ **N-major 路径真的生效**；
+pools 形状正确（`[S,4608,2560]` 等，dev=cuda:1=物理 GPU0）。
+
+### 21.2 两个问题
+
+1. **合成 warmup 失败**：`_warm_kernels` 没先 `set_device`，Triton 在 current=GPU1 下
+   拿到 cuda:1 的 tensor 报 “cpu tensor”；导致首次真实调用才编译（187ms，触发一次 50ms 超时）。
+   ✅ 已修：warmup 开头 `torch.cuda.set_device(self.device)`。
+2. **单层 1.95ms**（1 个命中），而 standalone 原型同形状只要 **0.115ms**，差 17×。
+   可疑项：
+   - 每次 `nm.forward` 分配 4 个临时张量（part/inter/part_out/out）；
+   - worker 里 Python 命中循环 + 每层 2 个 `torch.tensor(...)` H2D；
+   - 4 个 kernel 的 launch 开销（worker 线程、非图）；
+   - Triton 对 `slot_ids` 的形状/类型可能重新特化。
+
+### 21.3 下一步
+
+- 在 `compute` 里加分段计时（hit / H2D / gate / act / down / wsum / D2H）；
+- 预分配 `part/inter/part_out/out`（按最大命中数），复用 slots/weights 张量；
+- 目标：把 1.95ms 压回 0.2ms 量级，再做单层 on/off。

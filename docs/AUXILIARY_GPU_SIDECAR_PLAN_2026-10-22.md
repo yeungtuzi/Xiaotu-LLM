@@ -852,3 +852,14 @@ pwal 后 `layer.w13_weight` 是 cuda，但 kernel 收到的 w1 是 CPU ⇒ **w1 
 最可能：**worker 子进程没继承该 env**（serve 的 envfile 只桥接已知变量），
 或 base_loader 的 `load_model` 不是模块属性。
 下一步：把变量写进 envfile，或改用 pwal 内注册的 forward-pre-hook（pwal 已证明在 worker 内执行）。
+
+---
+
+## 24. 2026-10-23 23:15 qfn NVFP4 跑通（TP=2 + 2GB CPU offload）
+
+- **可用**：`XTU_NVFP4_GPU=1 VLLM_EXPERTS_LOAD_DEVICE=gpu CPU_OFFLOAD_GB=2 GPUS=1,2 TP=2`，
+  `Application startup complete`，KV 1.66 GiB；
+- GPU1/2 各 37.78 GiB，**GPU0 全空**；语义冒烟正常；
+- **C=1：47.1 tok/s**（260 prompt+64 decode），与官方 FP8 基线 46.3 基本持平；
+- 当前形态 = 部分驻留（2GB 在 CPU）+ GPU0 可撤除；
+- 下一步：needle 一致性、去 offload、C=2/4 与长上下文。

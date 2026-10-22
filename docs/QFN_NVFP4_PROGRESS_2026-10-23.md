@@ -83,6 +83,40 @@ pwal 期间看到 cuda，但模型加载统计只有 **4.92 GiB/卡**，GPU 峰�
 - 这个 env 只在 APIServer/父进程生效（之前 pwal 的 gpu_fix 列表来自父进程），
   worker 是 `spawn` 的，环境可能被 serve 脚本的 envfile **过滤**。
 
+## 4. 2026-10-23 23:15 **qfn NVFP4 已跑通（TP=2 + 2GB CPU offload）**
+
+### 4.1 可用启动命令
+
+```bash
+cd /home/user/lvllm/vllm-xiaotu-moe
+D=/home/user/.cache/modelscope/models/lovedheart--Qwen3.8-Flash-Next-NVFP4-W4A16-ATTN-FP8-MTP-NVFP4/snapshots/master
+setsid env ALLOW_PROD_GPU=1 XTU_NVFP4_GPU=1 VLLM_EXPERTS_LOAD_DEVICE=gpu \
+  CPU_OFFLOAD_GB=2 GPUS=1,2 TP=2 PORT=8142 LOAD=auto CKPT=$D \
+  TAG=qfn_nv_cpu2 MAXLEN=512 MBT=512 GPU_UTIL=0.95 \
+  XIAOTU_MOE_GPU_RESIDENT_LAYERS=0 bash scripts/serve_qwen38.sh
+```
+
+### 4.2 实测
+
+- `Application startup complete`；`Available KV cache memory: 1.66 GiB`；
+- GPU1/2 各 **37.78 GiB**，**GPU0 全空（0 MiB）**；
+- 语义冒烟：`1+1 等于 2`、`What is the capital of France?` 正常起句；
+- **C=1：260 prompt + 64 decode，wall 1.36s ⇒ 47.1 tok/s**
+  （官方 FP8 qfn C=1 基线 46.3 tok/s，基本持平）。
+
+### 4.3 关键改动
+
+- vLLM：2D block scale → 4D、`orig_dtype` 回落（见 `docs/patches/`）；
+- 插件：`XTU_NVFP4_GPU=1` 跳过 NVFP4 CPU shim + 搬卡；
+- serve：`CPU_OFFLOAD_GB=2`（差 ~1.7GB，用 CPU offload 补）；
+- **GPU0 未使用** ⇒ "GPU0 可撤除"天然成立；当前形态就是"部分驻留 + CPU 兜底"。
+
+### 4.4 下一步
+
+1. needle / greedy 一致性留档；
+2. 尝试去掉 2GB offload（缩小 graph/eager 或把少量专家放 GPU0 侧车）；
+3. C=2/4 与长上下文基准。
+
 ## 3. 下一步
 
 0. 把 `XTU_NVFP4_GPU` 写进 serve 的 envfile（不走“父进程 env”），或改用**进程内**

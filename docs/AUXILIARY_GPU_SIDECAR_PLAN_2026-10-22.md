@@ -555,3 +555,33 @@ DSpark k=5、8 会话、40,880 条 decode、40 层；**split-half held-out**（�
 - 现有内核 = 固定 0.43ms（并行度）+ 0.04ms/专家；调参到 0.64ms 已是极限；
 - 新内核方案：**K-split GEMV**（gate/up 与 down 都切 K），预计 0.15–0.25ms/层；
 - 在此之前 P2 不跑 A/B。
+
+---
+
+## 16. 2026-10-23 K-split 原型：单专家 0.18ms，但 6 专家仍 0.60ms
+
+按 §15.6 写了 Triton K-split 原型（gate/up + act + down，全部 K-split，
+去 atomic、scale 按 group 广播、e2m1 用 bitcast 快速反量化）。
+脚本留档：`dev-docs/ksplit_prototype.py`。
+
+### 16.1 实测（1 token，S 个专家，三轮优化后）
+
+| S | 全层（gate/up+act+down） |
+|---|---|
+| 1 | **0.179 ms** |
+| 2 | 0.305 ms |
+| 4 | 0.554 ms |
+| **6** | **0.597 ms** |
+| 8 | 0.619 ms |
+
+- 6 专家读 6×17.7MB ≈106MB，0.6ms ⇒ 有效带宽 ≈**177GB/s**（仍远低于 1.5TB/s）；
+- 三轮优化（去 atomic、scale 广播、bitcast 反量化）只从 0.61 → 0.60ms；
+- ⇒ **K-split 提高了单专家并行度（0.43→0.18ms），但多专家仍线性叠加**，
+  瓶颈是每专家的权重读取效率，不是并行度本身。
+
+### 16.2 结论
+
+- 现有 Triton 路线在 6 专家下 **0.60ms > CPU 0.55ms**，C=1 闸门**仍未通过**；
+- 要跨过，需要**手写 CUDA 内核**：16B 向量化加载、FP4→BF16 在寄存器内完成、
+  按 expert-pair 的 GEMV/小 GEMM、必要时用 tensor core（A100 无原生 FP4，需模拟）；
+- 这是 3–5 天工程；在此之前 P2 不跑 A/B。

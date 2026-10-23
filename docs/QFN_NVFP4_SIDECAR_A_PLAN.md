@@ -166,3 +166,22 @@ vLLM 源码已恢复，补丁归档 `docs/patches/qfn_a_forward_v2.patch`。
   2. 置零后的 `wts2` 是否真的让被置零专家的贡献变为 0（可对比 r 与 baseline）；
   3. `acc` 的 NaN 究竟在哪一步（打印 `wt`、`S2_2[e]`、`o` 的有限性）。
 - 补丁归档 `docs/patches/qfn_a_forward_v4.patch`；vLLM 源码已恢复。
+
+### 5.11 P1 **通过**（TP=1，2026-10-24 10:50）
+
+**根因**：侧车 kernel 在 `cuda:1` 上执行，但 Triton 按 **当前设备**（cuda:0）launch，
+指针却指向 cuda:1 ⇒ 读到 0/NaN。修法是计算前 `torch.cuda.set_device(side)`，算完恢复。
+
+**结果**（layer0，40% 专家置零 + GPU0 并回，与"全量 Marlin"对比）：
+
+| 步 | `masked + sidecar` vs `full` 相对误差 | acc |
+|---|---|---|
+| decode 1 | **0.004791** | 0.00895 |
+| decode 2 | **0.003738** | 0.02780 |
+
+- 文本连贯（"用户要求用一句话解释快速排序…"）；
+- 与 P0 离线对拍的 0.3–0.5% 完全一致 ⇒ **单层"置零 + 并回"机制数值正确**；
+- 补丁归档 `docs/patches/qfn_a_forward_v5.patch`。
+
+**下一步**：移植到 TP=2（本地/全局 id、每专家只算一次、all-reduce 前只加一次），
+再推到 48 层并做显存缩容（P2）。

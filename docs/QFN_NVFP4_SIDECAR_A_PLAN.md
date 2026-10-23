@@ -40,3 +40,24 @@
 - all-reduce 前加 GPU0 结果只能加一次，需确认 rank 同步；
 - Marlin 的 expert 数与权重形状绑定，P2 的缩减要改 create_weights/loading（最重）；
 - 回滚：env 关闭 + 代码 revert；vLLM 补丁已有 `docs/patches/`。
+
+## 5. 2026-10-24 08:45 P0 状态
+
+### 5.1 已完成
+- vLLM 侧 dump 钩子（`docs/patches/qfn_dump_hooks_2026-10-24.patch`）：
+  `ModelOptNvFp4FusedMoE.process_weights_after_loading` 开头 dump 原始权重；
+- **layer 0 原始 NVFP4 权重已落盘**（1.4GB：w13/s13/w2/s2，512 专家）；
+- 离线真实权重对拍已通过（`dev-docs/nvfp4_real_check.py`：0 误差）。
+
+### 5.2 阻塞点
+- `apply`（modelopt 686/1153）与 modular/monolithic 两条路径都加了 dump，
+  但**运行时都没触发**（无 `[qfn-apply]`/`[qfn-dump] io` 日志）；
+- backend 已确认是 **MARLIN**（`nvfp4.py:312`），但实际 MoE 执行路径不是
+  `ModelOptNvFp4FusedMoE.apply` / `forward_modular`，需在 `FusedMoE.forward` 或
+  runner 的 kernel dispatch 层再定位；
+- vLLM 源码已从 `modelopt.py.bak_qfn` 恢复干净（探针不留在生产路径）。
+
+### 5.3 下一步
+1. 在 `RoutedExperts.forward_modular` 入口加探针，确认实际调用栈；
+2. 找到后 dump 单层 `x/ids/weights/out`，完成引擎内对拍；
+3. 再进入 P1（单层拆分）。

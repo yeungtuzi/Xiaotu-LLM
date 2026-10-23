@@ -245,3 +245,21 @@ vLLM 源码已恢复，补丁归档 `docs/patches/qfn_a_forward_v2.patch`。
 - 若是 `[gate_half; up_half]`：现有切法正确，问题只在缩放；
 - 若是整块 gate / 整块 up：侧车必须先 all-gather 另一半，或在本地改为只算 gate/up 之一，
   由 all-reduce 合并（与 Marlin 的 TP 语义一致）。
+
+### 5.16 下一步的判定依据（2026-10-24 11:25）
+
+TP=2 的 `w13` 本地 640 行只有两种可能排布：
+
+1. **`[gate[0:320]; up[0:320]]`**（MergedColumnParallel 常规切法）
+   ⇒ 现有 `g[:I]`/`g[I:]`（I=320）切法正确，问题只在缩放；
+2. **整块 `gate(640)` 或 `up(640)`**（按列连续切）
+   ⇒ 本地无法算激活，必须 all-gather 另一半或改由 all-reduce 合并。
+
+判定方法（不改引擎、不需要重启）：
+- 从 checkpoint 取 layer0 某专家的 `gate_proj`（[640,1280] U8）与 `up_proj`；
+- 用 pwal 落盘的 `qfn_a_shapes.txt` 只能看形状，不能看行序；
+  所以需要**再落一次权重字节**（pwal 里把 `w13_weight[0, :8, :4]` 的原始字节写文件），
+  与 checkpoint 的 gate/up 对应位置比对即可确定行序；
+- 确定后再决定是修缩放还是加 all-gather。
+
+当前状态：TP=1 验证通过；TP=2 卡在“行序 + 缩放”两点。

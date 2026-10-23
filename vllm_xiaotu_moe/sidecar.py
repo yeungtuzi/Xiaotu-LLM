@@ -97,8 +97,12 @@ class SidecarWorker:
             self.out = torch.zeros(max_qlen * hidden, dtype=torch.float32, pin_memory=True)
 
         self.ctl = engine.sidecar_new()
+        # [xtu 2026-10-24] MXFP4 的 N-major GEMV 只对单 token 成立；qlen>1 时必须让
+        # host_begin 直接放弃（返回 0，不置 0 CPU 权重），否则命中专家会被静默丢弃，
+        # batch>1 输出出现空回复/截断。fp8 路径支持多 token，保持原 max_qlen。
+        _max_qlen = max_qlen if use_fp8 else 1
         engine.sidecar_config(
-            self.ctl, n_layers, n_experts, hidden, max_qlen, max_k,
+            self.ctl, n_layers, n_experts, hidden, _max_qlen, max_k,
             self.masks.data_ptr(), self.ids.data_ptr(), self.wts.data_ptr(),
             self.out.data_ptr(),
         )

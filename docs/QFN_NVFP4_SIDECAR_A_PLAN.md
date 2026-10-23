@@ -69,3 +69,22 @@
 - 结论：GPU0 内核对 qfn 的 NVFP4 专家计算在**数值上可直接替代** Marlin 的命中部分；
 - 补丁归档：`docs/patches/qfn_dump_weights.patch`、`qfn_trace.patch`；
 - 下一步 P1：单层交给 GPU0（全部命中），验证整模型 greedy 一致与耗时。
+
+### 5.5 P1 机制定稿（2026-10-24 09:10）
+
+**关键发现**：qfn 每层是 `shared_expert（bf16，I=640）+ 10 个路由专家（NVFP4）`，
+且还有 `shared_expert_gate`（sigmoid 门控）。所以"整层替换"必须连 bf16 共享专家一起算，
+不划算。
+
+**改用"权重置零 + 并回"（与 P2 同一机制，单层先行）**：
+
+1. pwal 时把目标层的**原始路由权重**（含 `w13/w2/scale/scale_2`）复制到 GPU0；
+2. `forward_modular` 里对目标层：
+   - 复制 `topk_weights`，把"归 GPU0 的专家"权重置 0；
+   - 调用原生 `quant_method.apply`（Marlin 仍算全部 + 共享专家，被置零的贡献为 0）；
+   - 用 GPU0 内核算这些被置零的命中，按**原始** `topk_weights` 加权；
+   - 返回 `marlin_out + gpu0_out`（TP=1 直接在 rank 上相加；TP=2 需在 all-reduce 前只加一次）。
+3. 共享专家完全不动 ⇒ 不需要复刻 bf16 MLP/sigmoid 门控。
+
+**验收**：同请求 greedy 文本一致（数值差 ≤0.5%）；该层耗时；
+**显存**：P1 不释放 GPU1/2（权重还在），P2 再缩容。

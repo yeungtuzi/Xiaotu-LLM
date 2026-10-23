@@ -774,7 +774,7 @@ nohup bash scripts/host_rss_watchdog.sh --tag <tag> --limit-gib <N> \
 
 ## 基准测试纪律（2026-10-23 用户明令）
 
-**跑任何"基本测试/基准"之前，必须先读口径与最新配置**，不得自拼对照组：
+**以后再跑"基准测试"，都先去读 readme 中的口径，或者文档中最新的配置**；不得自拼对照组：
 
 1. `README.md` 的基准表（唯一权威数据）与脚注口径；
 2. `docs/BENCH_PROTOCOL.md`（尤其 §6 的 decode 稳态窗口定义）；

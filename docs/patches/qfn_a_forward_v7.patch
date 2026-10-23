@@ -1,0 +1,130 @@
+--- /home/user/lvllm/process_data/ref/repos/vllm-mainline/vllm/model_executor/layers/fused_moe/routed_experts.py.bak_qfn	2026-10-23 00:44:12.067354226 +0000
++++ /home/user/lvllm/tmp/re_a7.py	2026-10-23 03:15:12.274683881 +0000
+@@ -70,6 +70,113 @@
+ 
+ 
+ @PluggableLayer.register("routed_experts")
++
++def _qfn_a_idx(layer):
++    import re
++    for attr in ("layer_name", "prefix", "name"):
++        m = re.search(r"layers?\.(\d+)", str(getattr(layer, attr, "") or ""))
++        if m:
++            return int(m.group(1))
++    return -1
++
++
++def _qfn_a_forward(self, x, topk_weights, topk_ids, shared_experts, shared_experts_input):
++    import os, sys
++    import torch
++    import triton
++    sys.path.insert(0, "/home/user/lvllm/tmp")
++    from nvfp4_gemv import gemv
++    dbg = os.environ.get("QFN_A_DEBUG") == "1"
++    d = self._qfn_gpu0
++    side = torch.device("cuda", torch.cuda.device_count() - 1)
++    mask = (topk_ids % 5) < 2
++    wts2 = topk_weights.clone().masked_fill(mask, 0.0)
++    if dbg:
++        print(f"[qfn-a-cfg] ari={getattr(self, 'apply_router_weight_on_input', None)} "
++              f"masked={int(mask.sum())}/{mask.numel()} "
++              f"wts_before={topk_weights.sum(-1)[:2].tolist()} wts_after={wts2.sum(-1)[:2].tolist()}",
++              flush=True)
++    r = self.quant_method.apply(
++        layer=self, x=x, topk_weights=wts2, topk_ids=topk_ids,
++        shared_experts=shared_experts, shared_experts_input=shared_experts_input)
++    if dbg:
++        r2 = self.quant_method.apply(
++            layer=self, x=x, topk_weights=topk_weights, topk_ids=topk_ids,
++            shared_experts=shared_experts, shared_experts_input=shared_experts_input)
++        _r2 = r2
++        _a = r if isinstance(r, torch.Tensor) else getattr(r, "hidden_states", None)
++        _b = r2 if isinstance(r2, torch.Tensor) else getattr(r2, "hidden_states", None)
++        if _a is not None and _b is not None:
++            print(f"[qfn-a-mask] masked_r={float(_a.abs().max()):.5f} "
++                  f"full_r={float(_b.abs().max()):.5f} diff={float((_a-_b).abs().max()):.5f}", flush=True)
++    W13 = d["w13_weight"]; S13 = d["w13_weight_scale"].view(torch.uint8)
++    S13_2 = d["w13_weight_scale_2"]; W2 = d["w2_weight"]; S2 = d["w2_weight_scale"].view(torch.uint8)
++    S2_2 = d["w2_weight_scale_2"]
++    E, N13, K13 = W13.shape; I = N13 // 2; H = K13 * 2
++    T = x.shape[0]
++    local = torch.cuda.current_device()
++    multi = E < 512
++    xd = x.to(side).float(); ids = topk_ids.to(side); wts = topk_weights.to(side).float(); msk = mask.to(side)
++    _prev = torch.cuda.current_device()
++    torch.cuda.set_device(side)
++    acc = torch.zeros(T, H, dtype=torch.float32, device=side)
++    for t in range(T):
++        for j in range(ids.shape[1]):
++            if not bool(msk[t, j]):
++                continue
++            eg = int(ids[t, j]); wt = float(wts[t, j])
++            if wt == 0.0 or eg < 0:
++                continue
++            if multi:
++                _mode = os.environ.get("QFN_A_MAP", "block")
++                if _mode == "interleave":
++                    if (eg % 2) != local:
++                        continue
++                    e = eg // 2
++                else:
++                    if (eg // E) != local:
++                        continue
++                    e = eg % E
++            else:
++                e = eg
++            if e < 0 or e >= E:
++                continue
++            g = torch.zeros(N13, dtype=torch.float32, device=side)
++            gemv[(triton.cdiv(N13, 4),)](xd[t], W13[e], S13[e], g, K=H, BN=4, BK=128, num_warps=4)
++            gate = g[:I] * S13_2[e, 0]; up = g[I:] * S13_2[e, 1]
++            act = torch.nn.functional.silu(gate) * up
++            o = torch.zeros(H, dtype=torch.float32, device=side)
++            gemv[(triton.cdiv(H, 4),)](act, W2[e], S2[e], o, K=I, BN=4, BK=128, num_warps=4)
++            if dbg and t == 0 and j <= 2:
++                print(f"[qfn-a-step] t={t} j={j} e={e} wt={wt:.5f} g={float(g.abs().max()):.3e} "
++                      f"act={float(act.abs().max()):.3e} o={float(o.abs().max()):.3e} "
++                      f"s2={float(S2_2[e]):.3e} fin={bool(torch.isfinite(o).all())}", flush=True)
++            acc[t] += wt * (o * S2_2[e])
++    torch.cuda.set_device(_prev)
++    acc = torch.nan_to_num(acc, nan=0.0, posinf=0.0, neginf=0.0)
++    if dbg:
++        _ra = r if isinstance(r, torch.Tensor) else getattr(r, "hidden_states", None)
++        if _ra is not None:
++            _rb = None
++            try:
++                _rb = _r2
++            except Exception:
++                _rb = None
++            if isinstance(_rb, torch.Tensor):
++                _sum = _ra + acc.to(_ra.device, _ra.dtype)
++                _rel = float((_sum - _rb).abs().max() / (_rb.abs().max() + 1e-9))
++                print(f"[qfn-a-cmp] rel_err(sum vs full)={_rel:.6f} acc={float(acc.abs().max()):.5f}", flush=True)
++            else:
++                print(f"[qfn-a-acc] acc={float(acc.abs().max()):.5f}", flush=True)
++    if isinstance(r, torch.Tensor):
++        return r + acc.to(r.device, r.dtype)
++    hs = getattr(r, "hidden_states", None)
++    if hs is not None:
++        r.hidden_states = hs + acc.to(hs.device, hs.dtype)
++        return r
++    return r
++
++
+ class RoutedExperts(PluggableLayer):
+     """Container for routed expert weights and execution logic.
+ 
+@@ -1294,6 +1401,13 @@
+ 
+         """
+         assert not self.quant_method.is_monolithic
++        import os as _os
++        try:
++            _tgt = int(_os.environ.get("QFN_A_LAYER", "-1") or -1)
++        except Exception:
++            _tgt = -1
++        if _tgt >= 0 and getattr(self, "_qfn_gpu0", None) is not None and _qfn_a_idx(self) == _tgt:
++            return _qfn_a_forward(self, x, topk_weights, topk_ids, shared_experts, shared_experts_input)
+ 
+         # Modular kernels use pre-computed routing
+         return self.quant_method.apply(

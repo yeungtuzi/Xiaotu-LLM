@@ -1,0 +1,76 @@
+--- /home/user/lvllm/process_data/ref/repos/vllm-mainline/vllm/model_executor/layers/quantization/modelopt.py.bak_qfn	2026-10-23 00:25:24.052158980 +0000
++++ /home/user/lvllm/tmp/mo_a9.py	2026-10-23 05:58:25.453239638 +0000
+@@ -817,6 +817,65 @@
+         )
+ 
+ 
++
++def _qfn_a_scope():
++    import os
++    v = os.environ.get("QFN_A_LAYER")
++    if v is None:
++        return -1
++    if str(v).lower() == "all":
++        return -2
++    try:
++        return int(v)
++    except Exception:
++        return -1
++
++
++def _qfn_layer_index(layer):
++    import re
++    for attr in ("layer_name", "prefix", "name"):
++        m = re.search(r"layers?\.(\d+)", str(getattr(layer, attr, "") or ""))
++        if m:
++            return int(m.group(1))
++    return -1
++
++
++def _qfn_copy_gpu0(layer):
++    scope = _qfn_a_scope()
++    idx = _qfn_layer_index(layer)
++    if scope < -1:
++        ok = idx >= 0
++    elif scope >= 0:
++        ok = idx == scope
++    else:
++        return
++    if not ok:
++        return
++    import torch
++    if torch.cuda.device_count() < 2:
++        print(f"[qfn-a] sidecar not visible (devices={torch.cuda.device_count()})", flush=True)
++        return
++    if torch.cuda.current_device() != 0:
++        return
++    dev = torch.device("cuda", torch.cuda.device_count() - 1)
++    names = ("w13_weight", "w13_weight_scale", "w13_weight_scale_2",
++             "w2_weight", "w2_weight_scale", "w2_weight_scale_2")
++    E = layer.w13_weight.shape[0]
++    mask = (torch.arange(E, device=layer.w13_weight.device) % 5) < 2
++    d = {}
++    for n in names:
++        t = getattr(layer, n, None)
++        if t is None:
++            continue
++        d[n] = t[mask].detach().to(dev).contiguous()
++    idxmap = torch.full((E,), -1, dtype=torch.long)
++    idxmap[mask] = torch.arange(int(mask.sum()), dtype=torch.long)
++    d["_idx"] = idxmap
++    layer._qfn_gpu0 = d
++    gb = sum(x.numel() * x.element_size() for x in d.values()) / 1e9
++    print(f"[qfn-a] layer={idx} sidecar {gb:.3f} GB ({int(mask.sum())}/{E} experts)", flush=True)
++
++
+ class ModelOptNvFp4FusedMoE(FusedMoEMethodBase):
+     """MoE Method for FP4 Quantization.
+ 
+@@ -973,6 +1032,7 @@
+ 
+     def process_weights_after_loading(self, layer: RoutedExperts) -> None:
+         """Convert NVFP4 MoE weights into kernel format and setup the kernel."""
++        _qfn_copy_gpu0(layer)
+         if is_weights_pre_processed():
+             if self.nvfp4_backend != NvFp4MoeBackend.FLASHINFER_TRTLLM:
+                 raise RuntimeError(

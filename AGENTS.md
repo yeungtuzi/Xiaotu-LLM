@@ -1,5 +1,39 @@
 # AGENTS.md —— 本仓库对自动化代理的强制纪律
 
+## ⭐⭐ 【双开发线纪律 · 2026-10-22】musa 线与主线并行,不许互相污染
+
+> 用户 2026-10-22 定:**A100 那台只跑主线,musa 只在本地开发**(musa 目标硬件是 mtts4000,
+> A100 上**无法验证**,所以永远不在 A100 上验证 musa)。
+
+**本地两个工作区(一套 `.git`,用 worktree,不切分支、不 stash):**
+
+| 线 | 路径 | 分支 | 说明 |
+|---|---|---|---|
+| 主线(GL M/DeepSeek) | `/root/lvllm/repos/vllm-xiaotu-moe` | 见 `git worktree list` | ⚠️ 2026-10-22 状态见下行 |
+| musa | 同上或独立 worktree | `feature/musa-correctness` | 仅本地开发,不部署到 A100 |
+| 主线 | `/root/lvllm/repos/vllm-mainline` | `dev/mainline` | 2026-10-22 由 `git worktree add` 建立 |
+
+**远端(A100)`/home/user/lvllm/vllm-xiaotu-moe`:只放主线,一个 env。**
+
+- env 只有 **`vllm-xiaotu-moe`**(python 3.12.14),editable 安装指向**唯一目录**
+  `/home/user/lvllm/vllm-xiaotu-moe` ⇒ **不要为第二条线复制 env**(A100 不跑 musa)✓
+- ⚠️ **该远端机器连不上 GitHub**(`git fetch` 130 s 后超时)⇒ **同步只能 scp / `git bundle`**,
+  不要指望在远端 `git pull` ✗
+- ⚠️ 远端是**编译调试环境**,代码由本地 scp 覆盖 ⇒ 它的 `git status` 经常显示大量"已修改",
+  **那是部署差异,不是远端有更新**。判断"远端是否落后"要看 **HEAD**,不看 status ✓
+  (2026-10-22 曾出现「旧 HEAD + musa 版 `gpu_prefill.py`/`expert_pool.py`」的混合态,
+  已 reset 回 `b6a30b9`,md5 与 `origin/main` 逐一对齐)
+
+**部署纪律(硬):**
+1. ⛔ **musa 的代码永远不部署到 A100** —— 否则主线基准实际跑的是 musa 路径,数据全不可信 ✗
+2. 部署前先确认**当前在哪个 worktree/分支**(`git worktree list` + `git rev-parse --abbrev-ref HEAD`)
+3. 主线基准必须在**主线工作区**发起部署
+
+**合并策略:**
+- musa 是 `origin/main` 的直系后代 ⇒ **让 musa 定期 `git merge origin/main`**,冲突小步解决
+- ⛔ 不要 squash musa 的提交(含 Revert,有语义)
+- 必然冲突的 5 个文件:`gpu_prefill.py`、`mixed_experts.py`、`moe_v2.hpp`、`moe_v2_fp8.hpp`、`binding.cpp`
+
 ## ⛔⛔⛔ 【环境事实 · 2026-10-15】这是**两台机器**,别搞混 ⇒ 先读 `dev-docs/ENV_TWO_MACHINES.md`
 
 > **用户原话(2026-10-15)**:"你先把**远程开发环境**和**本地 DSH 环境**这个问题**醒目记录**下来,**免得后续每次会话我都要解释一下**"
@@ -689,3 +723,66 @@ nohup bash scripts/host_rss_watchdog.sh --tag <tag> --limit-gib <N> \
    必须 `nohup`/`setsid` + 重定向 + `< /dev/null` 三件套。
 5. ⚠️ 我们曾因反复长连接把 sshd 打到不可用(端口 TCP 超时、ping 通)⇒ **这就是"阻塞 sshd"的实际后果**;
    恢复只能等机器/sshd 缓解,所以**预防 = 短连接 + 后台化**。
+
+## ⛔⛔⛔ 【研究前置查证 · 强制门禁】2026-10-20
+
+> 触发原因:我在“Strata / SGLang / Lsglang / LvLLM”问题上**先凭记忆和外部仓库开讲**,
+> 而本仓 `dev-docs/EXPERT_RESIDENCY_REFERENCES.md`、`dev-docs/AB_LK_VS_XIAOTU.md`、
+> `dev-docs/STRATA_ENGINE_LESSONS.md`、`dev-docs/CPU_MOE_PLAN.md` 早有代码级调研和实测结论。
+> 用户不得不再次提醒。**这是流程缺陷,不是知识不足。**
+
+### 规则(任何“第三方项目 / 性能 / 架构 / 优化”判断或实验之前,必须按顺序)
+
+1. **先跑本地查证**(不得跳过):
+   `bash scripts/research_preflight.sh <关键词...>`
+   命中的 `dev-docs/**`、`docs/**` 必须**当场读至少 top 3 相关文件**;
+2. **再查会话历史**:`session_search` / `session_event_search` 查同一关键词;
+3. **只有本地零命中,才查外部**;外部结论必须给 URL,并标注“未在本机验证”;
+4. **回答必须列来源**:本地 `文件:行` / 外部 URL / 本次实测,三者分开写;
+5. **禁止**用“一般来说 / 我记得 / 上游应该”替代查证;
+6. **查证结果写回**相关 `dev-docs/*.md` 或 `EXPERIMENTS.md`,让下一次能搜到。
+
+### 违反时的自检句
+
+> 我是否在**没有引用本地文件或实测**的情况下,给了第三方/性能结论?
+> 是 ⇒ 立即停,回到第 1 步,不得用“补充说明”掩盖。
+
+### ⏳ 性能对比的时效规则(2026-10-20,因 lk_moe 旧数据误引而加)
+
+- 引用任何**跨实现/跨版本性能对比**,必须同时写 **日期 + 版本**;
+- 先查最新的 `dev-docs/report/tuning/AB_*.md`、`dev-docs/REPORT_*.md`、`docs/EXPERIMENTS.md` 末条;
+- 若来源早于当前 release,必须标 **“历史,已被 X 取代”**,不得当现状引用;
+- 典型: `dev-docs/AB_LK_VS_XIAOTU.md`(2026-09-16,v0.2 前)的 2.1–2.3× **已过期**;
+  当前看 `dev-docs/report/tuning/AB_LVLLM_VS_XIAOTU.md` 轮 7 / `REPORT_vllm-xtu-moe.md`。
+
+## 🔔 参考项目雷达待办（新会话/恢复会话的第一件事）
+
+> 2026-10-20 用户要求：cron 更新雷达后，进入项目会话（即使是新会话）要得到**一次性的提醒**，
+> 但不希望每次都重复。
+
+**动作（机械执行）**：
+
+1. 会话开始/恢复时，先检查 `dev-docs/RADAR_PENDING.md` 是否存在；
+2. **不存在** ⇒ 不提醒，正常干活；
+3. **存在** ⇒ 读它，然后向用户**只报告一次**：
+   > 参考外部资源库已更新（日期/摘要见 `dev-docs/RADAR_PENDING.md`），可以启动一次调研比对。
+4. **不要自动展开调研、不要自动改代码**；等用户明确说“开始调研”再读 `REFERENCE_RADAR.md` 的变更记录并执行；
+5. 报告后**立刻**把文件移动到：
+   `dev-docs/archive/RADAR_PENDING_<YYYYMMDD>.ack.md`
+   ⇒ 这样同一提醒不会在下一个会话重复；新一期 cron 更新会重新生成 `RADAR_PENDING.md`。
+6. 若 `RADAR_PENDING.md` 存在但用户明确说“先不调研” ⇒ 仍然归档，不要反复提醒。
+
+## 基准测试纪律（2026-10-23 用户明令）
+
+**以后再跑"基准测试"，都先去读 readme 中的口径，或者文档中最新的配置**；不得自拼对照组：
+
+1. `README.md` 的基准表（唯一权威数据）与脚注口径；
+2. `docs/BENCH_PROTOCOL.md`（尤其 §6 的 decode 稳态窗口定义）；
+3. `docs/TUNING_GUIDE.md` / `docs/MODEL_GUIDES.md` 的最新配置；
+4. 生产固化脚本 `scripts/bringup_prod_8070.sh`（唯一真源）。
+
+要求：
+- 启动命令必须**逐项抄自**上述来源，并在日志/报告中记录完整 env；
+- 对照组与实验组**只允许一个变量不同**；
+- 报告必须注明 prefill / decode 的测量窗口，禁止用 `wall − TTFT` 这类粗糙减法；
+- 违反以上任一条的测量结果一律标注"作废"，不得引用。

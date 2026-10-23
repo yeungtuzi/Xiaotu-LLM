@@ -1,0 +1,1036 @@
+# 辅助 GPU（侧车）开发计划 —— 定稿
+
+> 状态：**定稿（2026-10-22）**。本文替代此前所有「3GPU / 三卡」口头方案。
+> 术语：**辅助 GPU = 侧车（sidecar）**；本文不再把方案称作“3GPU/三卡”。
+> 适用范围：3×A100-PCIE-40GB（sm_80），主线模型 ds41f（DeepSeek-V4.1-Flash-1017）。
+> 证据等级标注：**[实测]** / **[读码]** / **[推算]**。
+
+---
+
+## 0. 一页结论
+
+1. **主线目标**：让“**放不下**”的模型（ds41f：专家 ≈289 GB）用一张**可选的辅助 GPU（侧车）**加速
+   **单流（C=1）decode**；GPU1/2 主服务零改动、可随时撤掉侧车。
+2. **形态**：decode-only 的**整专家侧车**。GPU0 放 ≈1,900 个整专家（≈36 GB），
+   **GPU1/2 不驻留专家（PIN=0）**，KV 优先保证 **512K × 4 并发**。
+3. **预期**：C=1 步时 **+10～14%**（打折后）[推算]；乐观 +16～18%。
+4. **成败线**：跨设备 partial 能否进 `FULL_DECODE_ONLY` CUDA 图 —— 先做**单层 spike**，一票否决。
+5. **qfn NVFP4 全驻留（GPU0+1+2）**：**旁支/顺手验证**，不是本框架的产品目标（见 §6）。
+
+---
+
+## 1. 定位：框架解决的是“比值 > 1”
+
+```
+模型专家总字节 / 可用侧车显存 > 1   ⇒ 本框架的战场（ds41f：≈289GB / 40GB ≈ 7.2）
+                              ≤ 1   ⇒ 退化情形（qfn：68GB / 120GB），PP+TP 原生即可
+```
+
+**因此：**
+
+- 「把 48 层全部放进 GPU」**不是**本项目追求的能力；
+- **全驻留**只是退化情形，可作为旁支验证，**不作主验收**；
+- CPU 不是要消灭的兜底，而是**一等执行器**：框架做的是**分配**，不是“全部上 GPU”。
+
+### 1.1 非目标（写死，避免反复讨论）
+
+- ⛔ prefill 加速（侧车不参与 prefill；prefill 冻结现状）；
+- ⛔ TP=3（每层切 3 份 + 每层 all-reduce）；
+- ⛔ 以“全驻留”为产品形态；
+- ⛔ 为侧车扩大上下文×并发；
+- ⛔ 运行期热插拔（只在**启动时**加入/撤除）；
+- ⛔ 改动 GPU1/2 的主服务结构（TP/PP/KV 预算）。
+
+---
+
+## 2. 事实基线
+
+### 2.1 硬件与链路 [实测]
+
+| 项 | 值 |
+|---|---|
+| GPU | 3×A100-PCIE-40GB，sm_80，无 NVLink |
+| GPU0 | PCIe 4.0 **x8 ≈12.6 GB/s**（GPU1/2 为 x16） |
+| P2P | `can_device_access_peer` **0↔1、0↔2、1↔2 全部 true** |
+| 16 KB 同步拷贝延迟 | **13–23 µs**（GPU0↔1/2） |
+| GPU0 H2D（pinned） | 12.4 GB/s |
+
+⇒ handoff λ ≈ **15–25 µs/次**；真实每层 2 次拷贝 + kernel，估 **40–60 µs/层**。
+
+### 2.2 ds41f 基线 [实测/文档]
+
+| 项 | 值 |
+|---|---|
+| 结构 | 40 层 / 384 routed experts / top-6 / hidden 5120 / moe I 2304 |
+| 精度 | FP8 稠密 + MXFP4 专家 |
+| 整专家 | 18.81 MB ⇒ **整层 7.22 GB**；每 rank 半专家 9.40 MB |
+| C=1/C=2/C=4 decode | **42.6 / 69.7 / 72.0 tok/s**；步时 **82.3 / 116.1 / 190.1 ms** |
+| 15K prefill | 1,190 / 1,197 / 1,206 tok/s（冻结，不优化） |
+| decode 分解 | CPU 计算 ≈36%（≈29.6 ms/step）、GPU+spec+sync 62%、拷贝 2% |
+
+### 2.3 KV 预算（512K × 4）[实测]
+
+- 现池（util 0.70、PIN=0）：**3.43 GiB**；
+- 默认 `fp8_ds_mla`：≈**1.35 KB/token**；
+- 4×512K = **2.10 M token ≈ 2.84 GB**；
+- ⇒ **余 ≈0.84 GB（23%）**，满足“4 并发 + 防 OOM 余量”；
+- ⛔ **GPU1/2 的 700 槽与 512K 不可共存**：`2.84GB(KV)+700×9.4MB=9.4GB > 3.43GiB` ⇒ 必 OOM。
+
+### 2.4 路由覆盖（**临时值**，仅作方向判断）[实测·小样本]
+
+条件：40 层、约 3 万条 decode 记录、12 个会话、**SPEC=0**（非基线）、整专家槽。
+
+| 槽数 | 显存 | 路由覆盖（LRU） |
+|---|---|---|
+| 700 | 12.3 GB | 11.8% |
+| 1,200 | 21.0 GB | 43.6% |
+| **≈1,900** | **36 GB** | **≈55%（插值）** |
+| 2,400 | 42.1 GB | 64.1% |
+
+⚠️ 这是 **in-sample 上界**；生产表必须用 **DSpark k=5 + 更多会话**重采，并以 LOO 为准。
+
+---
+
+## 3. 设计
+
+### 3.1 形态与不变量
+
+```
+GPU1/2：完整主服务（TP=2、CPU MoE、GPU prefill、DSpark 全部照旧）；PIN=0
+GPU0  ：可选侧车，只服务 decode；放 ≈1,900 个整专家（≈36 GB），留 ≈4 GB
+```
+
+**不变量：**
+
+1. 同一专家**不在两处**工作（GPU0 一份，主机 checkpoint 作后备）；
+2. 侧车**不参与 prefill**；
+3. 启动时二选一：`XTU_SIDECAR=gpu0` 才加载侧车；**不设 / `none` / `0` / `off` ⇒ 跑今天验证过的全路径**；
+4. **运行期故障 = fail-closed**：侧车该请求显式失败，绝不静默降级（主服务已“不算”这些专家）。
+
+### 3.2 逐层数据面
+
+```
+层开始 ──► hidden/ids/weights 小拷贝 ──► GPU0 算命中专家的 partial
+            （与 GPU1/2 的 CPU MoE 并行）
+层结束 ◄── partial 回对应 rank ◄────────┘
+        合并（只加一次）→ 正常 all-reduce / 残差
+```
+
+- **add-once 不变式**：GPU0 的整专家贡献只能加一次（rank0 加、rank1 加零），否则 TP all-reduce 会翻倍；
+- **不许两头等**：GPU0 的活必须在层开始就 issue，合并放层末；55% 覆盖下每层 CPU 剩余 ≈0.33 ms，
+  GPU0 路径 ≈0.05–0.08 ms ⇒ 天然被盖住 [推算]；
+- decode 的拷贝是 KB 级，**延迟主导**（λ≈20 µs），不是带宽主导。
+
+### 3.3 表与分配
+
+- **一张全局热度表**（离线生成，运行期不换入换出）；
+- GPU0 取 **top-1,900**；GPU1/2 取 0；
+- 同一专家不重复；
+- 表是**启动参数**；换表 = 重启。
+
+### 3.4 图集成（最大风险，先验证）
+
+decode 走 `FULL_DECODE_ONLY` 图，而 CUDA graph 是**单设备**的。三条路：
+
+| 方案 | 代价 | 风险 |
+|---|---|---|
+| A. GPU0 独立图 + event/doorbell 同步 | 需要跨设备同步 | 易触发 `cudaErrorStreamCaptureUnjoined` |
+| B. GPU0 侧 eager 逐层跑 | 每层多 10–20 µs launch | 40 层 ≈0.4–0.8 ms，破坏单图收益 |
+| C. GPU0 常驻服务核（polling queue） | 工程最重 | 最干净，异构流水线标准做法 |
+
+⇒ **单层 spike 先回答“A 是否可行”；不可行再评估 B/C。**
+
+### 3.5 内存与“不重复放置”
+
+- 主机保留**完整权重**（311 GiB/rank），这是“随时撤除”的前提；
+- GPU0 的专家副本按**后备/缓存**语义记账（不是第二份工作副本）；
+- 审计时按此分类，不机械判违规。
+
+---
+
+## 4. 目标与验收
+
+### 4.1 第一目标
+
+**C=1 decode 步时**：`XTU_SIDECAR=gpu0` 相对不设（none）**≥ +5%（最低门槛），目标 +10～14%**。
+
+### 4.2 同时必须满足
+
+| 项 | 判据 |
+|---|---|
+| C=4 | 不退化（允许 ≤2% 噪声） |
+| prefill | 不退化（侧车不参与，应完全不变） |
+| 正确性 | on/off 逐 token greedy 一致；工具调用标记/参数解析一致 |
+| 显存 | GPU0 <40 GB 且留 ≥3 GB；GPU1/2 KV ≥ 4×512K + 余量 |
+| 可撤除 | `off` 回到今天验证过的配置，零回归 |
+| 故障 | 侧车故障 ⇒ 该请求显式失败；主服务不崩 |
+| 稳定性 | 24 h 无 OOM/泄漏 |
+
+### 4.3 度量纪律
+
+- 预热：同一实例连发 3 次、丢第 1 次；
+- decode 必须带 `deg`；C=1 报步时中位与 tok/s；
+- 结论标注证据等级（实测/读码/推算）。
+
+---
+
+## 5. 开发计划
+
+### P0 离线准备（1–2 天，不占 GPU）
+
+| 任务 | 交付 | 门禁 |
+|---|---|---|
+| P0.1 生产路由采集（**DSpark k=5**、PIN=0、15K、MBE=8192、GPU prefill on） | 原始 dump + 覆盖率曲线 | 层数=40；无 draft 层污染 |
+| P0.2 LOO / split-half | 诚实的覆盖率（非 in-sample） | ≥35%，否则重估方案 |
+| P0.3 表生成（1,200 / 1,900 两档） | XTUP 表 + md5 | 格式校验通过 |
+| P0.4 预算/OOM 计算器 | 每卡内存账 | GPU0 ≤36 GB；KV ≥4×512K |
+| P0.5 spike 设计 + 计数口径 | 一页设计 | 通过评审 |
+
+### P1 单层 spike（1 天 + 1 个窗口）
+
+| 任务 | 交付 | 门禁 |
+|---|---|---|
+| P1.1 单层、64 专家、eager | 关键路径增量（µs/层） | 增量 < 命中节省 |
+| P1.2 同配置开图（A/B/C 三选一） | 捕获是否成功 + 失败模式 | **图方案可行**；否则止损 |
+| P1.3 fail-closed 路径 | 侧车异常时请求失败、主服务存活 | 通过 |
+
+**P1 门禁失败 ⇒ 停止，不进入 P2**（如实出负结论）。
+
+### P2 原型（1–1.5 周 + 2–3 个窗口）
+
+| 任务 | 交付 | 门禁 |
+|---|---|---|
+| P2.1 4 层 → 全表（1,200 槽） | 可跑实例 | 正确性通过 |
+| P2.2 1,900 槽 | C=1 步时 A/B | ≥+5%，目标 +10% |
+| P2.3 C=4 / prefill 不退化 | 对照表 | ≤2% 噪声 |
+| P2.4 add-once / 图安全复验 | 不变式检查 | 无翻倍、无捕获失效 |
+
+### P3 产品化（3–5 天）
+
+| 任务 | 交付 |
+|---|---|
+| P3.1 启动开关（`XTU_SIDECAR=gpu0`）+ 配置校验 | 一键切换 |
+| P3.2 可观测性（命中率、handoff µs、侧车失败计数） | 日志/指标 |
+| P3.3 24 h 稳定性 + 故障注入 | 报告 |
+| P3.4 回滚手册 + 文档 | RUNBOOK 增补 |
+
+### P4 qfn NVFP4 全驻留（**旁支**，2–3 周，独立窗口）
+
+见 §6；**不占 P1–P3 的窗口**，失败不影响主线。
+
+---
+
+## 6. 旁支：qfn NVFP4 全驻留（GPU0+1+2，非项目主要方向）
+
+**定位**：这是“容量 ≥ 模型”的退化情形，PP+TP 原生也能做；本项目只**顺手**验证，
+用于复用 **NVFP4/Marlin 数据面**与**跨卡 handoff**，**不作产品目标、不作主验收**。
+
+- 模型：`lovedheart/Qwen3.8-Flash-Next-NVFP4-W4A16-ATTN-FP8-MTP-NVFP4`；
+- 48 层 / 512 experts / top-10；GPU 侧 **≈77.7 GB**（PLE 51.2 GB 留 host）；
+- 分区：`16/16/16` + **fp8 KV** + 262K ⇒ 每卡 **32.35 GB，余 +7.65 GB** [推算]；
+- 量化 dispatch：**156×`FP8_PB_WO` + 49×`W4A16_NVFP4`**（含 1 个 MTP）[实测·config]；
+- ⛔ 已知 blocker：
+  1. 156 个 FP8 投影用 **rank-2 `weight_scale_inv`**，主线只注册 `weight_scale`（issue #54126 open）；
+  2. 必须验证 `prepare_moe_fp4_layer_for_marlin` 覆盖 **g16 + E4M3 block scale**；
+     stock fallback 会**静默输出乱码**。
+
+**顺序**：等 ds41f P2 结束、有独立窗口再做；先单层 Marlin 对拍，再 2 卡，再 16/16/16。
+
+---
+
+## 7. 风险与止损
+
+| 风险 | 影响 | 止损 |
+|---|---|---|
+| 跨设备 partial 进不了图 | 方案不成立 | P1 一票否决；eager 代价 >5% 也停 |
+| LOO 覆盖 <35% | 收益不足 | 重估槽数/放弃 |
+| CPU 固定开销不省 | 实际收益低于覆盖 | 按 0.6–0.8 折；以 A/B 为准 |
+| handoff 成为关键路径 | 两头等 | 层内并行；λ>100µs 时改集中形态 |
+| GPU0 OOM | 服务不可用 | 槽数降到 1,200；留 4 GB |
+| 侧车故障静默降级 | 输出错 | fail-closed；启动开关 fail-open |
+| 重复放置 | 违反资源规则 | GPU1/2 PIN=0；全局表去重 |
+
+---
+
+## 8. 参数速查
+
+```
+GPU0 侧车：slots=1900（整专家 18.81MB），约 36 GB，留 4 GB
+GPU1/2  ：PIN=0；TP=2；MBT=8192；MAXLEN=524288；util=0.70
+KV      ：fp8_ds_mla；4×512K ≈2.84 GB；池 3.43 GiB；余 ≈0.84 GB
+采集    ：DSpark k=5；15K v2；GPU prefill on；PIN=0（路由与 PIN 无关）
+基线    ：C=1 42.6 tok/s / 82.3 ms；prefill 1,190 tok/s
+预期    ：C=1 +10～14%（打折后）；C=4 不退化
+```
+
+---
+
+*定稿：2026-10-22。实现细节与实验记录见 `dev-docs/`；本文件只保留方向、判据与计划。*
+
+---
+
+## 9. 2026-10-23 P1 spike 结果（跨设备图集成）
+
+### 9.1 实测（三卡空闲，torch 2.x / CUDA 12）
+
+| 方案 | 结果 |
+|---|---|
+| `torch.Tensor.copy_` 跨设备进 capture | ⛔ **FAIL** `cudaErrorStreamCaptureInvalidated` |
+| **raw `cudaMemcpyAsync`（kind=Default）进 capture** | ✅ **OK**，1→0 / 0→1 双向、replay 后数据正确 |
+| **GPU0 的 torch kernel 放进 GPU1 的图** | ⛔ **capture 返回 OK，但 replay 后侧车输出恒 0（静默不执行）** |
+| GPU0 单独一张图（只含本设备 kernel） | ✅ OK（约 17 µs/replay） |
+| 同一进程先后在两张卡上抓图 | ⚠️ 后抓的那张可能**空图**（PyTorch 限制）|
+| eager 两次跨设备拷贝 + 主图 add | ≈**53 µs/层** |
+| 三图 + event 串联（能抓成功时） | ≈31–41 µs/层，但抓图不稳定 |
+
+### 9.2 结论（写死）
+
+1. **单图里放侧车 kernel 绝对禁止** —— 它不报错、只产出 0；这是最危险的失败模式。
+2. 跨设备**拷贝**可以进图（raw API），跨设备**计算**不可以。
+3. ⇒ 生产形态只有两条：
+   - **O1（原型先用）**：主图只做本设备；侧车 kernel + 拷贝 **eager**，事件同步；≈50 µs/层（40 层 ≈2 ms，约 +2.4% 开销）。
+   - **O2（目标形态）**：**侧车独立进程/常驻核 + peer-memory doorbell**；主图内只有**本设备 kernel**（写 doorbell / 自旋等 ack / 读 partial），
+     全部是可捕获的同设备节点 ⇒ 既能进图，又没有跨设备拷贝 API。
+4. 同一进程多设备抓图的空图问题 ⇒ O2 用**独立进程**规避，而不是依赖 PyTorch 多图。
+
+### 9.3 追加目标（用户 2026-10-23）
+
+- **两个模型的最终基准数据必须留档**（ds41f + qfn NVFP4）；
+- 若不满足比特一致/误差超限，用 **needle（大海捞针）等语义测试**证明语义一致，也算合格；
+- 验收记录写入 `docs/` + `dev-docs/`，附启动参数、表 md5、原始日志路径。
+
+---
+
+## 10. 2026-10-23 O3 定稿：侧车挂在**同步 host-function** 里，不做跨设备图
+
+### 10.1 为什么改
+
+`binding.cpp` 的生产默认是 **`XIAOTU_MOE_ASYNC=0`（同步 host-function）**：
+每层 CPU MoE 跑在 `cudaLaunchHostFunc` 回调里，**本来就把整条流阻塞 0.5–0.7 ms**。
+⇒ 侧车只要在这段窗口内**并行**完成，关键路径几乎不增加，而且：
+- 不需要跨设备 graph 节点；
+- 不需要常驻核 / doorbell；
+- 不需要改 `FULL_DECODE_ONLY` 的捕获结构。
+
+### 10.2 微基准（三卡空闲，2026-10-23）
+
+| 项 | 实测 |
+|---|---|
+| 纯 CPU（模拟每层 CPU MoE，0.55 ms） | 0.604 ms/层 |
+| CPU + 侧车 worker（GPU0 matmul + H2D/D2H） | 0.621 ms/层 |
+| 侧车 worker 自身 | **71 µs/层** |
+| **关键路径增量** | **≈17 µs/层**（40 层 ≈0.7 ms/step，约 0.8%） |
+
+⇒ 侧车被 CPU MoE **完全遮住**；增量只是线程唤醒 + 合并。
+
+### 10.3 实现形态
+
+```
+graph replay
+  └─ host-function（每层，已存在）
+       ├─ 读 pinned ids/weights，查本层命中位图
+       ├─ 把命中专家的 ids/weights 拷到侧车请求区（pinned）
+       ├─ 置 request 原子标志
+       ├─ run_moe_and_ep(...)          ← CPU 引擎算非命中专家（命中项权重置 0 跳过）
+       ├─ 等 done 原子标志
+       └─ out[i] += sidecar_out[i]     ← 纯 host 合并，再走原有 H2D 回写
+```
+
+- 侧车 worker：独立线程 + GPU0 stream，持有 GPU0 的 `LayerPool`；
+- **host-function 内不调用任何 CUDA API**（只碰原子/内存），CUDA 调用都在 worker 线程；
+- 命中专家在 CPU 侧用 `weight=0` 跳过（B1052 已有“跳过 weight==0 pair”的机制）；
+- 表静态、启动时加载；`XTU_SIDECAR=gpu0` 才启用；**不设 / `none` / `0` / `off` ⇒ 标准路径**（零变化）。
+
+### 10.4 验收（不变）
+
+C=1 步时 ≥+5%（目标 +10～14%）；C=4/prefill 不退化；on/off greedy 一致；故障时该请求显式失败。
+
+---
+
+## 11. 2026-10-23 P0 实测更新（替代 §2.4 的临时值）
+
+DSpark k=5、8 会话、40,880 条 decode、40 层；**split-half held-out**（前 60% 建表，后 40% 评估）：
+
+| 槽数 | 显存 | held-out 覆盖 | 每层槽 min/med/max |
+|---|---|---|---|
+| 700 | 13.2 GB | **38.8%** | 12/17/22 |
+| 1,200 | 22.6 GB | **49.7%** | 18/30/38 |
+| **1,900** | **35.7 GB** | **62.6%**（发射表实测） | 33/49/61 |
+
+- ⭐ **静态表远好于动态 LRU**：700 槽 held-out 38.8% vs LRU 10.7% ⇒ 侧车必须用**静态表**。
+- 表：`expert_pin_sidecar_{1200,1900}.bin`，md5 `7d546ded…` / `e0ef80a3…`；
+  已按 `load_pin_table` 校验：XTUP v1、40 层、1,900 条、专家 id 0–383、无越界。
+
+### 11.1 收益重算（62.6%）
+
+| 项 | 值 |
+|---|---|
+| 基线 C=1 | 82.3 ms / 42.6 tok/s |
+| CPU MoE 每层 | 0.74 ms（其中 fwd ≈0.55 ms） |
+| 命中节省 | 0.626 × 0.55 × 40 ≈ **13.8 ms** |
+| 协议开销 | 40 × 20 µs ≈ **0.8 ms** |
+| 净 | **≈13.0 ms ⇒ +18.8%**（乐观） |
+| 打折 0.7–0.85 | **+13～16%** |
+
+⇒ 计划目标仍写 **+10～14%**（保守），实测若达 +15% 以上属超预期。
+
+---
+
+## 12. 2026-10-23 修正：qfn **也走辅助 GPU**，不是独立的 PP+TP 路径
+
+用户明确：**qfn 也用这种辅助卡的方式**；虽然它是全驻留，但 **GPU0 必须可撤除**，
+撤除后回退到 **部分层/部分专家驻留**（GPU1/2 上留一部分，其余 CPU）。
+
+⇒ 统一成**一套机制、两种表**：
+
+| 模型 | 表 | GPU0 在 | GPU0 撤除后 |
+|---|---|---|---|
+| ds41f | 部分驻留（≈1,900 整专家） | 侧车加速 | 纯 CPU 路径（今天的行为） |
+| qfn | **全驻留**（GPU1/2 + GPU0 覆盖全部专家） | 侧车补全 | **GPU1/2 部分驻留 + CPU 兜底**（同一套侧车协议，表换成“只含 GPU1/2 可容纳的专家”） |
+
+- **不再把 qfn 当成“PP+TP 原生、与本框架无关”的退化情形**；
+- qfn 全驻留 = **同一套 host-function 侧车 + 表**，只是表覆盖 100%；
+- GPU0 撤除 = 换表重启（不是改代码）；
+- 因此 qfn 是这套机制的**强验证**：同一数据面既跑“部分驻留”，也跑“全驻留”。
+
+### 12.1 对实现的含义
+
+1. 表的语义统一为「**(layer, expert) → 驻留设备**」；GPU0/GPU1/2 都只是“执行器”。
+2. host-function 侧车协议不变：命中项权重置 0、worker 并行算、host 合并；
+   worker 可以跑在 GPU0（侧车），也可以跑在 GPU1/2（本卡池）。
+3. qfn 的回退表在**启动时**生成/选择：GPU0 不在 ⇒ 只保留 GPU1/2 放得下的专家集合。
+4. 验收：qfn 全驻留与撤除 GPU0 后的部分驻留，**同一请求 greedy 一致**（或 needle 语义一致）。
+
+### 12.2 qfn 的部分驻留预算（推算，待实测）
+
+- 专家总字节 ≈68 GB；GPU1/2 在 262K + fp8 KV 下每卡可用于专家的余量约 18–20 GB
+  ⇒ 两卡 ≈36–40 GB ⇒ 覆盖约 **55–60%** 专家，其余 CPU；
+- GPU0 加入 ⇒ 100%；
+- 具体数字以 P4 实测为准（不写死）。
+
+---
+
+## 13. 2026-10-23 qfn NVFP4 下载完成 + 审计结论
+
+- 快照 **129.0 GB**（索引 total_size 128.72 GB），**208/208 分片**，config 已落盘。
+- `quantized_layers` **205**：**156 × `FP8_PB_WO`** + **49 × `W4A16_NVFP4`（group 16）**；
+  `quant_method: modelopt`，`quant_algo: MIXED_PRECISION`。
+- 索引侧 **156 个 `weight_scale_inv`**，与 156 个 FP8 投影精确对应。
+- 已知 blocker（P4 必须先解）：
+  1. 156 个 FP8 投影用 **rank-2 `weight_scale_inv`**，主线只注册 `weight_scale`（issue #54126）；
+  2. 49 个 NVFP4 层需 `prepare_moe_fp4_layer_for_marlin` 覆盖 **g16 + E4M3**，
+     stock fallback 会**静默乱码**。
+- 详细审计：`dev-docs/QFN_NVFP4_AUDIT_2026-10-23.md`。
+
+### 13.1 qfn 的两种表（统一机制）
+
+- **全驻留表**：GPU1/2 + GPU0 覆盖全部专家；GPU0 撤除 ⇒ 换 **部分驻留表** 重启；
+- 部分驻留表：只保留 GPU1/2 放得下的专家（约 55–60%），其余 CPU；
+- 两种表共用同一 host-function 侧车协议与 worker。
+
+### 13.2 当前代码状态（可回滚）
+
+| 提交 | 内容 | 默认行为 |
+|---|---|---|
+| `47a6dd8` | 计划 + 预算器 + 协议头 | 无变化 |
+| `ab2ce8d` | binding 接线（`cpu_decode(layer=-1)` + host_begin/end） | 无变化 |
+| `c7ac96e` | Python worker（`XTU_SIDECAR=gpu0`） | 无变化 |
+
+- 远端已用 `ONLY=avx512_bf16_vbmi` 重建 `.so`（2.61 MB，15:58），API 已验证；
+- 旧 `.so` 备份：`/home/user/lvllm/tmp/sidecar_backup/so_before.tgz`；
+- **尚未做**：真实 GPU0 compute（pool + kernel）、单层 on/off、C=1 A/B。
+
+---
+
+## 14. 2026-10-23 P2 实机冒烟：两个硬 blocker（C=1 结论反转）
+
+在 ds41f TP=1（GPU1 主 + GPU0 侧车，200 槽表，128K）上实跑，得到两个必须先解决的 blocker：
+
+### 14.1 GPU0 池装载失败（loader 不是 device-agnostic）
+
+- `build_layer_pool(..., device="cuda:0")` 只成功了前 ~10 层（GPU0 ≈919 MiB），
+  后续层报：
+  `ValueError: Pointer argument cannot be accessed from Triton (cpu tensor?)`
+- 根因：`gpu_prefill.kmajor_from_engine_shards_noraw` 的装配路径假设“目标设备 = 当前设备”，
+  在非当前设备（物理 GPU0 / logical 1）上把 CPU 分片指针交给 Triton ⇒ 失败。
+- ⇒ 需要：loader 显式按 `device` 建流/拷入，或把侧车池放到**独立进程**里建。
+
+### 14.2 MXFP4 池内核在 C=1 太慢（决定性）
+
+| 项 | 实测 |
+|---|---|
+| `gpu_prefill.gpu_moe_layer`（MXFP4，qlen=1） | **1.07 ms/层** |
+| 同上 qlen=4 | 1.06 ms/层（固定开销主导） |
+| CPU MoE 每层 | ≈0.55 ms（fwd） |
+
+⇒ 侧车**关键路径 1.07ms > 被替代的 CPU 0.55ms** ⇒ 即使完全重叠，
+每层还要多等 ≈0.5ms ⇒ 40 层 ≈ +20ms，而命中只省 ≈13.8ms ⇒ **C=1 净负**。
+（这也解释了 B1058 为什么 ds41f PIN 在 C=1 净负、C≥4 才转正：固定开销被摊薄。）
+
+### 14.3 结论与下一步
+
+- **P2 暂停**：当前 MXFP4 池内核不能支撑 C=1 目标；
+- 必须先做**decode 专用 MXFP4 内核**（目标 <0.3ms/层，固定开销主导 ⇒ 需持久化/批内合并），
+  或把侧车限定在 C≥4（但那不是本项目的主目标）；
+- 另需修 **GPU0 池 loader**（14.1）；
+- 已修的坑：`CUDA_VISIBLE_DEVICES` 物理/逻辑换算（`gpu0` 必须解析物理 0）、
+  首次调用 1.9s 需预热、pinned 缓冲需在 `inference_mode(False)` 下分配。
+
+⇒ **P0/P1 结论仍有效**；P2 的“+10~14%”在当前内核下**不成立**，等新内核再评估。
+
+---
+
+## 15. 2026-10-23 内核量化：C=1 的瓶颈是 GPU kernel，不是侧车协议
+
+### 15.1 实测（GPU0，随机 plane，S=8，qlen=1/4）
+
+| 内核 | q1 | q4 |
+|---|---|---|
+| MXFP4 `gpu_prefill.gpu_moe_layer`（默认 BM=64/BN=64） | 1.07 ms | 1.06 ms |
+| 同上，**BM=8/BN=64**（扫描最优） | **0.83 ms** | 2.24 ms |
+| FP8 `decode_moe_fp8` | 0.836 ms | 2.22 ms |
+| CPU MoE 每层 fwd | **0.55 ms** | — |
+
+- 块大小扫描最优也只到 **0.83ms**，仍 > CPU 0.55ms；
+- 每层读 6 专家 ×35.4MB ≈ **212MB**；0.83ms ⇒ 有效带宽 ≈**255GB/s**，
+  而 A100 HBM 峰值 1.5TB/s ⇒ 理论上限 ≈**0.14ms**，还有 ~6× 空间；
+- 结论：**现有 prefill 型分组 GEMM 在 T=1 严重低效**（按 BM=64 铺行 + 小 batch），
+  不是侧车协议的问题。
+
+### 15.2 对 C=1 目标的影响
+
+- 侧车每层关键路径 ≥0.83ms，而被替代的 CPU 只有 0.55ms ⇒ **C=1 净负**；
+- 要转正，需要 **decode 专用 MXFP4 内核 ≤0.3ms/层**（相对 0.83ms 再快 ~2.8×，
+  相对理论 0.14ms 仍有 2× 余量）；
+- 仅调参（BM/BN）不够；需要 GEMV 型、按 expert-pair 调度、复用权重常驻的新内核。
+
+### 15.3 新闸门（P2）
+
+| 条件 | 判据 |
+|---|---|
+| 新内核单层 | ≤0.30 ms/层（q1，6 专家，含 H2D/D2H）|
+| 收益 | 0.55−0.30 = 0.25ms/层 ⇒ 40 层 ≈10ms ⇒ **+12%**（乐观）|
+| 若只到 0.5ms | 收益 ≈0.05ms/层 ⇒ +2%，不值得 |
+
+⇒ **P2 的前置条件已改为“先有 decode MXFP4 内核”**；在此之前不再跑 A/B（避免浪费机时）。
+
+### 15.4 调参最优（仍不够）
+
+在 `gpu_moe_layer` 上调 `KERNEL=split / BM / BN / WARPS / STAGES` 全扫描：
+
+| 配置 | q1 |
+|---|---|
+| 默认 base BM=64/BN=64 | 1.07 ms |
+| base BM=8/BN=64 | 0.83 ms |
+| **split BM=16/BN=32/NW=4** | **0.642 ms**（最优）|
+| split BM=8/BN=32/NW=4 | 0.651 ms |
+| CPU fwd | **0.55 ms** |
+
+⇒ 调参把 1.07 → **0.642ms**，但仍 > CPU 0.55ms；**调参无法跨过闸门**。
+⇒ 必须写 decode 专用内核（GEMV 型 / 权重常驻 / 按 expert-pair 调度），
+目标 ≤0.30ms/层；现有内核不再投入调参。
+
+### 15.5 内核剖析：固定 ~0.43ms 是**并行度不足**，不是带宽打满
+
+固定 S（槽数）、只让 1 个 token 命中，扫 S：
+
+| S（槽/专家数） | q1 |
+|---|---|
+| 1 | **0.4275 ms** |
+| 2 | 0.4968 ms |
+| 4 | 0.5878 ms |
+| 8 | 0.6548 ms |
+| 16 | 0.6417 ms |
+
+⇒ **固定 ≈0.43ms + 每多一个专家 ≈0.04ms**；6 个命中 ≈0.63ms，与实测一致。
+
+- S=1 只读 17.7MB（gate/up 11.8 + down 5.9）却要 0.43ms ⇒ **有效带宽 ≈41GB/s**；
+- 原因：grid 只有 `(S, 2I/BN)` = 1×72（gate/up）与 1×80（down），
+  **72–80 个 block** 各跑一个 K=5120 的长循环 ⇒ **延迟受限**，不是 HBM 带宽受限；
+- ⇒ 新内核的关键不是“更省字节”，而是 **K-split（把 K 维切给多个 block，atomic/两次归约）**，
+  把并行度从 ~72 提到 ~512–1024；目标 ≤0.30ms/层。
+
+### 15.6 结论
+
+- 现有内核 = 固定 0.43ms（并行度）+ 0.04ms/专家；调参到 0.64ms 已是极限；
+- 新内核方案：**K-split GEMV**（gate/up 与 down 都切 K），预计 0.15–0.25ms/层；
+- 在此之前 P2 不跑 A/B。
+
+---
+
+## 16. 2026-10-23 K-split 原型：单专家 0.18ms，但 6 专家仍 0.60ms
+
+按 §15.6 写了 Triton K-split 原型（gate/up + act + down，全部 K-split，
+去 atomic、scale 按 group 广播、e2m1 用 bitcast 快速反量化）。
+脚本留档：`dev-docs/ksplit_prototype.py`。
+
+### 16.1 实测（1 token，S 个专家，三轮优化后）
+
+| S | 全层（gate/up+act+down） |
+|---|---|
+| 1 | **0.179 ms** |
+| 2 | 0.305 ms |
+| 4 | 0.554 ms |
+| **6** | **0.597 ms** |
+| 8 | 0.619 ms |
+
+- 6 专家读 6×17.7MB ≈106MB，0.6ms ⇒ 有效带宽 ≈**177GB/s**（仍远低于 1.5TB/s）；
+- 三轮优化（去 atomic、scale 广播、bitcast 反量化）只从 0.61 → 0.60ms；
+- ⇒ **K-split 提高了单专家并行度（0.43→0.18ms），但多专家仍线性叠加**，
+  瓶颈是每专家的权重读取效率，不是并行度本身。
+
+### 16.2 结论
+
+- 现有 Triton 路线在 6 专家下 **0.60ms > CPU 0.55ms**，C=1 闸门**仍未通过**；
+- 要跨过，需要**手写 CUDA 内核**：16B 向量化加载、FP4→BF16 在寄存器内完成、
+  按 expert-pair 的 GEMV/小 GEMM、必要时用 tensor core（A100 无原生 FP4，需模拟）；
+- 这是 3–5 天工程；在此之前 P2 不跑 A/B。
+
+---
+
+## 17. 2026-10-23 访存诊断与 N-major GEMV：带宽 1.19TB/s，瓶颈转为反量化
+
+### 17.1 诊断：旧 tile 布局 vs 线性读
+
+同样 106MB（6 专家权重）：
+
+| 读法 | 带宽 |
+|---|---|
+| 旧 `[K,N]` tile `[BK,BN]` | **221 GB/s** |
+| 纯线性读（BLOCK=4096） | **815 GB/s** |
+| **N-major `[N,K]` 行连续（BN=4）** | **1191 GB/s** |
+
+⇒ 旧布局的 2D strided tile 是带宽杀手；改成 **N-major、每 program 读 BN 个输出列的连续 K**，
+访存可到 ~1.2TB/s。
+
+### 17.2 N-major GEMV（含反量化）实测
+
+脚本：`dev-docs/ksplit_rows_prototype.py`（w13[S,N2,H/2]、w2[S,H,I/2]，K 连续）。
+
+| S | 全层 |
+|---|---|
+| 1 | 0.115 ms |
+| 2 | 0.215 ms |
+| 4 | 0.388 ms |
+| **6** | **0.562 ms** |
+| 8 | 0.499 ms |
+
+- 6 专家 0.562ms，仍 ≈ CPU 0.55ms；**但没有跨过**；
+- 纯读只要 0.089ms ⇒ **0.56ms 里约 0.47ms 是反量化/乘加的计算**，不是访存；
+- ⇒ 下一步不是改布局，而是**把 FP4→BF16 反量化做得更快**（CUDA C++：字节查表 + half2/bf16x2、
+  或 tensor-core 模拟），Triton 这条已接近上限。
+
+### 17.3 结论
+
+- 访存问题已解决（1.19TB/s）；
+- 瓶颈是**每元素反量化的 ALU 成本**；Triton 6 专家 0.56ms，CUDA 手写有望 0.25–0.35ms；
+- C=1 闸门**仍未通过**，但距离从 0.64 → 0.56，且明确了下一步优化点。
+
+### 17.4 反量化方案对比（Triton 天花板）
+
+| 方案 | S=6 |
+|---|---|
+| bitcast 算术（`(ex+126)<<23`） | **0.562 ms** |
+| 全局 16-entry gather LUT | 1.017 ms ✗ |
+| 16 路 `tl.where` LUT（更早） | 更慢 ✗ |
+
+⇒ Triton 下 bitcast 已是最优；0.56ms 就是这条路的天花板。
+再往下只能 **CUDA C++**（half2/bf16x2 + 共享内存查表 + 向量化），
+预计 0.25–0.35ms；这是否值得投入 3–5 天，需要用户拍板。
+
+---
+
+## 18. 2026-10-23 CUDA down GEMV 可行性：ALU 反量化 0.275ms，仍不够
+
+按上一轮建议写了最小 CUDA 内核（只做 down，N-major，warp-per-row，uint4 向量加载，
+shared x，6 专家）。脚本：`dev-docs/cuda_down_prototype.py`。
+
+### 18.1 迭代记录（6 专家 down）
+
+| 版本 | 耗时 | 说明 |
+|---|---|---|
+| block-per-row + `__constant__` LUT | 0.80 ms | 常量内存随机索引被串行化 |
+| warp-per-row + constant LUT | 0.77–0.85 ms | 同上 |
+| **ALU 反量化（bitcast，去常量表）** | **0.275 ms** | 正确性 err 0.004 |
+
+- 0.275ms / 35MB ⇒ 129GB/s，仍远低于 1.2TB/s；
+- 说明瓶颈在**每元素 ALU/延迟**，不是带宽；shared x 的加载也占一部分。
+
+### 18.2 对比
+
+- Triton 全层（gate/up+act+down，6 专家）**0.562ms**；
+- CUDA 仅 down 就 **0.275ms**，按 1/3 估算全层 ~0.7–0.8ms，**并未优于 Triton**；
+- ⇒ “CUDA 一定更快”的假设**未被证实**；要真正跨过 0.30ms，需要更系统的内核工程
+  （多行/线程复用、异步流水、FP4 tensor-core 模拟），不是一晚上的事。
+
+### 18.3 结论（写死）
+
+- 访存布局问题已解决；反量化在 Triton 与最小 CUDA 上都是瓶颈；
+- 当前最好全层 **0.56ms**，CPU **0.55ms**，**C=1 闸门未通过**；
+- 继续投入需要专门的 kernel 工程（3–5 天、独立任务），**不应继续在夜间会话里试探**。
+
+---
+
+## 19. 2026-10-23 **重要更正**：C=1 并非净负——CPU 与 GPU 算的是**不相交**的专家
+
+### 19.1 我之前的错误
+
+§15–§18 把“GPU 全量 0.56ms”与“CPU 全量 0.55ms”直接相比，得出“侧车净负”。
+但侧车只算**命中**专家，CPU 只算**未命中**专家，两者**并行**且在**不同的专家**上：
+
+```
+每层耗时 = max( GPU(命中) , CPU(未命中) ) + 协议开销
+```
+
+### 19.2 用实测 S 曲线重算
+
+N-major Triton 实测（1 token）：`GPU(S) ≈ 0.09·S + 0.02` ms；CPU 全量 6 专家 ≈0.55ms
+⇒ CPU(未命中) ≈ 0.55·(1−c)，c 为命中率。
+
+| 命中率 c | 命中数 S | GPU(命中) | CPU(未命中) | max | 每层节省 |
+|---|---|---|---|---|---|
+| 0.50 | 3.0 | 0.29 | 0.275 | 0.29 | **0.26 ms** |
+| **0.626** | **3.76** | **0.358** | **0.206** | **0.358** | **0.192 ms** |
+| 0.70 | 4.2 | 0.398 | 0.165 | 0.398 | 0.152 ms |
+
+- c=0.626 ⇒ 40 层节省 **7.7ms/step**；扣协议 ~0.8ms ⇒ **≈6.9ms ⇒ +8.4%**
+  （82.3→75.4ms；42.6→46.5 tok/s）；
+- c=0.50 ⇒ 节省 ~10.4ms/step ⇒ **+12%**；
+- ⇒ **P2 闸门（+5%）在现有 N-major 内核下即可通过**，**不需要先写 CUDA 内核**；
+- 需要的是：**把 N-major 内核接进侧车**（engine 的 `gpu_moe_layer` 固定开销 0.43ms，不能用）。
+
+### 19.3 修正后的 P2 计划
+
+1. 侧车池的 plane 改成 **N-major**（逐层转置，峰值 2× 单层 ≈1.7GB，可接受）；
+2. worker 只对**命中**的 slot 发 kernel（`slot_ids` 间接寻址），grid=(命中数, N/BN)；
+3. CPU 按权重 0 跳过命中项（现有机制）；
+4. 单层对拍 → 200 槽 → 1,900 槽 C=1 A/B。
+
+### 19.4 结论
+
+- §15–§18 的“C=1 净负”结论**作废**（前提错了）；
+- 现有 N-major Triton 内核足够；预计 **+8～12%**；
+- 新内核工程（3–5 天）**不再需要**，除非要冲 +15%。
+
+---
+
+## 20. 2026-10-23 N-major 侧车集成冒烟（部分成功）
+
+### 20.1 已打通的
+
+- **池 loader 设备问题已解决**：在 `build_layer_pool` 外包 `torch.cuda.set_device(side)`，
+  40/40 层池都建在 GPU0（4.7 GiB）；
+- `SidecarRuntime` 的 device 改为 `sidecar_device()`（此前误用 logical 0 = 物理 1）；
+- 服务 `Application startup complete`，layer 22 的 host-function 侧车 compute 能跑（0.85ms）。
+
+### 20.2 仍失败的
+
+- 部分层（35–39）warmup 报 `Pointer argument cannot be accessed from Triton (cpu tensor?)`；
+  说明这些层的 `pool.planes` 与 runtime 的 device 仍不一致（或 transpose 未生效）；
+- layer 22 的 0.85ms 更像**旧 gpu_moe_layer**（1.07ms 量级），不是 N-major 的 ~0.45ms
+  ⇒ N-major 路径是否真正生效**未确认**。
+
+### 20.3 下一步（明确）
+
+1. 在 `add_pool` 里断言 `pool.planes[0].device == torch.device(f"cuda:{side}")`，不一致就报错；
+2. transpose 后打印一层 `planes[0].shape`（应为 `[S, 2I, H//2]`）；
+3. 确认 `compute` 走的是 `nm.forward`（加一行 debug）；
+4. 单层 on/off 对拍，再 200 → 1,900 槽 A/B。
+
+### 20.4 经济性（已更正，§19）
+
+CPU/GPU 算不相交专家 ⇒ `max(GPU(hit), CPU(miss))`；62.6% 命中下预计 **+8～12%**；
+N-major 内核是正确方向，剩下是集成调试，不是新内核研究。
+
+---
+
+## 21. 2026-10-23 N-major 已在服务里跑通，但单层 1.95ms（需 profile）
+
+### 21.1 确认
+
+日志逐字：`[xtu-sidecar] nmajor layer=22 hits=1` ⇒ **N-major 路径真的生效**；
+pools 形状正确（`[S,4608,2560]` 等，dev=cuda:1=物理 GPU0）。
+
+### 21.2 两个问题
+
+1. **合成 warmup 失败**：`_warm_kernels` 没先 `set_device`，Triton 在 current=GPU1 下
+   拿到 cuda:1 的 tensor 报 “cpu tensor”；导致首次真实调用才编译（187ms，触发一次 50ms 超时）。
+   ✅ 已修：warmup 开头 `torch.cuda.set_device(self.device)`。
+2. **单层 1.95ms**（1 个命中），而 standalone 原型同形状只要 **0.115ms**，差 17×。
+   可疑项：
+   - 每次 `nm.forward` 分配 4 个临时张量（part/inter/part_out/out）；
+   - worker 里 Python 命中循环 + 每层 2 个 `torch.tensor(...)` H2D；
+   - 4 个 kernel 的 launch 开销（worker 线程、非图）；
+   - Triton 对 `slot_ids` 的形状/类型可能重新特化。
+
+### 21.3 下一步
+
+- 在 `compute` 里加分段计时（hit / H2D / gate / act / down / wsum / D2H）；
+- 预分配 `part/inter/part_out/out`（按最大命中数），复用 slots/weights 张量；
+- 目标：把 1.95ms 压回 0.2ms 量级，再做单层 on/off。
+
+---
+
+## 22. 2026-10-23 **结论：C=1 侧车在当前栈上不可行**（固定开销 > 可节省空间）
+
+sc200l 实测（200 槽，TP=1，N-major 路径，I/O 已预分配）：
+
+| 项 | 实测 |
+|---|---|
+| `io`（H2D hidden/slots/weights + D2H out） | **0.25–0.28 ms/层** |
+| `kernels`（gate/up+act+down+wsum，1 命中） | **0.26 ms/层** |
+| 单层侧车总耗时 | **0.75–0.89 ms** |
+| CPU 全量（6 专家） | **0.55 ms** |
+| CPU 未命中（4 命中、2 未命中） | ~0.18 ms |
+
+- 命中 4 个时：GPU ≈ 0.25 + 4×0.09 ≈ **0.61–0.7ms** > CPU 0.55ms
+  ⇒ `max(GPU,CPU)` 仍由 GPU 决定，**C=1 净负**；
+- §19 的 +8～12% 模型漏掉了**每层固定 I/O 与 launch 开销**（约 0.5ms/层 × 40 = 20ms）；
+- 固定开销来源：每层 2 次 H2D + 1 次 D2H 同步、worker 线程 4 次 kernel launch、
+  Python 命中构建。
+
+### 22.1 为什么不能靠“再调内核”解决
+
+- 内核本身已从 0.43 → 0.115ms（单专家）；
+- 但 C=1 每层只处理 1 个 token、少量专家，**摊不开固定同步/launch 成本**；
+- 唯一可能的进一步优化：GPU0 上的 CUDA Graph 捕获（把 4 次 launch 合成 1 次 replay）
+  + 异步 D2H；即使全部成功，乐观也只有 ~0.2ms 固定 + 0.1×hits，
+  4 命中 ≈0.6ms，仍 **≥ CPU 0.55ms**，上限约 ±5%。
+
+### 22.2 最终判断
+
+- **C=1 侧车不可行**（不是内核问题，是“每层小 batch + 跨设备同步”的结构问题）；
+- C≥4 仍可能（CPU 每层 ~2.2ms，0.7ms 可被遮住），但不是本目标；
+- qfn 全驻留场景不受此结论影响（它本来就不用 CPU 算 MoE）。
+
+---
+
+## 23. 2026-10-23 qfn NVFP4 加载链路（进行中）
+
+详细记录：`docs/QFN_NVFP4_PROGRESS_2026-10-23.md`。
+
+- 已解 4 个 blocker：2D/4D block scale、`orig_dtype`、NVFP4 CPU pwal、TP=3 不支持（改 TP=2）；
+- **208/208 分片加载成功**，已进推理；
+- 当前卡在 `moe_wna16_marlin_gemm: b_q_weight is not on GPU`（权重在 pwal 后已在 GPU，
+  疑为 experts/apply 仍走插件 CPU MoE 或缓存了搬卡前张量）；
+- 下一步：qfn 全驻留时禁用 CPU MoE，再跑 TP=2 → GPU0+1+2 侧车全驻留 → 撤 GPU0 部分表。
+
+### 23.1 定位（21:51）
+
+`_fused_marlin_moe` 入口探针：`w1=cpu w2=cpu s1=cpu hs=cuda:0/1`。
+pwal 后 `layer.w13_weight` 是 cuda，但 kernel 收到的 w1 是 CPU ⇒ **w1 来自另一处缓存
+（FusedMoE 外层引用或插件 CPU staging）**；capture 内搬卡会 `cudaErrorStreamCaptureInvalidated`。
+下一步：让 NVFP4 层完全不进 CPU staging（`XTU_NVFP4_GPU=1` 全域生效），再跑 TP=2。
+
+### 23.2 排除 device_loading_context（21:57）
+
+给 `device_loading_context` 加 `XTU_NVFP4_GPU=1` 直通后重跑，仍 `b_q_weight is not on GPU`
+⇒ 不是加载期 CPU 往返；下一步在 `fused_moe_modular_method.py` 打印 `w1=layer.w13_weight`
+的 device/id，与 pwal 后对比，定位“被谁替换成 CPU”。
+
+### 23.3 PP=3 被 PLE 锁死；改走 CPU NVFP4 引擎
+
+- `PP=3, TP=1` 被 vLLM 拒绝：`Qwen4Exp N-gram PLE embedding requires pipeline_parallel_size=1`；
+- TP=2 每 rank 专家 ~34GB + 非专家 ~6.5GB > 40GB ⇒ 权重被退到 CPU ⇒ native Marlin 报
+  `b_q_weight is not on GPU`（pwal 与 kernel 入口 id 相同、device 不同，证实是搬 CPU）；
+- ⇒ 下一步实现 **NVFP4 CPU 专家引擎**（e2m1 codebook + E4M3 g16 scale），
+  它同时是“撤 GPU0 → CPU 兜底”的前提；之后再谈 3 卡侧车全驻留。
+
+### 23.4 create_weights 把 NVFP4 专家建在 CPU（23:00）
+
+- `ModelOptNvFp4FusedMoE.create_weights` 用 `torch.empty(...)`（无 device）⇒ CPU；
+- loader 的 `device_loading_context` 按设计把参数搬回 CPU；pwal 期间是 cuda，
+  但每卡加载统计仅 **4.92 GiB**、GPU 峰值 10.7GB ⇒ 34GB 专家从未驻留；
+- 尝试 `base_loader.load_model` 后统一搬卡，shim 未出现在引擎进程的 applied 列表
+  （只看到 pwal gpu_fix）⇒ 落点/安装时机需改；
+- 容量：34+5=39GB vs 39.49GB 可用 ⇒ 只剩 ~0.5GB KV，即使搬上去也极紧。
+
+### 23.5 搬卡 hook 静默未装（23:05）
+
+`base_loader.load_model` 与 `Worker.load_model` 两处 hook 都没出现在引擎进程的 applied 列表，
+且无 skip/failed 日志 ⇒ 在 `XTU_NVFP4_GPU` 检查或 `orig is None` 处静默返回。
+最可能：**worker 子进程没继承该 env**（serve 的 envfile 只桥接已知变量），
+或 base_loader 的 `load_model` 不是模块属性。
+下一步：把变量写进 envfile，或改用 pwal 内注册的 forward-pre-hook（pwal 已证明在 worker 内执行）。
+
+---
+
+## 24. 2026-10-23 23:15 qfn NVFP4 跑通（TP=2 + 2GB CPU offload）
+
+- **可用**：`XTU_NVFP4_GPU=1 VLLM_EXPERTS_LOAD_DEVICE=gpu CPU_OFFLOAD_GB=2 GPUS=1,2 TP=2`，
+  `Application startup complete`，KV 1.66 GiB；
+- GPU1/2 各 37.78 GiB，**GPU0 全空**；语义冒烟正常；
+- **C=1：47.1 tok/s**（260 prompt+64 decode），与官方 FP8 基线 46.3 基本持平；
+- 当前形态 = 部分驻留（2GB 在 CPU）+ GPU0 可撤除；
+- 下一步：needle 一致性、去 offload、C=2/4 与长上下文。
+
+### 24.1 最佳运行点与 0GB 边界（23:30）
+
+| CPU_OFFLOAD_GB | KV | C=1 | needle |
+|---|---|---|---|
+| 0（含 EAGER=1） | — | — | OOM（38.52GB 已用，仅 179MB 空闲）|
+| **1** | 0.41 GiB | **68.0 tok/s** | ✅ ORANGE-7731 |
+| 2 | 1.66 GiB | 47.1 tok/s | ✅ ORANGE-7731 |
+
+- 1GB vs 2GB：needle 最终答案一致，reasoning 长度不同（非 bit-identical，符合“needle 语义一致”）；
+- GPU0 始终 0 MiB ⇒ 撤除天然成立；
+- 0GB 不可行 ⇒ 2 卡上“纯 GPU 全驻留”做不到；TP=3/PP=3 均被模型结构卡死。
+
+### 24.2 并发基准（1GB offload，MAXLEN=512）
+
+| 并发 | 聚合 tok/s | 单请求 tok/s |
+|---|---|---|
+| C=1 | 53.5（短 prompt；长 prompt 68.0） | 53.5 |
+| C=2 | **92.7** | 46.4 |
+| C=4 | **105.3** | 26.3 |
+
+`MAXLEN=4096` 时 KV 仅 0.05 GiB（activation 随 MAXLEN 增长）⇒ 长上下文需更多 offload。
+
+---
+
+## 25. 2026-10-23 qfn NVFP4 交付状态与 ② 的选项
+
+### 25.1 已交付（①③④）
+
+- ① 两个 blocker 已解：2D block scale→4D、`orig_dtype` 回落、NVFP4 CPU pwal 绕过；
+- ③ GPU0 始终 0 MiB（可撤除）；1GB 与 2GB 两种驻留表 needle 最终答案一致；
+- ④ 基准：C=1 **68.0**（长 prompt）/53.5（短）、C=2 **92.7**、C=4 **105.3** tok/s；
+  KV 0.41 GiB（MAXLEN=512）；`MAXLEN=4096` 时 KV 仅 0.05 GiB。
+
+### 25.2 ② 未达成：GPU0 没有参与 NVFP4 计算
+
+原因：qfn 的 MoE 走 vLLM **native Marlin TP=2**，不是插件的 CPU/侧车引擎；
+GPU0 要参与，需要以下之一：
+
+| 方案 | 内容 | 工作量 |
+|---|---|---|
+| A. NVFP4 侧车 | GPU0 存部分专家 + host-function 里用 NVFP4 GEMV 算命中项，再并回 Marlin 输出 | 大（新内核 + 混合路由） |
+| B. GPU0 作为 offload 目标 | 把 vLLM 的 `cpu_offload_gb` 目标从 CPU 改成 GPU0，按层 P2P 预取 | 中，但每层 PCIe 拷贝 ~GB 级，可能得不偿失 |
+| C. 接受现状 | GPU1/2 全驻留 + 1GB CPU 兜底，GPU0 不参与 | 0 |
+
+### 25.3 建议
+
+**B 已用算术否掉**：GPU0→GPU1/2 是 PCIe 4.0 **x8 ≈12.6GB/s**（本机实测），
+1GB offload 一次全量预取 ≈ **79ms/forward**，即使按层流水也远超 0.2ms/层 ⇒ 不可行。
+⇒ 只剩 **A（3–5 天，NVFP4 反量化内核 + 混合路由）** 或 **C（接受现状）**。
+
+### 25.4 NVFP4 GEMV 原型（23:55）
+
+`dev-docs/nvfp4_gemv_prototype.py`：E2M1 bitcast + E4M3 g16 尺度，N-major。
+
+| 形状 | 每专家 | 误差 |
+|---|---|---|
+| gate/up (1280×2560) | 0.030 ms | 0 |
+| down (2560×640) | 0.012 ms | 0 |
+
+6 专家全层 ≈ **0.27ms**（< 0.3ms 目标）⇒ A 方案（GPU0 侧车）性能可行，
+剩下是**与 native Marlin 的混合路由**集成（3–5 天）。
+
+### 25.5 真实权重验证（00:05）
+
+`dev-docs/nvfp4_real_check.py`（layer0，experts 0–5）：
+
+- gate/up：`[1280,1280]` U8 + `[1280,160]` E4M3，6/6 专家相对误差 **0.0**；
+- down：`[2560,320]` U8 + `[2560,40]` E4M3，6/6 专家 **0.0**；
+- **6 专家全层 0.2496 ms**（gate/up+down）。
+
+⇒ NVFP4 GEMV 的布局/尺度语义与真实 checkpoint 完全一致，A 方案的计算内核已就绪；
+剩余是**模型层混合路由**（把命中专家从 Marlin 切到 GPU0 侧车）。
+
+---
+
+## 26. 2026-10-24 ② 的落地方案与阻塞点（层级侧车）
+
+### 26.1 设计（比"层内混合路由"简单）
+
+- **层级切分**：GPU0 持有若干**整层**的 NVFP4 专家（原始布局，Marlin 重排之前），
+  每层 512 专家 ≈ **1.26GB** ⇒ GPU0 40GB 可放 **~30 层**；
+- GPU1/2 只保留其余层（TP=2 Marlin），专家内存大减 ⇒ KV 大幅增加；
+- 对这些"GPU0 层"，`apply` 里把 hidden(2560×2B) + topk ids/weights 经 PCIe 发给 GPU0，
+  用已验证的内核（6 专家 0.25ms、10 命中 ≈0.4ms）算加权和，再传回；
+- 传输量 ~5KB/层，PCIe 往返 ~26µs，可忽略。
+
+### 26.2 为什么仍要 3–5 天
+
+1. TP=2 下每 rank 只持有**一半专家**（256 个），`apply` 是 rank-local 的；
+   GPU0 层需要处理"整层 512 专家"或两个 rank 各发一半，还要与 all-reduce 对齐；
+2. 必须在 Marlin `pwal` **重排之前**截获原始权重并搬到 GPU0（否则布局不可用）；
+3. 要跳过/替换这些层的 Marlin kernel，且保证数值与 Marlin 一致（单层对拍）；
+4. 主路径改动必须可回滚（env 开关 + 可 revert 的 patch）。
+
+### 26.3 结论
+
+- ①③④ 已完成并留档；qfn 可用（C=1 68 tok/s）；
+- ② 的**计算内核已就绪**（真实权重 0 误差、0.25ms/6 专家），
+  但模型层集成是 **3–5 天的 MoE 主路径改造**，需要用户明确批准后再动。
+
+### 26.4 受控对比：FP8 vs NVFP4（同 MAXLEN=512 / TP=2 / 0 常驻 / PIN=0）
+
+| 项 | 官方 FP8 | NVFP4 |
+|---|---|---|
+| KV | **28.52 GiB** | 0.41 GiB |
+| C=1（短 prompt 32 tok） | 27.9 | **53.5** |
+| C=2 | 51.7 | **92.7** |
+| C=4 | 75.6 | **105.3** |
+| needle | ✅ | ✅ |
+
+⇒ 同配置下 NVFP4 约 **1.9×** 快，代价是 **KV 少 70×**（专家占了显存）。
+之前“68 vs 46.3”混入了 262K/12 常驻的差异，作废；以此表为准。
+
+---
+
+## 27. 2026-10-24 汇总与决策（本报告的状态页）
+
+### 27.1 ds41f C=1 侧车：**关闭**
+
+- 内核三条路线实测：旧池内核 0.64ms、K-split 0.60ms、N-major 0.56ms；
+  CPU 同类负载 0.55ms（60 线程 AVX512，已贴 DRAM 带宽）。
+- 决定性的不是内核本身，而是**每层固定开销**：I/O 0.25–0.28ms + 4 次 launch，
+  40 层≈20ms；C=1 串行、无合法重叠窗口 ⇒ 净负。
+- 纯读 1.19TB/s、内核 190GB/s，差距来自反量化 ALU + 小 tile；BF16 预反量化能到 ~0.34ms，
+  但显存 ×4（1,900 槽 135GB）且固定开销仍在。
+- ⇒ **C=1 侧车不再推进**；C≥4 仍可用（CPU 2.2ms/层，可遮住）。
+
+### 27.2 qfn NVFP4：**可用（C）**
+
+- 受控对比（同 MAXLEN=512/TP=2/0 常驻/PIN=0）：
+
+| | 官方 FP8 | NVFP4 |
+|---|---|---|
+| KV | 28.52 GiB | 0.41 GiB |
+| C=1 | 27.9 | **53.5** |
+| C=2 | 51.7 | **92.7** |
+| C=4 | 75.6 | **105.3** |
+
+- 收益来源：8bit→4bit 让专家 114.9GB→68GB，**装进 2×40GB**，MoE 从 CPU 挪到 GPU；
+  与 GPU0 无关（GPU0 始终 0 MiB）。
+- 最佳运行点：`CPU_OFFLOAD_GB=1`，KV 0.41GiB，长 prompt C=1 **68.0**；
+- 0GB 不可行（38.52GB 已用，仅 179MB 空闲）；
+- TP=3 不可行（16 head 不整除）；PP=3 被 PLE 锁死。
+
+### 27.3 2026-10-24 决策：**做 A（每层 40–60% 专家放 GPU0）**
+
+- 用户批准；ds41f 方向暂缓。
+- 选 A 而非"整层放 GPU0"：三卡并行、延迟不涨、KV 同样能到 ~15GB+；
+  整层方案 GPU0 单卡串行，30 层会多 9–12ms/step。
+- 实施计划见 `docs/QFN_NVFP4_SIDECAR_A_PLAN.md`（P0 dump 对拍 → P1 单层 → P2 全量 → P3 撤 GPU0）。
+- 硬件备注：96GB 级 Blackwell 单卡当主力更简单；本方案的价值是**存量 3×A100 不换平台**。
+
+### 27.4 文档索引
+
+- 本报告：分析、实测、决策；
+- `docs/QFN_NVFP4_PROGRESS_2026-10-23.md`：qfn 加载/基准/内核细节；
+- `docs/QFN_NVFP4_SIDECAR_A_PLAN.md`：A 方案实施计划；
+- `docs/patches/qfn_nvfp4_vllm_2026-10-23.patch`：vLLM 补丁（可反向）。
+
+---
+
+## 28. 2026-10-24 09:15 后续任务登记（用户指定）
+
+**ds41f 侧车 C=2 / C=4 基准**（qfn A 完成并留档后执行）：
+
+- 用户已知 **C=1 是负值**，仍要求看 C=2/4 的表现；
+- 目的：确认侧车在并发下能否靠"跨请求重叠"转正；
+- 协议：与既有 C=1 基准同环境（GPU1/2 + GPU0 侧车 + PIN 表），
+  分别测 C=2、C=4 的聚合 tok/s、单请求 tok/s、CPU/GPU 时间占比；
+- 产出写入本报告与 `dev-docs/report/`，与 qfn 基准并列。

@@ -31,7 +31,7 @@
 
 [中文](README.md) · English (default)
 
-> **📌 Current release: v0.2.9** (2026-10-19) — Expert-layer residency for Qwen3.8-Flash-Next; CUDA Graph capture crash fixed
+> **📌 Current release: v0.3.0** (2026-10-24) — Auxiliary-GPU (sidecar) support for higher concurrent decode throughput; see [v0.3.0 release notes](RELEASE_NOTES_v0.3.0.md)
 > [Release notes](RELEASE_NOTES_v0.2.9.md) · [Benchmark protocol](docs/BENCH_PROTOCOL.md)
 
 ---

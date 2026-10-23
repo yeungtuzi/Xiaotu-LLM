@@ -53,8 +53,11 @@ class SidecarRuntime:
         self.pools: dict[int, object] = {}
         self._slotmap_cpu: dict[int, object] = {}
         self._bufs: dict[int, tuple] = {}
+        # [xtu 2026-10-24] MXFP4 N-major GEMV 只对 qlen=1 正确；qlen>1 时 host_begin 直接放弃
+        # （不置 0 CPU 权重），避免命中专家被静默丢弃（见 docs/QUALITY_SIDECAR_SPEC_CONFLICT.md）。
+        self._eff_qlen = int(max_qlen) if self.use_fp8 else 1
         self._worker = _sc.SidecarWorker(
-            engine, table, n_layers, n_experts, hidden, max_qlen, max_k,
+            engine, table, n_layers, n_experts, hidden, self._eff_qlen, max_k,
             compute=self.compute,
         )
         self._dev = f"cuda:{self.device}"

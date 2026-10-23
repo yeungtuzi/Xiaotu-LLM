@@ -97,12 +97,8 @@ class SidecarWorker:
             self.out = torch.zeros(max_qlen * hidden, dtype=torch.float32, pin_memory=True)
 
         self.ctl = engine.sidecar_new()
-        # [xtu 2026-10-24] MXFP4 N-major GEMV 只对单 token 有可接受性能/正确性；
-        # qlen>1 必须让 host_begin 直接放弃（不置 0 CPU 权重），否则命中专家被丢弃。
-        # 批量 MXFP4 内核原型实测 1.6~5 tok/s（比无挎斗慢 40 倍），不可用，见文档 §9。
-        _max_qlen = max_qlen if use_fp8 else 1
         engine.sidecar_config(
-            self.ctl, n_layers, n_experts, hidden, _max_qlen, max_k,
+            self.ctl, n_layers, n_experts, hidden, max_qlen, max_k,
             self.masks.data_ptr(), self.ids.data_ptr(), self.wts.data_ptr(),
             self.out.data_ptr(),
         )

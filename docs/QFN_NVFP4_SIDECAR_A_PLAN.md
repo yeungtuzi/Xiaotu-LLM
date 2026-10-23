@@ -153,3 +153,16 @@ vLLM 源码已恢复，补丁归档 `docs/patches/qfn_a_forward_v2.patch`。
 - 补丁归档 `docs/patches/qfn_a_forward_v3.patch`；vLLM 源码已恢复。
 - 下一步：以 `layer.w13_weight_scale_2`/`w2_weight_scale_2` 的**实际值**为准重算，
   并在单层再做一次离线对拍（用引擎 dump 的 x/ids/out + 引擎里的 scale_2）。
+
+### 5.10 P1 诊断收敛（2026-10-24 10:35）
+
+- 引擎实际值：`w13_scale_2` 统一 4.476e-4；`w2_scale_2` 逐专家 3.97e-5–4.53e-4；
+- 文本**恢复连贯**（"用户要求用一句话解释快速排序…"），但 debug 显示 `acc=0`，
+  且没有 `[qfn-a-nan]`/`[qfn-a-nan2]` 触发 ⇒ `acc` 的 NaN 不是来自 act/o 的溢出；
+- 更可能的解释：**置零没有影响 Marlin**（`apply_router_weight_on_input` 或权重在输入端生效），
+  于是输出 ≈ 原始 Marlin，侧车贡献被丢弃/覆盖 ⇒ 文本正常但机制没生效；
+- 下一步必须先确认：
+  1. `layer.apply_router_weight_on_input` 是否为 True；
+  2. 置零后的 `wts2` 是否真的让被置零专家的贡献变为 0（可对比 r 与 baseline）；
+  3. `acc` 的 NaN 究竟在哪一步（打印 `wt`、`S2_2[e]`、`o` 的有限性）。
+- 补丁归档 `docs/patches/qfn_a_forward_v4.patch`；vLLM 源码已恢复。

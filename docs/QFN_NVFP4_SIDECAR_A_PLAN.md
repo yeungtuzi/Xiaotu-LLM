@@ -195,3 +195,13 @@ vLLM 源码已恢复，补丁归档 `docs/patches/qfn_a_forward_v2.patch`。
 - 诊断打印因在 `S13_2` 赋值前引用而崩溃（已回滚），下一轮先把打印移到赋值后，
   确认 TP=2 的 `w13_weight_scale_2` 形状/数值，再修正索引；
 - vLLM 源码已恢复；补丁归档 `docs/patches/qfn_a_forward_v6.patch`。
+
+### 5.13 TP=2 诊断受阻（2026-10-24 11:10）
+
+- 连续两次诊断打印都落在 `local` 赋值之前，导致 `UnboundLocalError`；
+  说明用字符串替换往长函数里插探针不可靠（顺序不可控）；
+- 现状：TP=1 已通过（0.37–0.48%），TP=2 的 `acc` 偏大约 `1/w13_scale_2`（≈2222×），
+  仍然高度怀疑 `w13_scale_2` 在 TP=2 下未生效；
+- 下一步改为**行号定位插入**（或用 `sys.settrace`/单独脚本读层参数），
+  不再用文本替换插探针；
+- vLLM 源码已恢复；GPU 全 0 MiB。

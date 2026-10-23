@@ -51,7 +51,7 @@
 | CPU | 2× AMD EPYC 9654(192 物理核 / 384 线程,8 NUMA node) |
 | 内存 | 1538 GiB DDR5 |
 | GPU | 3× NVIDIA A100-PCIE-40GB |
-| 系统 | Ubuntu 22.04 · conda env `lvllm` |
+| 系统 | Ubuntu 22.04 · conda env `vllm-xiaotu-moe` |
 
 ---
 

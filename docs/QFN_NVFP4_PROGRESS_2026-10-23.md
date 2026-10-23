@@ -193,3 +193,17 @@ setsid env ALLOW_PROD_GPU=1 XTU_NVFP4_GPU=1 GPUS=1,2 TP=2 PORT=8142 \
 
 - vLLM 侧补丁：`docs/patches/qfn_nvfp4_vllm_2026-10-23.patch`（可 `patch -R` 回滚）；
 - 插件侧：`mainline_shims.py` 的 `XTU_NVFP4_GPU` 分支（默认不设 ⇒ 零行为变化）。
+
+## 9. 2026-10-24 09:00 P0 单层对拍**通过**（0.3–0.5%）
+
+- 用 vLLM 钩子 dump 出 **layer 0** 的原始 NVFP4 权重（512 专家，1.4GB）与一次真实请求的
+  `x/ids/weights/out`（`topk_ids` 是全局 id，10 个命中）；
+- 离线用我们的内核复算：gate/up → silu*up → down，按 `weight_scale_2`（每专家/投影的
+  per-tensor 全局缩放，~1e-4）还原，再按路由权重求和；
+- **相对误差：0.00488 / 0.005236 / 0.003163（3 个 token）**，量级 0.3–0.5%，
+  与 bf16 舍入一致 ⇒ **内核与 Marlin 数值一致**；
+- 关键坑：`weight_scale_2` 必须乘（之前只乘 per-16 E4M3 尺度，结果放大 1e4 倍）；
+- 钩子补丁已归档：`docs/patches/qfn_dump_weights.patch`、`docs/patches/qfn_trace.patch`；
+- vLLM 源码已恢复干净。
+
+⇒ P0 完成；P1 可以开始做"单层交给 GPU0 计算"的引擎内替换。

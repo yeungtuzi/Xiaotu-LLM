@@ -58,6 +58,7 @@
 ## 性能
 
 > 统一测试口径：[`docs/BENCH_PROTOCOL.md`](docs/BENCH_PROTOCOL.md) · 详细测试方法：[`docs/SIDECAR_GPU0_POSTMORTEM.md`](docs/SIDECAR_GPU0_POSTMORTEM.md)
+> ⚠️ 质量提示：**DSpark 与挎斗不能同时开**（输出质量会明显下降），取舍与复现见 [`docs/QUALITY_SIDECAR_SPEC_CONFLICT.md`](docs/QUALITY_SIDECAR_SPEC_CONFLICT.md)
 
 > 注：投机解码接受率有随机性，因此 tok/s 数据供参考；权威比较要看**步时延时**（代表原始解码性能）。
 

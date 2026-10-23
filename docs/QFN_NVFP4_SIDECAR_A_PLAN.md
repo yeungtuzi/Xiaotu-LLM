@@ -137,3 +137,19 @@
 
 **当前结论**：P1 的"置零 + 并回"机制可跑通，但数值稳定性未解决；
 vLLM 源码已恢复，补丁归档 `docs/patches/qfn_a_forward_v2.patch`。
+
+### 5.9 P1 再测（2026-10-24 10:25）：_os 作用域修复，但数值仍不对
+
+- 修 `UnboundLocalError` 后侧车真正执行；诊断输出：
+  - `w13_weight_scale_2`：`[512,2]` fp32，**min=max=4.476e-4**（vLLM 里是**统一值**，
+    不是 checkpoint 的逐专家/逐投影值）；
+  - prefill 一步：`acc=2279.87` vs Marlin `r=0.0283`（差 ~8e4）；
+  - decode 一步：`acc=0`（被 nan_to_num 兜底，说明仍有 NaN）；
+- 结论：
+  1. vLLM 的 `w13_weight_scale_2` 语义与 checkpoint 不同（统一 4.476e-4），
+     不能直接沿用 P0 的逐专家 scale_2；
+  2. 卷积核的缩放链（block E4M3 × scale_2 × down scale_2）在引擎里需要重新对齐；
+  3. NaN 仍未定位（decode 行触发）。
+- 补丁归档 `docs/patches/qfn_a_forward_v3.patch`；vLLM 源码已恢复。
+- 下一步：以 `layer.w13_weight_scale_2`/`w2_weight_scale_2` 的**实际值**为准重算，
+  并在单层再做一次离线对拍（用引擎 dump 的 x/ids/out + 引擎里的 scale_2）。

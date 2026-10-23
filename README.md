@@ -28,7 +28,7 @@
 
 [**English**](README_EN.md) · 中文(默认)
 
-> **📌 当前版本：v0.2.9**（2026-10-19）—— 针对 Qwen3.8-Flash-Next 的专家层常驻；修复 CUDA Graph 捕获崩溃
+> **📌 当前版本：v0.3.0**（2026-10-24）—— 新增辅助 GPU（侧车）功能，提升多并发解码性能，详见 [v0.3.0 发行说明](RELEASE_NOTES_v0.3.0.md)
 > [发行说明](RELEASE_NOTES_v0.2.9.md) · [性能口径](docs/BENCH_PROTOCOL.md)
 
 ---

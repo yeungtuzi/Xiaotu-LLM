@@ -59,6 +59,8 @@
 
 > 统一测试口径：[`docs/BENCH_PROTOCOL.md`](docs/BENCH_PROTOCOL.md) · 详细测试方法：[`docs/SIDECAR_GPU0_POSTMORTEM.md`](docs/SIDECAR_GPU0_POSTMORTEM.md)
 
+> 注：投机解码接受率有随机性，因此 tok/s 数据供参考；权威比较要看**步时延时**（代表原始解码性能）。
+
 | 模型(最优配置) | 负载 | 实际 token | 并发 | prefill (tok/s) | decode (tok/s) |
 |---|---|---|---|---|---|
 | **DeepSeek-V4.1-Flash (1017) + GPU0 侧车（v0.3.0）**<br>TP=2 · util 0.70 · MAXLEN 524288 · MBT 8192 · seqs 4 · DSpark k=5 · PIN off<br>`GPUS=1,2,0` · `XTU_SIDECAR=gpu0` · **1900 槽** | 真实 DSH 15K v2 | ≈15,000 | 4 | **1,206** | **106.8** |

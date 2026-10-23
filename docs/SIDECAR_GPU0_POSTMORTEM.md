@@ -1,0 +1,149 @@
+# GPU0 侧车项目复盘（2026-10-24）
+
+> **定性：一次很有益的失败。**
+> 机制全部打通、数值正确、端到端可跑；但在 A100 上性能不成立，
+> 收益（省下的 CPU offload / 换来的 KV）小于跨设备逐层边界的代价。
+
+---
+
+## 0. 一句话结论
+
+| 对象 | 结论 |
+|---|---|
+| **qfn NVFP4（A 方案）** | 机制正确（单层 0.37–0.52%，全 48 层 needle 正确），但**净负**：同配置 5.9 vs 12.3 tok/s；根因是每层 **8.6–11.3 ms** 的跨设备开销 |
+| **ds41f 15K（侧车 1900 槽）** | C≥2 有小幅正收益（C4 36.4 vs 24.0 tok/s），C=1 与基线同量级（15.2 vs 13.2）；绝对值仍远低于 README（42.6/69.7/72.0） |
+| **建议** | qfn 不用 GPU0 侧车；ds41f 仅在 C≥2 可考虑；长上下文/高吞吐走 sm120/96GB 换卡 |
+
+---
+
+## 1. 目标
+
+1. 用第三张卡（GPU0）分担 MoE，让 qfn NVFP4（68GB 专家）在 2×A100 上
+   去掉 1GB CPU offload、把 KV 从 0.41GB 提到 ~15GB；
+2. GPU0 撤除时回退纯 GPU1/2 + CPU 兜底，同一请求 needle 一致；
+3. 对 ds41f：量化侧车在 15K 上下文、C=1/2/4 下的真实收益。
+
+---
+
+## 2. 设计
+
+### 2.1 qfn（A 方案：每层 40% 专家放 GPU0）
+
+- GPU0 持有每层 **40%（206/512）专家**的原始 NVFP4 布局（Marlin 重排之前）；
+- GPU1/2 的 Marlin 照常计算其余 60%；
+- 每层路由后，把归 GPU0 的命中专家的 topk 权重**置零**再交给 Marlin，
+  GPU0 用已验证的 NVFP4 内核（E2M1 + E4M3 g16 + `weight_scale_2`）计算这些命中，
+  按原路由权重并回；
+- 共享专家（bf16）完全不动。
+
+### 2.2 ds41f（CPU + GPU0 混合）
+
+- 插件原有 CPU MoE 引擎 + GPU1/2 的 PIN 热专家；
+- `XTU_SIDECAR=gpu0` + `expert_pin_sidecar_1900.bin`：GPU0 再常驻 1900 个热专家，
+  与 CPU、GPU1/2 并行计算。
+
+---
+
+## 3. 实现
+
+| 组件 | 内容 |
+|---|---|
+| NVFP4 内核 | `dev-docs/nvfp4_gemv_prototype.py`、`nvfp4_gemv_batch.py`：E2M1 bitcast + E4M3 g16 + `scale_2`，批量化（每层 gate/up 一次、down 一次） |
+| vLLM 补丁 | `docs/patches/qfn_a_forward_v8.patch`、`qfn_a_all_v9.patch`、`qfn_a_copy_v9.patch`、`qfn_dump_weights.patch`、`qfn_trace.patch` |
+| 三卡可见 | `GPUS=1,2,0`：逻辑 0/1 = 物理 1/2（TP=2），逻辑 2 = 物理 0（侧车） |
+| 数值验证 | `dev-docs/nvfp4_real_check.py`：真实权重 0 误差，6 专家 0.25ms |
+| 回退 | `QFN_A_LAYER` 未设 / `XTU_SIDECAR` 未设 ⇒ 零行为变化 |
+
+---
+
+## 4. 测试结果
+
+### 4.1 qfn NVFP4 数值（全部通过）
+
+| 阶段 | 结果 |
+|---|---|
+| P0 离线（真实 layer0 权重 + 引擎 dump 的 x/ids/out） | 相对误差 **0.3–0.5%** |
+| P1 单层（TP=1，40% 置零 + 并回 vs 全量 Marlin） | **0.004791 / 0.003738** |
+| P1 单层（TP=2） | **0.004303 / 0.005157** |
+| 全 48 层（40% 专家） | 文本连贯，needle **ORANGE-7731** 正确；GPU0 13.9GB |
+
+关键坑（已修）：
+- Triton 按**当前设备**启动 ⇒ 必须先 `torch.cuda.set_device(side)`；
+- `BK=128` 不整除 TP=2 的 `K=320` ⇒ 越界读 scale（`o` 爆到 7e8）；改 `BK=64` 后正确。
+
+### 4.2 qfn 性能（决定性）
+
+同配置（TP=2、`CPU_OFFLOAD_GB=3`、`EAGER=1`、MAXLEN=512、260+64）：
+
+| 配置 | C=1 |
+|---|---|
+| 无侧车基线 | **12.3 tok/s** |
+| 全 48 层侧车 | **5.9 tok/s** |
+
+侧车内部计时：**8.6–11.3 ms/层**（目标 0.3–0.5ms），48 层 ⇒ 步时 +0.4–0.5s。
+批量化只把 4.9→5.9 tok/s ⇒ launch 不是主因，**每层跨设备边界**（`set_device` + 3 次 `.to()` 的隐式同步）才是。
+
+参考：qfn 无侧车最佳点 `CPU_OFFLOAD_GB=1`：C=1 **68.0 tok/s**，KV 0.41GB（≈512 token）。
+
+### 4.3 ds41f 15K（README 权威配置，`PIN off`、`util 0.70`、无 ASYNC）
+
+口径：14K 合成 prompt、`max_tokens=64`、稳态窗口（所有请求出首 token 之后），
+**自建脚本，非官方 DSH 载荷**；每档只跑一轮（侧车组取 warm 第二轮）。
+
+| C | 无侧车 | 侧车 1900 | README 参考 |
+|---|---|---|---|
+| 1 | 13.16 | **15.15** | 42.6 |
+| 2 | 20.43 | **23.73** | 69.7 |
+| 4 | 23.99 | **36.36** | 72.0 |
+
+- 侧车在 C≥2 有 **+16% ~ +52%** 的聚合提升；
+- 但绝对值与 README 差 2–3×，主要来自口径差异（prompt/窗口/请求数）与 `XIAOTU_MOE_ASYNC`
+  （实测：开 ASYNC 时 C=1 从 13.2 掉到 **2.0** tok/s，已确认是负优化并移除）。
+
+---
+
+## 5. 分析：为什么失败 / 为什么收益有限
+
+1. **逐层跨设备边界的固定成本不可摊薄**
+   - 每层要 `set_device`、把 hidden 送 GPU0、把结果收回、再切回；
+   - 实测 8.6ms/层，远大于被替代的 Marlin MoE（~0.15ms/层）；
+   - 即使 kernel 优化到 0，边界成本仍在毫秒级。
+
+2. **A100 的互联条件不利**
+   - GPU0 只有 **PCIe 4.0 x8**（~12.6 GB/s，另两张是 x16）；
+   - 任何按层搬运/同步都会被放大。
+
+3. **qfn 的收益是“容量”而不是“速度”**
+   - 去掉 1GB offload、把 KV 提到 ~15GB，需要 GPU1/2 少放 40% 专家；
+   - 但省下的显存换来的速度收益（68→?）远小于侧车每层 8.6ms 的损失。
+
+4. **ds41f 的瓶颈是 CPU MoE + SM80 attention**
+   - 15K 上下文下 attention 本身很重，侧车只能分担 MoE；
+   - 侧车的 1900 专家确实降低了 CPU 命中，故 C≥2 有提升；
+   - 但绝对吞吐仍受 SM80 执行器代差限制（README 的 42.6/69.7/72.0 是同一硬件上
+     官方口径+完整预热的结果，自建脚本没有复现该口径）。
+
+---
+
+## 6. 建议
+
+| 场景 | 建议 |
+|---|---|
+| qfn 短上下文 | 维持 `TP=2 + CPU_OFFLOAD_GB=1`：C=1 **68 tok/s**，KV 0.41GB（≈512 token） |
+| qfn 长上下文 | **不要用 A100 侧车**；换 96GB/sm120 级卡（专家 68GB 可全驻留，KV 15GB+） |
+| qfn 中等上下文 | `CPU_OFFLOAD_GB=2`：C=1 47 tok/s，KV 1.66GB（≈2K token） |
+| ds41f | C≥2 可保留侧车（+16%~+52%）；C=1 不划算，维持 CPU+GPU1/2 |
+| 换卡 | 优先 96GB 级 Blackwell：原生 FP4、无需侧车、单卡可跑 qfn |
+
+**工程结论**：若未来仍要做跨卡侧车，必须先解决“每层边界”——
+持久 worker/独立 stream/CUDA Graph 把 8.6ms 压到 <0.3ms，否则不要投入。
+
+---
+
+## 7. 附录
+
+- 补丁：`docs/patches/qfn_*.patch`
+- 内核：`dev-docs/nvfp4_gemv_prototype.py`、`dev-docs/nvfp4_real_check.py`
+- 计划与逐日记录：`docs/QFN_NVFP4_SIDECAR_A_PLAN.md`、`docs/AUXILIARY_GPU_SIDECAR_PLAN_2026-10-22.md`
+- 关键提交：`4868494`（TP2 通过）、`602fcf2`（全 48 层）、`4205848`（性能结论）
+- 现场：GPU 全 0 MiB、vLLM 源码已恢复、引擎参数已恢复为**不使用 GPU0**

@@ -318,3 +318,19 @@ TP=2 的 `w13` 本地 640 行只有两种可能排布：
 
 **下一步**：把这套机制推到 **48 层**（`QFN_A_LAYER` → 全层），再缩容 GPU1/2 拿 KV，
 最后做 C=1/2/4 基准。
+
+### 5.20 全 48 层侧车**跑通**（2026-10-24 14:00）
+
+- `QFN_A_LAYER=all`：rank0 把每层 40%（206/512）专家搬到 GPU0，共 **13.9GB**；
+- GPU1/2 各 36.1/36.6GB，KV 1.35GB（仍带 CPU_OFFLOAD_GB=3）；
+- 文本连贯；**needle 正确**：`ORANGE-7731`；
+- 但 **C=1 只有 4.9 tok/s**（基线 68 tok/s）——慢 14×。
+
+**性能瓶颈**：侧车是"逐 token、逐专家"的 Python 循环，
+每层 10 命中 × 2 次 kernel = 20 次 launch，48 层 ≈ 960 次 launch/token，
+再加 `set_device` 与跨设备复制；eager 模式更放大。
+
+**下一步**：把每层所有命中专家批成一个 kernel（gate/up 一次、down 一次），
+launch 数从 ~960 降到 ~96/token；再评估是否值得继续。
+
+补丁归档：`docs/patches/qfn_a_all_v9.patch`、`qfn_a_copy_v9.patch`。

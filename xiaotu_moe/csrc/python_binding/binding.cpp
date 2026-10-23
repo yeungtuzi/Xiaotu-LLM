@@ -287,7 +287,7 @@ bool auto_ep_setup(const void* key, const MOEConfigV2& cfg) {
 // sharing one map across all template instantiations is safe.
 std::mutex g_cd_mtx;
 
-// 辅助 GPU（侧车）全局控制块；由 Python 通过 sidecar_attach 注册，默认 nullptr。
+// 辅助 GPU（挎斗）全局控制块；由 Python 通过 sidecar_attach 注册，默认 nullptr。
 static xiaotu_sidecar::SidecarCtl* g_sidecar = nullptr;
 // 故意"泄漏"到进程退出(`*new`):常驻 async worker 线程在**静态析构期**仍可能轮询
 // 这些 state,若此时 vector/map 已析构就会 SIGSEGV(实测,harness 退出时必崩)。
@@ -903,7 +903,7 @@ static void bind_moe_class(py::module& m, const char* name) {
                 float* wts;
                 float* out;
                 bool graph_owned;   // true: 由 graph 节点持有,回调不得释放
-                int layer;          // -1 = 侧车未启用/该层无表
+                int layer;          // -1 = 挎斗未启用/该层无表
             };
 
             // ---- 异步握手路径(item 1/3)---------------------------------
@@ -992,9 +992,9 @@ static void bind_moe_class(py::module& m, const char* name) {
                 const int qlen = c->qlen, k = c->k;
                 const uint16_t* hid = c->hid;
                 const uint32_t* ids = c->ids;
-                float* wts = c->wts;  // 侧车会把命中项置 0
+                float* wts = c->wts;  // 挎斗会把命中项置 0
                 float* out = c->out;
-                // ---- 侧车阶段 1：命中项置 0 + 发请求（与下面的 CPU MoE 并行）----
+                // ---- 挎斗阶段 1：命中项置 0 + 发请求（与下面的 CPU MoE 并行）----
                 uint32_t side_hits = 0;
                 if (c->layer >= 0 && g_sidecar) {
                     side_hits = xiaotu_sidecar::host_begin(
@@ -1031,7 +1031,7 @@ static void bind_moe_class(py::module& m, const char* name) {
                 //   ⚠️ 必须在 run_moe_and_ep 之前写:同一次调用的所有 worker 看到同一个值 ✓
                 xiaotu_int8::set_cur_tokens(qlen);
                 run_moe_and_ep(engine, qlen, k, hid, ids, wts, out, &ep_ms_last, &fwd_ms_last);
-                // ---- 侧车阶段 2：等 worker 并合并 partial ----
+                // ---- 挎斗阶段 2：等 worker 并合并 partial ----
                 if (side_hits && g_sidecar) {
                     if (!xiaotu_sidecar::host_end(g_sidecar, out)) {
                         fprintf(stderr, "[cd] sidecar TIMEOUT layer=%d (fail-closed)\n",

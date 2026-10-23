@@ -1,7 +1,7 @@
 # qfn NVFP4 全驻留 —— 加载链路进展（2026-10-23）
 
 > 检查点：`lovedheart/Qwen3.8-Flash-Next-NVFP4-W4A16-ATTN-FP8-MTP-NVFP4`（129GB，208 分片）
-> 目标：3×A100 全驻留、同侧车机制、GPU0 可撤除。
+> 目标：3×A100 全驻留、同挎斗机制、GPU0 可撤除。
 
 ## 1. 已解决（按出现顺序）
 
@@ -148,7 +148,7 @@ setsid env ALLOW_PROD_GPU=1 XTU_NVFP4_GPU=1 VLLM_EXPERTS_LOAD_DEVICE=gpu \
 
 - 6 专家全层 ≈ 6×0.030 + 6×0.012 + act ≈ **0.27 ms**（< 0.3ms）；
 - 反量化 = e2m1 bitcast + E4M3 算术（无 LUT/常量内存）；
-- ⚠️ 这是**单层内核原型**，还不是侧车集成；但说明 A 方案在性能上可行。
+- ⚠️ 这是**单层内核原型**，还不是挎斗集成；但说明 A 方案在性能上可行。
 
 ## 8. 2026-10-24 00:05 NVFP4 内核在**真实权重**上验证通过
 
@@ -168,7 +168,7 @@ setsid env ALLOW_PROD_GPU=1 XTU_NVFP4_GPU=1 VLLM_EXPERTS_LOAD_DEVICE=gpu \
 ## 4.4 下一步
 
 1. needle / greedy 一致性留档；
-2. 尝试去掉 2GB offload（缩小 graph/eager 或把少量专家放 GPU0 侧车）；
+2. 尝试去掉 2GB offload（缩小 graph/eager 或把少量专家放 GPU0 挎斗）；
 3. C=2/4 与长上下文基准。
 
 ## 3. 下一步
@@ -179,7 +179,7 @@ setsid env ALLOW_PROD_GPU=1 XTU_NVFP4_GPU=1 VLLM_EXPERTS_LOAD_DEVICE=gpu \
    这是 TP=2 部分驻留与 GPU0 撤除兜底的共同前提；
    `XTU_NVFP4_GPU=1` 时让 NVFP4 层**完全不进 CPU staging**（权重常驻 GPU）；
 2. 或给 NVFP4 单独实现 full-residency 的 `FusedMoE` 路径（不经插件 CPU engine）；
-3. 再跑 TP=2 起步，随后做 GPU0+1+2 的侧车全驻留与“撤 GPU0 → 部分表”验证。
+3. 再跑 TP=2 起步，随后做 GPU0+1+2 的挎斗全驻留与“撤 GPU0 → 部分表”验证。
 
 ## 4. 复现
 

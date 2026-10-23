@@ -1,4 +1,4 @@
-"""辅助 GPU（侧车）worker —— Python 侧。
+"""辅助 GPU（挎斗）worker —— Python 侧。
 
 开关（用户 2026-10-23 定）：**`XTU_SIDECAR=gpu0`** 才启用；
 不设 / `none` / `0` / `off` / `false` ⇒ 标准路径（零行为变化）。
@@ -43,7 +43,7 @@ def sidecar_device() -> int | None:
             return phys.index(0)
         raise ValueError(
             "XTU_SIDECAR=gpu0 但物理 GPU0 不在 CUDA_VISIBLE_DEVICES="
-            f"{cvd!r} 中；请用 GPUS=1,0 这类顺序让主服务占物理1、侧车占物理0"
+            f"{cvd!r} 中；请用 GPUS=1,0 这类顺序让主服务占物理1、挎斗占物理0"
         )
     raise ValueError(
         f"XTU_SIDECAR={v!r} 不认识；只支持 'gpu0'，或 none/0/off 表示关闭"

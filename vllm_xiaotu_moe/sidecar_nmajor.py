@@ -1,4 +1,4 @@
-"""侧车 N-major GEMV（MXFP4，qlen=1）：只算命中 slot，按权重求和。
+"""挎斗 N-major GEMV（MXFP4，qlen=1）：只算命中 slot，按权重求和。
 
 plane 布局（由 K-major `[S,K,N]` 转置而来）：
   w13_t [S, 2I, H//2], s13_t [S, 2I, H//32]

@@ -95,3 +95,20 @@ qlen>1 时结果就错**。定位范围缩小到：
   `qlen>1` 直接放弃挎斗（不置 0 CPU 权重）⇒ 不再产生错误输出，也不再拖慢 batch；
 - **生产 8700 仍用 A（spec on + 无挎斗）**；
 - 挎斗若要真正支持 batch，需要实现**多 token 批量的 N-major 内核**（不是循环），属于新的内核工作。
+
+## 9. 批量 N-major 内核原型（2026-10-24 上午）：正确但不可用
+
+按 fp8 内核的思路给 MXFP4 N-major 加了 `forward_batch`（x 按 token 索引、`_wsum` 按 token 聚合、
+pad slot 权重 0），并把 `sidecar_gpu0` 的 qlen>1 分支接上。
+
+- 正确性：batch=4 输出全部完整（119~121 字），与无挎斗一致 ✅
+- 性能：**C=1 实测 1.6~5 tok/s**（BN=4 时约 5，BN=128 时约 1.6），
+  无挎斗基线 68.6 ⇒ **慢 14~40 倍** ❌
+
+原因：N-major 是“每 slot 一次 GEMV”的形状，qlen×topk 个 slot（C=4 时 24 个）叠上
+`_gateup` 的 4608 列 × 20 段权重加载，单层耗时 ~4ms，43 层就把一步吃掉数百 ms；
+它本来就是为 qlen=1、少量命中 slot 设计的，不适合批量。
+
+**结论**：要在 batch 上真正用挎斗，需要**另写一个以 token 为 M 的 MXFP4 GEMM 内核**
+（类似 fp8 的 `gpu_moe_decode_fp8` 的 tiling），而不是把 GEMV 循环/批量拼起来。
+在此之前：MXFP4 挎斗仅在 qlen=1 启用（`sidecar.py` 护栏），生产保持 A。

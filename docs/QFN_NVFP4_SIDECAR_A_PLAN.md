@@ -61,3 +61,11 @@
 1. 在 `RoutedExperts.forward_modular` 入口加探针，确认实际调用栈；
 2. 找到后 dump 单层 `x/ids/weights/out`，完成引擎内对拍；
 3. 再进入 P1（单层拆分）。
+
+### 5.4 P0 **通过**（2026-10-24 09:00）
+
+- 真实请求的 layer 0：`x/ids/weights/out` + 原始权重（512 专家）已 dump；
+- 离线复算（含 `weight_scale_2` 全局缩放）与 Marlin 输出相对误差 **0.3–0.5%**（bf16 量级）；
+- 结论：GPU0 内核对 qfn 的 NVFP4 专家计算在**数值上可直接替代** Marlin 的命中部分；
+- 补丁归档：`docs/patches/qfn_dump_weights.patch`、`qfn_trace.patch`；
+- 下一步 P1：单层交给 GPU0（全部命中），验证整模型 greedy 一致与耗时。

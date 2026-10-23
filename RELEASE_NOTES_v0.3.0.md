@@ -84,3 +84,19 @@ pip install -U vllm-xtu-moe==0.3.0
 - 默认关闭，**升级本身不改变任何行为**；
 - 启用挎斗：`GPUS=1,2,0 XTU_SIDECAR=gpu0 XTU_SIDECAR_TABLE=<table.bin> bash scripts/serve_v41.sh`
 - 回滚：去掉 `XTU_SIDECAR*` 即可回到 v0.2.9 行为。
+
+---
+
+## 七、可变 K（DSpark adaptive verification）——已实现并评估，**暂时暂停**
+
+本次一并完成了 DSpark「可变长度验证」的实现与评估，结论是**本机收益不大，暂停**：
+
+- **固定 k 扫描**（15K，官方口径）：C=1 最优 k=5（68.6 tok/s），C=4 最优 k=3（83.7 tok/s）⇒ 最优 k 随并发变化；
+- **完整 adaptive verification**：A100 上 `DeepseekV41IndexerBackend` 不支持设备侧裁剪，需移植 ROCm device-lens 路径，**评估为不划算**；
+- **置信度驱动 per-request 变长**：已实现且与固定 k=5 **逐 token 一致**，但各请求置信度曲线同质、verify 固定成本不随 k 缩短 ⇒ 无差异化收益；
+- **内建 batch-size 动态 k**（零代码，`num_speculative_tokens_per_batch_size = [[1,2,5],[3,4,3]]`）：
+  C=1 69.3 / C=2 74.1~75.3 / C=4 **83.2**（固定 k=5 为 68.6 / 70.8 / 79.6，C=4 **+4.5%**）。
+
+**处置**：暂停进一步投入；**代码默认关**（不设 `XTU_VARLEN_K` 即原行为）；
+重新启用条件 = **硬件变化（sm90+/sm100）**或**其他挖潜手段穷尽**后再评估。
+实现细节、数据与门限见 [`docs/DYNAMIC_K_NOTES.md`](docs/DYNAMIC_K_NOTES.md)。

@@ -112,3 +112,28 @@ pad slot 权重 0），并把 `sidecar_gpu0` 的 qlen>1 分支接上。
 **结论**：要在 batch 上真正用挎斗，需要**另写一个以 token 为 M 的 MXFP4 GEMM 内核**
 （类似 fp8 的 `gpu_moe_decode_fp8` 的 tiling），而不是把 GEMV 循环/批量拼起来。
 在此之前：MXFP4 挎斗仅在 qlen=1 启用（`sidecar.py` 护栏），生产保持 A。
+
+## 10. 再次尝试：qlen>1 改走 gpu_prefill GEMM（2026-10-24）
+
+思路：MXFP4 的 N-major 是 qlen=1 的 GEMV；非 fp8 的 `qlen>1` 分支本来就有
+`gpu_prefill.gpu_moe_layer`（M=qlen 的 GEMM），只要不再 fail-closed 就能复用。
+
+结果（SPEC=0 + 挎斗）：
+
+| 指标 | 结果 |
+|---|---|
+| 单请求吞吐 | **4.0 tok/s**（128 token 用 31.7s）|
+| batch=4 | HTTP 500（该路径直接失败）|
+
+⇒ `gpu_prefill` 的 slot 语义（按 slot 编号而不是专家 id 取权重）与挎斗的命中 slot 不兼容，
+不仅慢而且不稳。**MXFP4 挎斗的多 token 化到此为止：现有两套内核都不适用。**
+
+## 11. 总体结论（重要）
+
+1. **v0.3.0 里挎斗在 C≥2 的“收益”来自 bug**：命中专家被静默丢弃（CPU 权重置 0、GPU 没算），
+   所以省了 CPU 时间但输出已损坏；修复正确性后（逐 token/批量/GEMM 三种尝试）性能都远低于基线；
+2. 挎斗真正能用的场景只有 **qlen=1（单请求、无投机解码）**，此时收益有限（≈5%）；
+3. 与 DSpark 投机解码叠加必然 qlen>1，因此**二者在当前实现下不可共存**；
+4. 若要重做，需要**以 token 为 M 的新 MXFP4 GEMM 内核**（把 4-bit 反量化、scale 应用、
+   按 token 分块都做进 tiling），这是一项独立的内核工程，且收益上限需重新评估
+   （CPU 侧每层仅 ~1ms，GPU 侧能否低于是未知数）。

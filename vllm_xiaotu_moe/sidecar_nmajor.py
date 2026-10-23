@@ -95,16 +95,23 @@ def transpose_planes(pool):
 
 def forward(x: torch.Tensor, slot_ids: torch.Tensor, weights: torch.Tensor,
             planes_t, H: int, I: int, GK: int,
-            BN: int = 4, BK: int = 256) -> torch.Tensor:
-    """x [H] bf16, slot_ids [n] int32, weights [n] fp32 → out [H] fp32。"""
+            BN: int = 4, BK: int = 256, bufs=None) -> torch.Tensor:
+    """x [H] bf16, slot_ids [n] int32, weights [n] fp32 → out [H] fp32。
+
+    bufs=(part, inter, part_out, out) 可复用（外部按 max_hits 预分配）。
+    """
     n = int(slot_ids.numel())
     dev = x.device
     w13t, s13t, w2t, s2t = planes_t
     N2, H2, G2 = 2 * I, H // 2, H // 32
-    part = torch.empty(n, N2, dtype=torch.float32, device=dev)
-    inter = torch.empty(n, I, dtype=torch.bfloat16, device=dev)
-    part_out = torch.empty(n, H, dtype=torch.float32, device=dev)
-    out = torch.empty(H, dtype=torch.float32, device=dev)
+    if bufs is None:
+        part = torch.empty(n, N2, dtype=torch.float32, device=dev)
+        inter = torch.empty(n, I, dtype=torch.bfloat16, device=dev)
+        part_out = torch.empty(n, H, dtype=torch.float32, device=dev)
+        out = torch.empty(H, dtype=torch.float32, device=dev)
+    else:
+        part, inter, part_out, out = bufs
+        part, inter, part_out = part[:n], inter[:n], part_out[:n]
     _gateup[(n, triton.cdiv(N2, BN))](x, w13t, s13t, slot_ids, part,
                                       H2=H2, N2=N2, G2=G2, BN=BN, BK=BK, num_warps=4)
     _act[(n, triton.cdiv(I, 128))](part, inter, I=I, N2=N2, BN=128, num_warps=4)

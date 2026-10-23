@@ -771,3 +771,18 @@ nohup bash scripts/host_rss_watchdog.sh --tag <tag> --limit-gib <N> \
    `dev-docs/archive/RADAR_PENDING_<YYYYMMDD>.ack.md`
    ⇒ 这样同一提醒不会在下一个会话重复；新一期 cron 更新会重新生成 `RADAR_PENDING.md`。
 6. 若 `RADAR_PENDING.md` 存在但用户明确说“先不调研” ⇒ 仍然归档，不要反复提醒。
+
+## 基准测试纪律（2026-10-23 用户明令）
+
+**跑任何"基本测试/基准"之前，必须先读口径与最新配置**，不得自拼对照组：
+
+1. `README.md` 的基准表（唯一权威数据）与脚注口径；
+2. `docs/BENCH_PROTOCOL.md`（尤其 §6 的 decode 稳态窗口定义）；
+3. `docs/TUNING_GUIDE.md` / `docs/MODEL_GUIDES.md` 的最新配置；
+4. 生产固化脚本 `scripts/bringup_prod_8070.sh`（唯一真源）。
+
+要求：
+- 启动命令必须**逐项抄自**上述来源，并在日志/报告中记录完整 env；
+- 对照组与实验组**只允许一个变量不同**；
+- 报告必须注明 prefill / decode 的测量窗口，禁止用 `wall − TTFT` 这类粗糙减法；
+- 违反以上任一条的测量结果一律标注"作废"，不得引用。

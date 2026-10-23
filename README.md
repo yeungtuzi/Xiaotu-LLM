@@ -57,34 +57,20 @@
 
 ## 性能
 
-* 本表 **DeepSeek-V4.1-Flash(1017)行为 2026-10-19 实测**(本表唯一权威数据;按 `docs/BENCH_PROTOCOL.md` §6:真实 DSH 15K v2、**自然结束**、decode 用 token 计数窗口、每并发档 16 请求、充分预热);**GLM-5.3-Flash 行为 2026-10-17 实测**(按 §2/§3,15K 载荷、每档 16 请求、`--outlen 1024`、充分预热)。首行是 **v0.3.0 新增的辅助 GPU（侧车）数据**（2026-10-24）。
-* 口径(**v0.2.8 起变更,唯一权威定义见 [`docs/BENCH_PROTOCOL.md`](docs/BENCH_PROTOCOL.md)**):**prefill** = `Σ预填 token ÷ 最后一路解码开始时刻`,从**冷缓存**测(计数一律取服务端 `usage`);**decode** = ⭐ **固定输出长度**(`max_tokens=min_tokens` + `ignore_eos`,每请求恰好 N 个 token)、**满 C 连续灌入**下的 **`Σ输出token ÷ Σ(解码段)`**,再 **× C** 得聚合值 —— 固定输出长度使"分子"不再是随机变量,消除了旧口径里"接受长度抽样"带来的 ±10% 级抖动(**B416/B418**);校验脚本 `scripts/bench_protocol_check.py`。⭐ **`deg`(复制循环体检)是这些数字的必要标注**。⚠️ **1017 行是例外**:按 `BENCH_PROTOCOL` §6 用**自然结束 + token 计数窗口**,不是固定 1024;跨行不可直接比较。
-* 配置细节、判据与 `MBT` 取舍见 `docs/TUNING_GUIDE.md` §8、`docs/MODEL_GUIDES.md` §0.1。
+> 统一测试口径：[`docs/BENCH_PROTOCOL.md`](docs/BENCH_PROTOCOL.md) · 详细测试方法：[`docs/SIDECAR_GPU0_POSTMORTEM.md`](docs/SIDECAR_GPU0_POSTMORTEM.md)
 
 | 模型(最优配置) | 负载 | 实际 token | 并发 | prefill (tok/s) | decode (tok/s) |
 |---|---|---|---|---|---|
-| **DeepSeek-V4.1-Flash (1017) + GPU0 侧车（v0.3.0）**<br>TP=2 · util 0.70 · MAXLEN 524288 · MBT 8192 · seqs 4 · DSpark k=5 · PIN off<br>`GPUS=1,2,0` · `XTU_SIDECAR=gpu0` · **1900 槽** | 真实 DSH 15K v2† | ≈15,000 | 4 | **1,206** | **106.8**§ |
-| **DeepSeek-V4.1-Flash (1017)**<br>TP=2 · util 0.70 · **MAXLEN 524288**<br>**MBT 8192** · **seqs 4** · **DSpark k=5** · **PIN off** | 真实 DSH 15K v2† | ≈15,000 | 1 | **1,190** | **68.6**‡‡ |
-| | 真实 DSH 15K v2† | ≈15,000 | 2 | **1,197** | **70.8**‡‡ |
-| | 真实 DSH 15K v2† | ≈15,000 | 4 | **1,206** | **79.6**‡‡ |
-| **Qwen3.8-Flash-Next(qfn)**<br>TP=2 · util 0.90 · **MAXLEN 262144**<br>**MBT 8192** · **MTP 关** · **12 层精选常驻** · `FULL_DECODE_ONLY` | 真实 DSH 15K v2† | ≈15,000 | 1 | **1,517** | **46.3** |
-| | 真实 DSH 15K v2† | ≈15,000 | 2 | **1,538** | **92.9** |
-| | 真实 DSH 15K v2† | ≈15,000 | 4 | **1,529** | **127.3** |
-| **GLM-5.3-Flash**<br>TP=2 · util 0.90 · **MAXLEN 262144**<br>MBT 8192 · **MTP k=4** · **GPU 预填开**(v0.2.8 配置) | 真实 DSH 载荷‡ | ≈14,500 | 1 | **1,477** | **29.8** |
-| | 真实 DSH 载荷‡ | ≈14,500 | 2 | **1,441** | **31.6** |
-| | 真实 DSH 载荷‡ | ≈14,500 | 4 | **1,394** | **37.2** |
-
-‡ 负载 = **真实 DSH 会话载荷**(预装配 `<|im_start|>` 模板,即真实 HTTP 形状;互异、天然长输出)。**decode 列 = 聚合吞吐**(每请求解码段 × C)。口径:greedy、**固定输出长度 1024**(`max_tokens=min_tokens` + `ignore_eos`,⛔ 自然结束会让"输出 token 数"变成随机变量而引入 ±10% 级抖动)、**满 C 连续灌入**(槽位利用率实测 0.99)、每档 16(DS41F)/ 8(GLM)条请求。⚠️ **`deg`(8-gram 复制率)是必要标注**:强制长输出会落进复制循环而抬高 tok/s(实测 `deg` 中位 0.37~0.72)⇒ 判"引擎是否更快"请看发行说明里的**步时**。**prefill**:冷测(§ 见 `docs/BENCH_PROTOCOL.md`);§ C≥2 时预填串行 ⇒ 聚合 prefill 与 C=1 接近。**相对无投机的收益 ≈2.9× / 2.1× / 1.7×**(旧 "2.4×/2.4×/1.8×" 受强制续写污染,已作废)。旧口径(每请求解码段 × C 的 48.7/70.4/95.2、GLM 短负载 115.2/22.0)已归档到 [`docs/BENCH_HISTORY.md`](docs/BENCH_HISTORY.md)。全部数据与口径演变见 [v0.2.8 发行说明](RELEASE_NOTES_v0.2.8.md)。⚠️ **1017 行的 decode 为自然结束的 token 计数窗口,与 GLM/qfn 的固定 1024 口径不同,跨行不可直接比较**;1017 在 524K + 700 槽 PIN 下仍会触发 `aten::new_empty` 谷底 OOM(见 `dev-docs/BUG_REGISTRY.md` A68),故本行用 **PIN off + util 0.70** 的稳定配置。
-
-
-
-§ 侧车行（2026-10-24，DSpark 开）：C=4 三次 **106.8 / 108.5 / 81.1** tok/s —— **tok/s 随投机接受率浮动**（83%→65%→40%）；**步时收益三次稳定 −41%**（115.5ms vs 197.5ms，三次均值）。明细见 [`docs/SIDECAR_GPU0_POSTMORTEM.md`](docs/SIDECAR_GPU0_POSTMORTEM.md)。
-
-‡‡ 2026-10-24 按同一官方口径复测（`dsh_15k_v2` + `bench_decode_window.py --tokenizer`、每档 2×C 预热）：decode **68.6 / 70.8 / 79.6** tok/s；同档 fixed-16 为 43.7 / 62.9 / 73.8。明细见 [`docs/SIDECAR_GPU0_POSTMORTEM.md`](docs/SIDECAR_GPU0_POSTMORTEM.md)。
-
-† **qfn 行口径(2026-10-19 用户统一口径,`docs/BENCH_PROTOCOL.md` §6/§6.1)**:15K prompt、`MBT=8192`、TP=2、GPU prefill on;
-**prefill** = 15K 冷预填(16 条/档);**decode = 稳态解码窗口**(C 条 15K 请求**全部产出首 token 之后**才计时,排除预填竞争;步时 21.6 / 21.5 / 31.4 ms)。
-自然结束口径,**不要与上表固定长度行直接比较**;⛔ 不得用"连续灌入"下混入预填等待的聚合数回答扩展性(§6.1 有反例)。
+| **DeepSeek-V4.1-Flash (1017) + GPU0 侧车（v0.3.0）**<br>TP=2 · util 0.70 · MAXLEN 524288 · MBT 8192 · seqs 4 · DSpark k=5 · PIN off<br>`GPUS=1,2,0` · `XTU_SIDECAR=gpu0` · **1900 槽** | 真实 DSH 15K v2 | ≈15,000 | 4 | **1,206** | **106.8** |
+| **DeepSeek-V4.1-Flash (1017)**<br>TP=2 · util 0.70 · **MAXLEN 524288**<br>**MBT 8192** · **seqs 4** · **DSpark k=5** · **PIN off** | 真实 DSH 15K v2 | ≈15,000 | 1 | **1,190** | **68.6** |
+| | 真实 DSH 15K v2 | ≈15,000 | 2 | **1,197** | **70.8** |
+| | 真实 DSH 15K v2 | ≈15,000 | 4 | **1,206** | **79.6** |
+| **Qwen3.8-Flash-Next(qfn)**<br>TP=2 · util 0.90 · **MAXLEN 262144**<br>**MBT 8192** · **MTP 关** · **12 层精选常驻** · `FULL_DECODE_ONLY` | 真实 DSH 15K v2 | ≈15,000 | 1 | **1,517** | **46.3** |
+| | 真实 DSH 15K v2 | ≈15,000 | 2 | **1,538** | **92.9** |
+| | 真实 DSH 15K v2 | ≈15,000 | 4 | **1,529** | **127.3** |
+| **GLM-5.3-Flash**<br>TP=2 · util 0.90 · **MAXLEN 262144**<br>MBT 8192 · **MTP k=4** · **GPU 预填开**(v0.2.8 配置) | 真实 DSH 载荷 | ≈14,500 | 1 | **1,477** | **29.8** |
+| | 真实 DSH 载荷 | ≈14,500 | 2 | **1,441** | **31.6** |
+| | 真实 DSH 载荷 | ≈14,500 | 4 | **1,394** | **37.2** |
 
 ## 快速开始
 

@@ -82,7 +82,7 @@
 
 
 
-§ 侧车行（2026-10-24，DSpark 开）：C=4 三次 **106.8 / 108.5 / 81.1** tok/s —— **tok/s 随投机接受率浮动**（83%→65%→40%）；**步时收益三次稳定 −34%**（115.6ms vs 197.4ms）。明细见 [`docs/SIDECAR_GPU0_POSTMORTEM.md`](docs/SIDECAR_GPU0_POSTMORTEM.md)。
+§ 侧车行（2026-10-24，DSpark 开）：C=4 三次 **106.8 / 108.5 / 81.1** tok/s —— **tok/s 随投机接受率浮动**（83%→65%→40%）；**步时收益三次稳定 −41%**（115.5ms vs 197.5ms，三次均值）。明细见 [`docs/SIDECAR_GPU0_POSTMORTEM.md`](docs/SIDECAR_GPU0_POSTMORTEM.md)。
 
 ‡‡ 2026-10-24 按同一官方口径复测（`dsh_15k_v2` + `bench_decode_window.py --tokenizer`、每档 2×C 预热）：decode **68.6 / 70.8 / 79.6** tok/s；同档 fixed-16 为 43.7 / 62.9 / 73.8。明细见 [`docs/SIDECAR_GPU0_POSTMORTEM.md`](docs/SIDECAR_GPU0_POSTMORTEM.md)。
 

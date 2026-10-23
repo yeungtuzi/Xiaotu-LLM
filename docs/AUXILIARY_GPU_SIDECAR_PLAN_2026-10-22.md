@@ -1022,3 +1022,15 @@ GPU0 要参与，需要以下之一：
 - `docs/QFN_NVFP4_PROGRESS_2026-10-23.md`：qfn 加载/基准/内核细节；
 - `docs/QFN_NVFP4_SIDECAR_A_PLAN.md`：A 方案实施计划；
 - `docs/patches/qfn_nvfp4_vllm_2026-10-23.patch`：vLLM 补丁（可反向）。
+
+---
+
+## 28. 2026-10-24 09:15 后续任务登记（用户指定）
+
+**ds41f 侧车 C=2 / C=4 基准**（qfn A 完成并留档后执行）：
+
+- 用户已知 **C=1 是负值**，仍要求看 C=2/4 的表现；
+- 目的：确认侧车在并发下能否靠"跨请求重叠"转正；
+- 协议：与既有 C=1 基准同环境（GPU1/2 + GPU0 侧车 + PIN 表），
+  分别测 C=2、C=4 的聚合 tok/s、单请求 tok/s、CPU/GPU 时间占比；
+- 产出写入本报告与 `dev-docs/report/`，与 qfn 基准并列。

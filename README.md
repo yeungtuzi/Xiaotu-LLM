@@ -69,6 +69,7 @@
 | **DeepSeek-V4.1-Flash (1017)**<br>TP=2 · util 0.70 · **MAXLEN 524288**<br>**MBT 8192** · **seqs 4** · **DSpark k=5** · **PIN off** | 真实 DSH 15K v2† | ≈15,000 | 1 | **1,190** | **68.6**‡‡ |
 | | 真实 DSH 15K v2† | ≈15,000 | 2 | **1,197** | **70.8**‡‡ |
 | | 真实 DSH 15K v2† | ≈15,000 | 4 | **1,206** | **79.6**‡‡ |
+| **DeepSeek-V4.1-Flash (1017) + GPU0 侧车**<br>同上 + `GPUS=1,2,0` · `XTU_SIDECAR=gpu0` · **1900 槽** | 真实 DSH 15K v2† | ≈15,000 | 4 | **1,206** | **106.8**§ |
 | **MiMo-V2.6-Flash-RL**<br>TP=2 · util 0.85 · **MAXLEN 131072**<br>MBT 8192 · **seqs 4** · **MTP k=1** · **GPU 预填开(门槛 4096)** | 短(随机) | 128 | 1 | **232.0** | **30.5** |
 | | 短(随机) | 128 | 2 | **367.5** | **40.7** |
 | | 长(随机) | 16,384 | 1 | **811.3** | **27.3** |
@@ -80,6 +81,8 @@
 ‡ 负载 = **真实 DSH 会话载荷**(预装配 `<|im_start|>` 模板,即真实 HTTP 形状;互异、天然长输出)。**decode 列 = 聚合吞吐**(每请求解码段 × C)。口径:greedy、**固定输出长度 1024**(`max_tokens=min_tokens` + `ignore_eos`,⛔ 自然结束会让"输出 token 数"变成随机变量而引入 ±10% 级抖动)、**满 C 连续灌入**(槽位利用率实测 0.99)、每档 16(DS41F)/ 8(GLM)条请求。⚠️ **`deg`(8-gram 复制率)是必要标注**:强制长输出会落进复制循环而抬高 tok/s(实测 `deg` 中位 0.37~0.72)⇒ 判"引擎是否更快"请看发行说明里的**步时**。**prefill**:冷测(§ 见 `docs/BENCH_PROTOCOL.md`);§ C≥2 时预填串行 ⇒ 聚合 prefill 与 C=1 接近。**相对无投机的收益 ≈2.9× / 2.1× / 1.7×**(旧 "2.4×/2.4×/1.8×" 受强制续写污染,已作废)。旧口径(每请求解码段 × C 的 48.7/70.4/95.2、GLM 短负载 115.2/22.0)已归档到 [`docs/BENCH_HISTORY.md`](docs/BENCH_HISTORY.md)。全部数据与口径演变见 [v0.2.8 发行说明](RELEASE_NOTES_v0.2.8.md)。⚠️ **1017 行的 decode 为自然结束的 token 计数窗口,与 GLM/MiMo/qfn 的固定 1024 口径不同,跨行不可直接比较**;1017 在 524K + 700 槽 PIN 下仍会触发 `aten::new_empty` 谷底 OOM(见 `dev-docs/BUG_REGISTRY.md` A68),故本行用 **PIN off + util 0.70** 的稳定配置。
 
 
+
+§ 侧车行（2026-10-24，DSpark 开）：C=4 三次 **106.8 / 108.5 / 81.1** tok/s —— **tok/s 随投机接受率浮动**（83%→65%→40%）；稳定的是 **TPOT：115.6ms vs 197.4ms（−34%），三次一致**。明细见 [`docs/SIDECAR_GPU0_POSTMORTEM.md`](docs/SIDECAR_GPU0_POSTMORTEM.md)。
 
 ‡‡ 2026-10-24 按同一官方口径复测（`dsh_15k_v2` + `bench_decode_window.py --tokenizer`、每档 2×C 预热）：decode **68.6 / 70.8 / 79.6** tok/s；同档 fixed-16 为 43.7 / 62.9 / 73.8。明细见 [`docs/SIDECAR_GPU0_POSTMORTEM.md`](docs/SIDECAR_GPU0_POSTMORTEM.md)。
 

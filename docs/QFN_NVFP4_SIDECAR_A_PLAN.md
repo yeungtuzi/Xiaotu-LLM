@@ -121,3 +121,19 @@
 
 **同时确认**：跨设备 CUDA Graph capture 冲突 ⇒ P1 暂用 `EAGER=1`；
 后续要么禁用该层的 graph，要么把侧车调用移到 capture 之外。
+
+### 5.8 P1 深挖（2026-10-24 10:05，TP=1 隔离）
+
+- 侧车设备改为"最后一个可见设备"（TP=1: cuda:1；TP=2: cuda:2），
+  TP=1 单 rank 成功复制 **1.416GB**（512 专家）；
+- `forward_modular` 分流触发，`topk_ids` 是**全局 id**（0–505），`w13_weight_scale_2`
+  形状 `[512,2]` fp32；
+- **发现 NaN**：prefill（x 最大 7.5、560 行）时 `acc=nan`；decode（x 2.3、10 行）时
+  `acc=0.0497` 正常 ⇒ NaN 只在大 batch/较大激活时出现；
+- 加 `nan_to_num` 兜底后文本**部分恢复**（"1+1 equals 2" 出现），但仍有乱码 token，
+  且 debug 显示 decode 的 `acc` 被兜底成 0 ⇒ 贡献丢失；
+- 下一步：定位 NaN 来源（怀疑 `silu*up` 在 bf16 溢出，或个专家 `scale_2` 异常），
+  改为 fp32 激活、逐专家上限检查后再 bf16。
+
+**当前结论**：P1 的"置零 + 并回"机制可跑通，但数值稳定性未解决；
+vLLM 源码已恢复，补丁归档 `docs/patches/qfn_a_forward_v2.patch`。

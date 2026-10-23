@@ -1,7 +1,7 @@
-# 辅助 GPU（侧车）开发计划 —— 定稿
+# 辅助 GPU（挎斗）开发计划 —— 定稿
 
 > 状态：**定稿（2026-10-22）**。本文替代此前所有「3GPU / 三卡」口头方案。
-> 术语：**辅助 GPU = 侧车（sidecar）**；本文不再把方案称作“3GPU/三卡”。
+> 术语：**辅助 GPU = 挎斗（sidecar）**；本文不再把方案称作“3GPU/三卡”。
 > 适用范围：3×A100-PCIE-40GB（sm_80），主线模型 ds41f（DeepSeek-V4.1-Flash-1017）。
 > 证据等级标注：**[实测]** / **[读码]** / **[推算]**。
 
@@ -9,9 +9,9 @@
 
 ## 0. 一页结论
 
-1. **主线目标**：让“**放不下**”的模型（ds41f：专家 ≈289 GB）用一张**可选的辅助 GPU（侧车）**加速
-   **单流（C=1）decode**；GPU1/2 主服务零改动、可随时撤掉侧车。
-2. **形态**：decode-only 的**整专家侧车**。GPU0 放 ≈1,900 个整专家（≈36 GB），
+1. **主线目标**：让“**放不下**”的模型（ds41f：专家 ≈289 GB）用一张**可选的辅助 GPU（挎斗）**加速
+   **单流（C=1）decode**；GPU1/2 主服务零改动、可随时撤掉挎斗。
+2. **形态**：decode-only 的**整专家挎斗**。GPU0 放 ≈1,900 个整专家（≈36 GB），
    **GPU1/2 不驻留专家（PIN=0）**，KV 优先保证 **512K × 4 并发**。
 3. **预期**：C=1 步时 **+10～14%**（打折后）[推算]；乐观 +16～18%。
 4. **成败线**：跨设备 partial 能否进 `FULL_DECODE_ONLY` CUDA 图 —— 先做**单层 spike**，一票否决。
@@ -22,7 +22,7 @@
 ## 1. 定位：框架解决的是“比值 > 1”
 
 ```
-模型专家总字节 / 可用侧车显存 > 1   ⇒ 本框架的战场（ds41f：≈289GB / 40GB ≈ 7.2）
+模型专家总字节 / 可用挎斗显存 > 1   ⇒ 本框架的战场（ds41f：≈289GB / 40GB ≈ 7.2）
                               ≤ 1   ⇒ 退化情形（qfn：68GB / 120GB），PP+TP 原生即可
 ```
 
@@ -34,10 +34,10 @@
 
 ### 1.1 非目标（写死，避免反复讨论）
 
-- ⛔ prefill 加速（侧车不参与 prefill；prefill 冻结现状）；
+- ⛔ prefill 加速（挎斗不参与 prefill；prefill 冻结现状）；
 - ⛔ TP=3（每层切 3 份 + 每层 all-reduce）；
 - ⛔ 以“全驻留”为产品形态；
-- ⛔ 为侧车扩大上下文×并发；
+- ⛔ 为挎斗扩大上下文×并发；
 - ⛔ 运行期热插拔（只在**启动时**加入/撤除）；
 - ⛔ 改动 GPU1/2 的主服务结构（TP/PP/KV 预算）。
 
@@ -97,15 +97,15 @@
 
 ```
 GPU1/2：完整主服务（TP=2、CPU MoE、GPU prefill、DSpark 全部照旧）；PIN=0
-GPU0  ：可选侧车，只服务 decode；放 ≈1,900 个整专家（≈36 GB），留 ≈4 GB
+GPU0  ：可选挎斗，只服务 decode；放 ≈1,900 个整专家（≈36 GB），留 ≈4 GB
 ```
 
 **不变量：**
 
 1. 同一专家**不在两处**工作（GPU0 一份，主机 checkpoint 作后备）；
-2. 侧车**不参与 prefill**；
-3. 启动时二选一：`XTU_SIDECAR=gpu0` 才加载侧车；**不设 / `none` / `0` / `off` ⇒ 跑今天验证过的全路径**；
-4. **运行期故障 = fail-closed**：侧车该请求显式失败，绝不静默降级（主服务已“不算”这些专家）。
+2. 挎斗**不参与 prefill**；
+3. 启动时二选一：`XTU_SIDECAR=gpu0` 才加载挎斗；**不设 / `none` / `0` / `off` ⇒ 跑今天验证过的全路径**；
+4. **运行期故障 = fail-closed**：挎斗该请求显式失败，绝不静默降级（主服务已“不算”这些专家）。
 
 ### 3.2 逐层数据面
 
@@ -159,11 +159,11 @@ decode 走 `FULL_DECODE_ONLY` 图，而 CUDA graph 是**单设备**的。三条�
 | 项 | 判据 |
 |---|---|
 | C=4 | 不退化（允许 ≤2% 噪声） |
-| prefill | 不退化（侧车不参与，应完全不变） |
+| prefill | 不退化（挎斗不参与，应完全不变） |
 | 正确性 | on/off 逐 token greedy 一致；工具调用标记/参数解析一致 |
 | 显存 | GPU0 <40 GB 且留 ≥3 GB；GPU1/2 KV ≥ 4×512K + 余量 |
 | 可撤除 | `off` 回到今天验证过的配置，零回归 |
-| 故障 | 侧车故障 ⇒ 该请求显式失败；主服务不崩 |
+| 故障 | 挎斗故障 ⇒ 该请求显式失败；主服务不崩 |
 | 稳定性 | 24 h 无 OOM/泄漏 |
 
 ### 4.3 度量纪律
@@ -192,7 +192,7 @@ decode 走 `FULL_DECODE_ONLY` 图，而 CUDA graph 是**单设备**的。三条�
 |---|---|---|
 | P1.1 单层、64 专家、eager | 关键路径增量（µs/层） | 增量 < 命中节省 |
 | P1.2 同配置开图（A/B/C 三选一） | 捕获是否成功 + 失败模式 | **图方案可行**；否则止损 |
-| P1.3 fail-closed 路径 | 侧车异常时请求失败、主服务存活 | 通过 |
+| P1.3 fail-closed 路径 | 挎斗异常时请求失败、主服务存活 | 通过 |
 
 **P1 门禁失败 ⇒ 停止，不进入 P2**（如实出负结论）。
 
@@ -210,7 +210,7 @@ decode 走 `FULL_DECODE_ONLY` 图，而 CUDA graph 是**单设备**的。三条�
 | 任务 | 交付 |
 |---|---|
 | P3.1 启动开关（`XTU_SIDECAR=gpu0`）+ 配置校验 | 一键切换 |
-| P3.2 可观测性（命中率、handoff µs、侧车失败计数） | 日志/指标 |
+| P3.2 可观测性（命中率、handoff µs、挎斗失败计数） | 日志/指标 |
 | P3.3 24 h 稳定性 + 故障注入 | 报告 |
 | P3.4 回滚手册 + 文档 | RUNBOOK 增补 |
 
@@ -247,7 +247,7 @@ decode 走 `FULL_DECODE_ONLY` 图，而 CUDA graph 是**单设备**的。三条�
 | CPU 固定开销不省 | 实际收益低于覆盖 | 按 0.6–0.8 折；以 A/B 为准 |
 | handoff 成为关键路径 | 两头等 | 层内并行；λ>100µs 时改集中形态 |
 | GPU0 OOM | 服务不可用 | 槽数降到 1,200；留 4 GB |
-| 侧车故障静默降级 | 输出错 | fail-closed；启动开关 fail-open |
+| 挎斗故障静默降级 | 输出错 | fail-closed；启动开关 fail-open |
 | 重复放置 | 违反资源规则 | GPU1/2 PIN=0；全局表去重 |
 
 ---
@@ -255,7 +255,7 @@ decode 走 `FULL_DECODE_ONLY` 图，而 CUDA graph 是**单设备**的。三条�
 ## 8. 参数速查
 
 ```
-GPU0 侧车：slots=1900（整专家 18.81MB），约 36 GB，留 4 GB
+GPU0 挎斗：slots=1900（整专家 18.81MB），约 36 GB，留 4 GB
 GPU1/2  ：PIN=0；TP=2；MBT=8192；MAXLEN=524288；util=0.70
 KV      ：fp8_ds_mla；4×512K ≈2.84 GB；池 3.43 GiB；余 ≈0.84 GB
 采集    ：DSpark k=5；15K v2；GPU prefill on；PIN=0（路由与 PIN 无关）
@@ -277,7 +277,7 @@ KV      ：fp8_ds_mla；4×512K ≈2.84 GB；池 3.43 GiB；余 ≈0.84 GB
 |---|---|
 | `torch.Tensor.copy_` 跨设备进 capture | ⛔ **FAIL** `cudaErrorStreamCaptureInvalidated` |
 | **raw `cudaMemcpyAsync`（kind=Default）进 capture** | ✅ **OK**，1→0 / 0→1 双向、replay 后数据正确 |
-| **GPU0 的 torch kernel 放进 GPU1 的图** | ⛔ **capture 返回 OK，但 replay 后侧车输出恒 0（静默不执行）** |
+| **GPU0 的 torch kernel 放进 GPU1 的图** | ⛔ **capture 返回 OK，但 replay 后挎斗输出恒 0（静默不执行）** |
 | GPU0 单独一张图（只含本设备 kernel） | ✅ OK（约 17 µs/replay） |
 | 同一进程先后在两张卡上抓图 | ⚠️ 后抓的那张可能**空图**（PyTorch 限制）|
 | eager 两次跨设备拷贝 + 主图 add | ≈**53 µs/层** |
@@ -285,11 +285,11 @@ KV      ：fp8_ds_mla；4×512K ≈2.84 GB；池 3.43 GiB；余 ≈0.84 GB
 
 ### 9.2 结论（写死）
 
-1. **单图里放侧车 kernel 绝对禁止** —— 它不报错、只产出 0；这是最危险的失败模式。
+1. **单图里放挎斗 kernel 绝对禁止** —— 它不报错、只产出 0；这是最危险的失败模式。
 2. 跨设备**拷贝**可以进图（raw API），跨设备**计算**不可以。
 3. ⇒ 生产形态只有两条：
-   - **O1（原型先用）**：主图只做本设备；侧车 kernel + 拷贝 **eager**，事件同步；≈50 µs/层（40 层 ≈2 ms，约 +2.4% 开销）。
-   - **O2（目标形态）**：**侧车独立进程/常驻核 + peer-memory doorbell**；主图内只有**本设备 kernel**（写 doorbell / 自旋等 ack / 读 partial），
+   - **O1（原型先用）**：主图只做本设备；挎斗 kernel + 拷贝 **eager**，事件同步；≈50 µs/层（40 层 ≈2 ms，约 +2.4% 开销）。
+   - **O2（目标形态）**：**挎斗独立进程/常驻核 + peer-memory doorbell**；主图内只有**本设备 kernel**（写 doorbell / 自旋等 ack / 读 partial），
      全部是可捕获的同设备节点 ⇒ 既能进图，又没有跨设备拷贝 API。
 4. 同一进程多设备抓图的空图问题 ⇒ O2 用**独立进程**规避，而不是依赖 PyTorch 多图。
 
@@ -301,13 +301,13 @@ KV      ：fp8_ds_mla；4×512K ≈2.84 GB；池 3.43 GiB；余 ≈0.84 GB
 
 ---
 
-## 10. 2026-10-23 O3 定稿：侧车挂在**同步 host-function** 里，不做跨设备图
+## 10. 2026-10-23 O3 定稿：挎斗挂在**同步 host-function** 里，不做跨设备图
 
 ### 10.1 为什么改
 
 `binding.cpp` 的生产默认是 **`XIAOTU_MOE_ASYNC=0`（同步 host-function）**：
 每层 CPU MoE 跑在 `cudaLaunchHostFunc` 回调里，**本来就把整条流阻塞 0.5–0.7 ms**。
-⇒ 侧车只要在这段窗口内**并行**完成，关键路径几乎不增加，而且：
+⇒ 挎斗只要在这段窗口内**并行**完成，关键路径几乎不增加，而且：
 - 不需要跨设备 graph 节点；
 - 不需要常驻核 / doorbell；
 - 不需要改 `FULL_DECODE_ONLY` 的捕获结构。
@@ -317,11 +317,11 @@ KV      ：fp8_ds_mla；4×512K ≈2.84 GB；池 3.43 GiB；余 ≈0.84 GB
 | 项 | 实测 |
 |---|---|
 | 纯 CPU（模拟每层 CPU MoE，0.55 ms） | 0.604 ms/层 |
-| CPU + 侧车 worker（GPU0 matmul + H2D/D2H） | 0.621 ms/层 |
-| 侧车 worker 自身 | **71 µs/层** |
+| CPU + 挎斗 worker（GPU0 matmul + H2D/D2H） | 0.621 ms/层 |
+| 挎斗 worker 自身 | **71 µs/层** |
 | **关键路径增量** | **≈17 µs/层**（40 层 ≈0.7 ms/step，约 0.8%） |
 
-⇒ 侧车被 CPU MoE **完全遮住**；增量只是线程唤醒 + 合并。
+⇒ 挎斗被 CPU MoE **完全遮住**；增量只是线程唤醒 + 合并。
 
 ### 10.3 实现形态
 
@@ -329,14 +329,14 @@ KV      ：fp8_ds_mla；4×512K ≈2.84 GB；池 3.43 GiB；余 ≈0.84 GB
 graph replay
   └─ host-function（每层，已存在）
        ├─ 读 pinned ids/weights，查本层命中位图
-       ├─ 把命中专家的 ids/weights 拷到侧车请求区（pinned）
+       ├─ 把命中专家的 ids/weights 拷到挎斗请求区（pinned）
        ├─ 置 request 原子标志
        ├─ run_moe_and_ep(...)          ← CPU 引擎算非命中专家（命中项权重置 0 跳过）
        ├─ 等 done 原子标志
        └─ out[i] += sidecar_out[i]     ← 纯 host 合并，再走原有 H2D 回写
 ```
 
-- 侧车 worker：独立线程 + GPU0 stream，持有 GPU0 的 `LayerPool`；
+- 挎斗 worker：独立线程 + GPU0 stream，持有 GPU0 的 `LayerPool`；
 - **host-function 内不调用任何 CUDA API**（只碰原子/内存），CUDA 调用都在 worker 线程；
 - 命中专家在 CPU 侧用 `weight=0` 跳过（B1052 已有“跳过 weight==0 pair”的机制）；
 - 表静态、启动时加载；`XTU_SIDECAR=gpu0` 才启用；**不设 / `none` / `0` / `off` ⇒ 标准路径**（零变化）。
@@ -357,7 +357,7 @@ DSpark k=5、8 会话、40,880 条 decode、40 层；**split-half held-out**（�
 | 1,200 | 22.6 GB | **49.7%** | 18/30/38 |
 | **1,900** | **35.7 GB** | **62.6%**（发射表实测） | 33/49/61 |
 
-- ⭐ **静态表远好于动态 LRU**：700 槽 held-out 38.8% vs LRU 10.7% ⇒ 侧车必须用**静态表**。
+- ⭐ **静态表远好于动态 LRU**：700 槽 held-out 38.8% vs LRU 10.7% ⇒ 挎斗必须用**静态表**。
 - 表：`expert_pin_sidecar_{1200,1900}.bin`，md5 `7d546ded…` / `e0ef80a3…`；
   已按 `load_pin_table` 校验：XTUP v1、40 层、1,900 条、专家 id 0–383、无越界。
 
@@ -385,19 +385,19 @@ DSpark k=5、8 会话、40,880 条 decode、40 层；**split-half held-out**（�
 
 | 模型 | 表 | GPU0 在 | GPU0 撤除后 |
 |---|---|---|---|
-| ds41f | 部分驻留（≈1,900 整专家） | 侧车加速 | 纯 CPU 路径（今天的行为） |
-| qfn | **全驻留**（GPU1/2 + GPU0 覆盖全部专家） | 侧车补全 | **GPU1/2 部分驻留 + CPU 兜底**（同一套侧车协议，表换成“只含 GPU1/2 可容纳的专家”） |
+| ds41f | 部分驻留（≈1,900 整专家） | 挎斗加速 | 纯 CPU 路径（今天的行为） |
+| qfn | **全驻留**（GPU1/2 + GPU0 覆盖全部专家） | 挎斗补全 | **GPU1/2 部分驻留 + CPU 兜底**（同一套挎斗协议，表换成“只含 GPU1/2 可容纳的专家”） |
 
 - **不再把 qfn 当成“PP+TP 原生、与本框架无关”的退化情形**；
-- qfn 全驻留 = **同一套 host-function 侧车 + 表**，只是表覆盖 100%；
+- qfn 全驻留 = **同一套 host-function 挎斗 + 表**，只是表覆盖 100%；
 - GPU0 撤除 = 换表重启（不是改代码）；
 - 因此 qfn 是这套机制的**强验证**：同一数据面既跑“部分驻留”，也跑“全驻留”。
 
 ### 12.1 对实现的含义
 
 1. 表的语义统一为「**(layer, expert) → 驻留设备**」；GPU0/GPU1/2 都只是“执行器”。
-2. host-function 侧车协议不变：命中项权重置 0、worker 并行算、host 合并；
-   worker 可以跑在 GPU0（侧车），也可以跑在 GPU1/2（本卡池）。
+2. host-function 挎斗协议不变：命中项权重置 0、worker 并行算、host 合并；
+   worker 可以跑在 GPU0（挎斗），也可以跑在 GPU1/2（本卡池）。
 3. qfn 的回退表在**启动时**生成/选择：GPU0 不在 ⇒ 只保留 GPU1/2 放得下的专家集合。
 4. 验收：qfn 全驻留与撤除 GPU0 后的部分驻留，**同一请求 greedy 一致**（或 needle 语义一致）。
 
@@ -426,7 +426,7 @@ DSpark k=5、8 会话、40,880 条 decode、40 层；**split-half held-out**（�
 
 - **全驻留表**：GPU1/2 + GPU0 覆盖全部专家；GPU0 撤除 ⇒ 换 **部分驻留表** 重启；
 - 部分驻留表：只保留 GPU1/2 放得下的专家（约 55–60%），其余 CPU；
-- 两种表共用同一 host-function 侧车协议与 worker。
+- 两种表共用同一 host-function 挎斗协议与 worker。
 
 ### 13.2 当前代码状态（可回滚）
 
@@ -444,7 +444,7 @@ DSpark k=5、8 会话、40,880 条 decode、40 层；**split-half held-out**（�
 
 ## 14. 2026-10-23 P2 实机冒烟：两个硬 blocker（C=1 结论反转）
 
-在 ds41f TP=1（GPU1 主 + GPU0 侧车，200 槽表，128K）上实跑，得到两个必须先解决的 blocker：
+在 ds41f TP=1（GPU1 主 + GPU0 挎斗，200 槽表，128K）上实跑，得到两个必须先解决的 blocker：
 
 ### 14.1 GPU0 池装载失败（loader 不是 device-agnostic）
 
@@ -453,7 +453,7 @@ DSpark k=5、8 会话、40,880 条 decode、40 层；**split-half held-out**（�
   `ValueError: Pointer argument cannot be accessed from Triton (cpu tensor?)`
 - 根因：`gpu_prefill.kmajor_from_engine_shards_noraw` 的装配路径假设“目标设备 = 当前设备”，
   在非当前设备（物理 GPU0 / logical 1）上把 CPU 分片指针交给 Triton ⇒ 失败。
-- ⇒ 需要：loader 显式按 `device` 建流/拷入，或把侧车池放到**独立进程**里建。
+- ⇒ 需要：loader 显式按 `device` 建流/拷入，或把挎斗池放到**独立进程**里建。
 
 ### 14.2 MXFP4 池内核在 C=1 太慢（决定性）
 
@@ -463,7 +463,7 @@ DSpark k=5、8 会话、40,880 条 decode、40 层；**split-half held-out**（�
 | 同上 qlen=4 | 1.06 ms/层（固定开销主导） |
 | CPU MoE 每层 | ≈0.55 ms（fwd） |
 
-⇒ 侧车**关键路径 1.07ms > 被替代的 CPU 0.55ms** ⇒ 即使完全重叠，
+⇒ 挎斗**关键路径 1.07ms > 被替代的 CPU 0.55ms** ⇒ 即使完全重叠，
 每层还要多等 ≈0.5ms ⇒ 40 层 ≈ +20ms，而命中只省 ≈13.8ms ⇒ **C=1 净负**。
 （这也解释了 B1058 为什么 ds41f PIN 在 C=1 净负、C≥4 才转正：固定开销被摊薄。）
 
@@ -471,7 +471,7 @@ DSpark k=5、8 会话、40,880 条 decode、40 层；**split-half held-out**（�
 
 - **P2 暂停**：当前 MXFP4 池内核不能支撑 C=1 目标；
 - 必须先做**decode 专用 MXFP4 内核**（目标 <0.3ms/层，固定开销主导 ⇒ 需持久化/批内合并），
-  或把侧车限定在 C≥4（但那不是本项目的主目标）；
+  或把挎斗限定在 C≥4（但那不是本项目的主目标）；
 - 另需修 **GPU0 池 loader**（14.1）；
 - 已修的坑：`CUDA_VISIBLE_DEVICES` 物理/逻辑换算（`gpu0` 必须解析物理 0）、
   首次调用 1.9s 需预热、pinned 缓冲需在 `inference_mode(False)` 下分配。
@@ -480,7 +480,7 @@ DSpark k=5、8 会话、40,880 条 decode、40 层；**split-half held-out**（�
 
 ---
 
-## 15. 2026-10-23 内核量化：C=1 的瓶颈是 GPU kernel，不是侧车协议
+## 15. 2026-10-23 内核量化：C=1 的瓶颈是 GPU kernel，不是挎斗协议
 
 ### 15.1 实测（GPU0，随机 plane，S=8，qlen=1/4）
 
@@ -495,11 +495,11 @@ DSpark k=5、8 会话、40,880 条 decode、40 层；**split-half held-out**（�
 - 每层读 6 专家 ×35.4MB ≈ **212MB**；0.83ms ⇒ 有效带宽 ≈**255GB/s**，
   而 A100 HBM 峰值 1.5TB/s ⇒ 理论上限 ≈**0.14ms**，还有 ~6× 空间；
 - 结论：**现有 prefill 型分组 GEMM 在 T=1 严重低效**（按 BM=64 铺行 + 小 batch），
-  不是侧车协议的问题。
+  不是挎斗协议的问题。
 
 ### 15.2 对 C=1 目标的影响
 
-- 侧车每层关键路径 ≥0.83ms，而被替代的 CPU 只有 0.55ms ⇒ **C=1 净负**；
+- 挎斗每层关键路径 ≥0.83ms，而被替代的 CPU 只有 0.55ms ⇒ **C=1 净负**；
 - 要转正，需要 **decode 专用 MXFP4 内核 ≤0.3ms/层**（相对 0.83ms 再快 ~2.8×，
   相对理论 0.14ms 仍有 2× 余量）；
 - 仅调参（BM/BN）不够；需要 GEMV 型、按 expert-pair 调度、复用权重常驻的新内核。
@@ -675,8 +675,8 @@ shared x，6 专家）。脚本：`dev-docs/cuda_down_prototype.py`。
 
 ### 19.1 我之前的错误
 
-§15–§18 把“GPU 全量 0.56ms”与“CPU 全量 0.55ms”直接相比，得出“侧车净负”。
-但侧车只算**命中**专家，CPU 只算**未命中**专家，两者**并行**且在**不同的专家**上：
+§15–§18 把“GPU 全量 0.56ms”与“CPU 全量 0.55ms”直接相比，得出“挎斗净负”。
+但挎斗只算**命中**专家，CPU 只算**未命中**专家，两者**并行**且在**不同的专家**上：
 
 ```
 每层耗时 = max( GPU(命中) , CPU(未命中) ) + 协议开销
@@ -697,11 +697,11 @@ N-major Triton 实测（1 token）：`GPU(S) ≈ 0.09·S + 0.02` ms；CPU 全量
   （82.3→75.4ms；42.6→46.5 tok/s）；
 - c=0.50 ⇒ 节省 ~10.4ms/step ⇒ **+12%**；
 - ⇒ **P2 闸门（+5%）在现有 N-major 内核下即可通过**，**不需要先写 CUDA 内核**；
-- 需要的是：**把 N-major 内核接进侧车**（engine 的 `gpu_moe_layer` 固定开销 0.43ms，不能用）。
+- 需要的是：**把 N-major 内核接进挎斗**（engine 的 `gpu_moe_layer` 固定开销 0.43ms，不能用）。
 
 ### 19.3 修正后的 P2 计划
 
-1. 侧车池的 plane 改成 **N-major**（逐层转置，峰值 2× 单层 ≈1.7GB，可接受）；
+1. 挎斗池的 plane 改成 **N-major**（逐层转置，峰值 2× 单层 ≈1.7GB，可接受）；
 2. worker 只对**命中**的 slot 发 kernel（`slot_ids` 间接寻址），grid=(命中数, N/BN)；
 3. CPU 按权重 0 跳过命中项（现有机制）；
 4. 单层对拍 → 200 槽 → 1,900 槽 C=1 A/B。
@@ -714,14 +714,14 @@ N-major Triton 实测（1 token）：`GPU(S) ≈ 0.09·S + 0.02` ms；CPU 全量
 
 ---
 
-## 20. 2026-10-23 N-major 侧车集成冒烟（部分成功）
+## 20. 2026-10-23 N-major 挎斗集成冒烟（部分成功）
 
 ### 20.1 已打通的
 
 - **池 loader 设备问题已解决**：在 `build_layer_pool` 外包 `torch.cuda.set_device(side)`，
   40/40 层池都建在 GPU0（4.7 GiB）；
 - `SidecarRuntime` 的 device 改为 `sidecar_device()`（此前误用 logical 0 = 物理 1）；
-- 服务 `Application startup complete`，layer 22 的 host-function 侧车 compute 能跑（0.85ms）。
+- 服务 `Application startup complete`，layer 22 的 host-function 挎斗 compute 能跑（0.85ms）。
 
 ### 20.2 仍失败的
 
@@ -771,7 +771,7 @@ pools 形状正确（`[S,4608,2560]` 等，dev=cuda:1=物理 GPU0）。
 
 ---
 
-## 22. 2026-10-23 **结论：C=1 侧车在当前栈上不可行**（固定开销 > 可节省空间）
+## 22. 2026-10-23 **结论：C=1 挎斗在当前栈上不可行**（固定开销 > 可节省空间）
 
 sc200l 实测（200 槽，TP=1，N-major 路径，I/O 已预分配）：
 
@@ -779,7 +779,7 @@ sc200l 实测（200 槽，TP=1，N-major 路径，I/O 已预分配）：
 |---|---|
 | `io`（H2D hidden/slots/weights + D2H out） | **0.25–0.28 ms/层** |
 | `kernels`（gate/up+act+down+wsum，1 命中） | **0.26 ms/层** |
-| 单层侧车总耗时 | **0.75–0.89 ms** |
+| 单层挎斗总耗时 | **0.75–0.89 ms** |
 | CPU 全量（6 专家） | **0.55 ms** |
 | CPU 未命中（4 命中、2 未命中） | ~0.18 ms |
 
@@ -799,7 +799,7 @@ sc200l 实测（200 槽，TP=1，N-major 路径，I/O 已预分配）：
 
 ### 22.2 最终判断
 
-- **C=1 侧车不可行**（不是内核问题，是“每层小 batch + 跨设备同步”的结构问题）；
+- **C=1 挎斗不可行**（不是内核问题，是“每层小 batch + 跨设备同步”的结构问题）；
 - C≥4 仍可能（CPU 每层 ~2.2ms，0.7ms 可被遮住），但不是本目标；
 - qfn 全驻留场景不受此结论影响（它本来就不用 CPU 算 MoE）。
 
@@ -813,7 +813,7 @@ sc200l 实测（200 槽，TP=1，N-major 路径，I/O 已预分配）：
 - **208/208 分片加载成功**，已进推理；
 - 当前卡在 `moe_wna16_marlin_gemm: b_q_weight is not on GPU`（权重在 pwal 后已在 GPU，
   疑为 experts/apply 仍走插件 CPU MoE 或缓存了搬卡前张量）；
-- 下一步：qfn 全驻留时禁用 CPU MoE，再跑 TP=2 → GPU0+1+2 侧车全驻留 → 撤 GPU0 部分表。
+- 下一步：qfn 全驻留时禁用 CPU MoE，再跑 TP=2 → GPU0+1+2 挎斗全驻留 → 撤 GPU0 部分表。
 
 ### 23.1 定位（21:51）
 
@@ -834,7 +834,7 @@ pwal 后 `layer.w13_weight` 是 cuda，但 kernel 收到的 w1 是 CPU ⇒ **w1 
 - TP=2 每 rank 专家 ~34GB + 非专家 ~6.5GB > 40GB ⇒ 权重被退到 CPU ⇒ native Marlin 报
   `b_q_weight is not on GPU`（pwal 与 kernel 入口 id 相同、device 不同，证实是搬 CPU）；
 - ⇒ 下一步实现 **NVFP4 CPU 专家引擎**（e2m1 codebook + E4M3 g16 scale），
-  它同时是“撤 GPU0 → CPU 兜底”的前提；之后再谈 3 卡侧车全驻留。
+  它同时是“撤 GPU0 → CPU 兜底”的前提；之后再谈 3 卡挎斗全驻留。
 
 ### 23.4 create_weights 把 NVFP4 专家建在 CPU（23:00）
 
@@ -899,12 +899,12 @@ pwal 后 `layer.w13_weight` 是 cuda，但 kernel 收到的 w1 是 CPU ⇒ **w1 
 
 ### 25.2 ② 未达成：GPU0 没有参与 NVFP4 计算
 
-原因：qfn 的 MoE 走 vLLM **native Marlin TP=2**，不是插件的 CPU/侧车引擎；
+原因：qfn 的 MoE 走 vLLM **native Marlin TP=2**，不是插件的 CPU/挎斗引擎；
 GPU0 要参与，需要以下之一：
 
 | 方案 | 内容 | 工作量 |
 |---|---|---|
-| A. NVFP4 侧车 | GPU0 存部分专家 + host-function 里用 NVFP4 GEMV 算命中项，再并回 Marlin 输出 | 大（新内核 + 混合路由） |
+| A. NVFP4 挎斗 | GPU0 存部分专家 + host-function 里用 NVFP4 GEMV 算命中项，再并回 Marlin 输出 | 大（新内核 + 混合路由） |
 | B. GPU0 作为 offload 目标 | 把 vLLM 的 `cpu_offload_gb` 目标从 CPU 改成 GPU0，按层 P2P 预取 | 中，但每层 PCIe 拷贝 ~GB 级，可能得不偿失 |
 | C. 接受现状 | GPU1/2 全驻留 + 1GB CPU 兜底，GPU0 不参与 | 0 |
 
@@ -923,7 +923,7 @@ GPU0 要参与，需要以下之一：
 | gate/up (1280×2560) | 0.030 ms | 0 |
 | down (2560×640) | 0.012 ms | 0 |
 
-6 专家全层 ≈ **0.27ms**（< 0.3ms 目标）⇒ A 方案（GPU0 侧车）性能可行，
+6 专家全层 ≈ **0.27ms**（< 0.3ms 目标）⇒ A 方案（GPU0 挎斗）性能可行，
 剩下是**与 native Marlin 的混合路由**集成（3–5 天）。
 
 ### 25.5 真实权重验证（00:05）
@@ -935,11 +935,11 @@ GPU0 要参与，需要以下之一：
 - **6 专家全层 0.2496 ms**（gate/up+down）。
 
 ⇒ NVFP4 GEMV 的布局/尺度语义与真实 checkpoint 完全一致，A 方案的计算内核已就绪；
-剩余是**模型层混合路由**（把命中专家从 Marlin 切到 GPU0 侧车）。
+剩余是**模型层混合路由**（把命中专家从 Marlin 切到 GPU0 挎斗）。
 
 ---
 
-## 26. 2026-10-24 ② 的落地方案与阻塞点（层级侧车）
+## 26. 2026-10-24 ② 的落地方案与阻塞点（层级挎斗）
 
 ### 26.1 设计（比"层内混合路由"简单）
 
@@ -981,7 +981,7 @@ GPU0 要参与，需要以下之一：
 
 ## 27. 2026-10-24 汇总与决策（本报告的状态页）
 
-### 27.1 ds41f C=1 侧车：**关闭**
+### 27.1 ds41f C=1 挎斗：**关闭**
 
 - 内核三条路线实测：旧池内核 0.64ms、K-split 0.60ms、N-major 0.56ms；
   CPU 同类负载 0.55ms（60 线程 AVX512，已贴 DRAM 带宽）。
@@ -989,7 +989,7 @@ GPU0 要参与，需要以下之一：
   40 层≈20ms；C=1 串行、无合法重叠窗口 ⇒ 净负。
 - 纯读 1.19TB/s、内核 190GB/s，差距来自反量化 ALU + 小 tile；BF16 预反量化能到 ~0.34ms，
   但显存 ×4（1,900 槽 135GB）且固定开销仍在。
-- ⇒ **C=1 侧车不再推进**；C≥4 仍可用（CPU 2.2ms/层，可遮住）。
+- ⇒ **C=1 挎斗不再推进**；C≥4 仍可用（CPU 2.2ms/层，可遮住）。
 
 ### 27.2 qfn NVFP4：**可用（C）**
 
@@ -1027,10 +1027,10 @@ GPU0 要参与，需要以下之一：
 
 ## 28. 2026-10-24 09:15 后续任务登记（用户指定）
 
-**ds41f 侧车 C=2 / C=4 基准**（qfn A 完成并留档后执行）：
+**ds41f 挎斗 C=2 / C=4 基准**（qfn A 完成并留档后执行）：
 
 - 用户已知 **C=1 是负值**，仍要求看 C=2/4 的表现；
-- 目的：确认侧车在并发下能否靠"跨请求重叠"转正；
-- 协议：与既有 C=1 基准同环境（GPU1/2 + GPU0 侧车 + PIN 表），
+- 目的：确认挎斗在并发下能否靠"跨请求重叠"转正；
+- 协议：与既有 C=1 基准同环境（GPU1/2 + GPU0 挎斗 + PIN 表），
   分别测 C=2、C=4 的聚合 tok/s、单请求 tok/s、CPU/GPU 时间占比；
 - 产出写入本报告与 `dev-docs/report/`，与 qfn 基准并列。

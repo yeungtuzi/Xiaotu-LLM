@@ -28,7 +28,7 @@
 
 [**English**](README_EN.md) · 中文(默认)
 
-> **📌 当前版本：v0.3.0**（2026-10-24）—— 新增辅助 GPU（侧车）功能，提升多并发解码性能，详见 [v0.3.0 发行说明](RELEASE_NOTES_v0.3.0.md)
+> **📌 当前版本：v0.3.0**（2026-10-24）—— 新增辅助 GPU（挎斗）功能，提升多并发解码性能，详见 [v0.3.0 发行说明](RELEASE_NOTES_v0.3.0.md)
 > [发行说明](RELEASE_NOTES_v0.2.9.md) · [性能口径](docs/BENCH_PROTOCOL.md)
 
 ---
@@ -63,7 +63,7 @@
 
 | 模型(最优配置) | 负载 | 实际 token | 并发 | prefill (tok/s) | decode (tok/s) |
 |---|---|---|---|---|---|
-| **DeepSeek-V4.1-Flash (1017) + GPU0 侧车（v0.3.0）**<br>TP=2 · util 0.70 · MAXLEN 524288 · MBT 8192 · seqs 4 · DSpark k=5 · PIN off<br>`GPUS=1,2,0` · `XTU_SIDECAR=gpu0` · **1900 槽** | 真实 DSH 15K v2 | ≈15,000 | 1 | **1,250** | **72.5** |
+| **DeepSeek-V4.1-Flash (1017) + GPU0 挎斗（v0.3.0）**<br>TP=2 · util 0.70 · MAXLEN 524288 · MBT 8192 · seqs 4 · DSpark k=5 · PIN off<br>`GPUS=1,2,0` · `XTU_SIDECAR=gpu0` · **1900 槽** | 真实 DSH 15K v2 | ≈15,000 | 1 | **1,250** | **72.5** |
 | | 真实 DSH 15K v2 | ≈15,000 | 2 | **1,250** | **106.8** |
 | | 真实 DSH 15K v2 | ≈15,000 | 4 | **1,250** | **110.2** |
 | **DeepSeek-V4.1-Flash (1017)**<br>TP=2 · util 0.70 · **MAXLEN 524288**<br>**MBT 8192** · **seqs 4** · **DSpark k=5** · **PIN off** | 真实 DSH 15K v2 | ≈15,000 | 1 | **1,190** | **68.6** |

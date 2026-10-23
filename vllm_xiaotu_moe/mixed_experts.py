@@ -2655,7 +2655,7 @@ class _XiaotuExpertsMixin:
                                 swiglu_limit=float(getattr(self, "swiglu_limit", 0.0) or 0.0),
                             )
                             if _rt is not None:
-                                # loader 内部用 current device；必须切到侧车卡再建池
+                                # loader 内部用 current device；必须切到挎斗卡再建池
                                 _prev_dev = torch.cuda.current_device()
                                 torch.cuda.set_device(_sc.sidecar_device())
                                 try:
@@ -2672,7 +2672,7 @@ class _XiaotuExpertsMixin:
                                     _rt.add_pool(_li, _pool2)
                                     self._side_pool = _pool2
                                     self._side_layer_idx = _li
-                                    _pinp = None   # 侧车与 GPU1/2 PIN 互斥，避免重复计算
+                                    _pinp = None   # 挎斗与 GPU1/2 PIN 互斥，避免重复计算
                         elif _m2 and _tab and expert_map is not None:
                             if not getattr(self, "_side_tp_warned", False):
                                 self._side_tp_warned = True

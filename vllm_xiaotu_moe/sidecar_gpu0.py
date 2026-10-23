@@ -1,4 +1,4 @@
-"""GPU0 侧车运行时：池 + worker + 真实 compute（ds41f MXFP4 / qfn FP8 两条内核路径）。
+"""GPU0 挎斗运行时：池 + worker + 真实 compute（ds41f MXFP4 / qfn FP8 两条内核路径）。
 
 用法（在 mixed_experts 的非捕获初始化块里）：
     rt = get_sidecar_runtime(engine, hidden, inter, topk, table, n_layers, n_experts)

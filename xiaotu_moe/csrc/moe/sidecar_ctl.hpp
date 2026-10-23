@@ -1,9 +1,9 @@
-// 侧车 host-function 协议（纯 host，无 CUDA 依赖）
+// 挎斗 host-function 协议（纯 host，无 CUDA 依赖）
 //
 // 设计见 dev-docs/SPEC_SIDECAR_HOSTFN.md：
 //   - 生产默认 XIAOTU_MOE_ASYNC=0 ⇒ 每层 CPU MoE 跑在 cudaLaunchHostFunc 回调里；
 //   - 该回调内**不得调用 CUDA API**，只碰原子/内存；
-//   - 侧车 worker 在独立线程里用 GPU0 stream 计算，与本回调并行；
+//   - 挎斗 worker 在独立线程里用 GPU0 stream 计算，与本回调并行；
 //   - 回调先 host_begin（命中检查/拷请求/置 0/发请求），再 run_moe_and_ep，
 //     最后 host_end（等 worker/合并）。命中项在 CPU 侧权重为 0 ⇒ 引擎跳过。
 //

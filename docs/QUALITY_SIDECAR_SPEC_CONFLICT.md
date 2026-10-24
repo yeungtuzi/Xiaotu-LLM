@@ -156,3 +156,21 @@ v0.3.0 里“C≥2 收益”是 bug 伪影，“C=1 +5%”也不成立（那是�
 
 **处置**：`sidecar.py`/`sidecar_gpu0.py` 保留护栏（MXFP4 仅 qlen=1，qlen>1 放弃命中），
 生产 8700 = SPEC on + 无挎斗；v0.3.0 保留不撤回，但挎斗标记为**实验特性、默认关闭、无性能承诺**。
+
+## 13. P2P/架构改造评估与 min_hits 实验（2026-10-24）
+
+**先排除“拷贝带宽”假设**：每层走 host 的 hidden 只有 `qlen×H×2B`（C=1 时 ~51KB），
+回传 `qlen×H×4B`（~82KB），按 pinned 12–25GB/s 只要 ~5–10µs；实测 io 0.10–0.48ms
+说明**瓶颈不是拷贝带宽，而是每层的握手/调度（Python worker 轮询 + host_fn + 两次 blocking copy + 跨卡同步）**。
+⇒ **P2P 直连（cudaMemcpyPeer）只能省掉那 5–10µs，无法解决 0.5ms/层的编排开销。**
+
+**min_hits 实验（新增 C++ 开关 `XTU_SIDECAR_MIN_HITS`）**：命中数 < 阈值时不接管（不置 0 CPU 权重）。
+- 先重建 6 个 ISA 变体（`scripts/build_engine_variants.sh`，EXIT=0）；
+- `MIN_HITS=4` 跑官方口径：C=1 步时 **51.5ms / 19.3 tok/s**（= 无挎斗基线），
+  因为该 workload 每层命中只有 2~5 个、**没有任何一层达到 4**，挎斗全程未接管；
+- `MIN_HITS=1`（即之前）时 C=1 是 87.2ms，慢 35ms。
+
+⇒ 结论：命中数不足以覆盖每层编排开销；min_hits 只能让挎斗"不拖后腿"（等于关掉），
+**无法让它变成正收益**。要真正拿到收益，必须把整套 per-layer 握手搬进 C++/CUDA graph
+（消除 Python worker 与 host 往返），这是重写级工作；而 CPU 侧每层可省的时间只有 0.25–0.5ms，
+重写后能否覆盖剩余开销仍未知。

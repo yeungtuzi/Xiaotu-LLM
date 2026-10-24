@@ -44,6 +44,7 @@ struct SidecarCtl {
     uint32_t max_qlen = 0;
     uint32_t max_k = 0;
     uint32_t timeout_us = 50000;          // fail-closed：默认 50 ms
+    uint32_t min_hits = 1;                // 命中数 < min_hits ⇒ 不接管（省掉同步开销）
 
     // ---- 统计 ----
     alignas(64) std::atomic<uint64_t> stat_steps{0};
@@ -71,12 +72,12 @@ inline uint32_t host_begin(SidecarCtl* c, uint32_t layer, uint32_t qlen, uint32_
 
     uint32_t hits = 0;
     for (uint32_t i = 0; i < n; ++i) {
-        if (hit_test(c, layer, ids[i])) {
-            wts[i] = 0.0f;       // CPU 跳过（原值已在 c->wts）
-            ++hits;
-        }
+        if (hit_test(c, layer, ids[i])) ++hits;
     }
-    if (hits == 0) return 0;
+    if (hits == 0 || hits < c->min_hits) return 0;   // 命中太少 ⇒ 不值得付同步开销
+    for (uint32_t i = 0; i < n; ++i) {
+        if (hit_test(c, layer, ids[i])) wts[i] = 0.0f;  // CPU 跳过（原值已在 c->wts）
+    }
 
     c->layer = layer;
     c->qlen = qlen;

@@ -103,6 +103,11 @@ class SidecarWorker:
             self.out.data_ptr(),
         )
         engine.sidecar_attach(self.ctl)
+        try:
+            _mh = int(__import__("os").environ.get("XTU_SIDECAR_MIN_HITS", "1"))
+        except Exception:
+            _mh = 1
+        engine.sidecar_set_min_hits(self.ctl, max(1, _mh))
         engine.sidecar_set_enabled(self.ctl, True)
         self.thread = threading.Thread(target=self._loop, name="xtu-sidecar", daemon=True)
         self.thread.start()

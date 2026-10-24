@@ -85,7 +85,7 @@ if command -v py-spy >/dev/null 2>&1; then
   done
 else
   log "    ✗ 未安装 py-spy ⇒ 只能看内核态(wchan);安装后可直接抓到 Python 行号:"
-  log "      HTTPS_PROXY=<proxy> pip install py-spy    # 独立二进制,不影响已加载的模块"
+  log "      pip install py-spy    # 独立二进制,不影响已加载的模块（本机直连，无需代理）"
 fi
 log ""
 log "=== 取证完成 ⇒ $OUT ==="

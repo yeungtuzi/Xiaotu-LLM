@@ -246,10 +246,19 @@ class SidecarRuntime:
 def get_sidecar_runtime(engine, hidden: int, inter: int, topk: int, table: str,
                         n_layers: int, n_experts: int, use_fp8: bool,
                         swiglu_limit: float = 0.0) -> SidecarRuntime | None:
-    """进程级单例；未设 XTU_SIDECAR=gpu0 或表为空 ⇒ None。"""
+    """进程级单例；v0.3.0 挎斗功能已撤回（2026-10-24）⇒ 恒返回 None。"""
     global _RT
-    if _sc.sidecar_device() is None or not table or not os.path.exists(table):
-        return None
+    global _RT_WARNED
+    try:
+        _RT_WARNED
+    except NameError:
+        _RT_WARNED = False
+    if not _RT_WARNED:
+        _RT_WARNED = True
+        print("[xtu-sidecar] v0.3.0 挎斗功能已撤回（2026-10-24）：不再启用，"
+              "现有实测证明其在 C=1/2/4 均慢于无挎斗基线，见 "
+              "docs/QUALITY_SIDECAR_SPEC_CONFLICT.md §14", flush=True)
+    return None
     if int(n_layers) <= 0:
         n_layers = _table_n_layers(table)
     with _RT_LOCK:

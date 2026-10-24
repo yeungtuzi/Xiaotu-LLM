@@ -113,7 +113,7 @@
 | ⭐ **生产服务** | 本地 `vllm-xtu-moe` 服务的 **ds41f**,`TP=2`(GPU1+GPU2)✓ —— **就是我自己的推理后端** ✗ |
 | ⭐ **测试服务** | 本地**开发分支**上运行的 **qfn** ✓ |
 | (其它) | 我为实验临时起的实例一律叫 **"临时实例"** ✓ —— **不要**混称"测试服务" ✗ |
-| ⭐ **外网** | **中国大陆【境外】的网站** —— 已知的主要是 **github / huggingface / google** 等 ✓ ⇒ **必须走代理** ✓。⭐ **国内镜像不算外网**(modelscope.cn / hf-mirror.com ⇒ **直连**)✓ |
+| ⭐ **外网** | **中国大陆【境外】的网站**（github / huggingface / google 等）✓ ⭐ **本机直连，不需要代理**（2026-10-24 起；旧的“必须走代理”已作废）。⭐ 国内镜像（modelscope.cn / hf-mirror.com）同样直连 ✓ |
 
 ⚠️ **两条硬含义**:
 1. ⭐⭐ **2026-10-15 用户明令**:**「我已经删除了那个过时的 qfn 量化版…即日起,黑话中 qfn 就是指官方版」** ✓
@@ -365,22 +365,17 @@ grep -n "^## " dev-docs/USER_QA_LEDGER.md                # 错题本目录
    (历史教训:分叉出 **7 棵树**,收敛成本极高 ✓)
 6. ⭐ 机械自检:`git worktree list`(排除 prunable)应 **≤ 2 条**;有 prunable ⇒ 立即 prune ✓
 
-## ⛔ 外网访问纪律(用户 2026-09-23 第二次提醒)
+## ⛔ 网络出网纪律（2026-10-24 修订：本机不需要 proxy）
 
-**访问外网(下载、gh、curl、pip、clone 等)必须显式带上本机代理**,否则会被挡住:
-```bash
-export HTTPS_PROXY=http://<proxy-host>:<port> HTTP_PROXY=http://<proxy-host>:<port> \
-       https_proxy=http://<proxy-host>:<port> http_proxy=http://<proxy-host>:<port>
-```
-* 代理值来自 `~/.bashrc`,但**非交互 shell 不读它** ⇒ **必须在命令里显式 export**
-* 典型症状:下载“看似成功”实则被截断/为空、`gh search` 返回空 ⇒ **下载后必须校验大小与 Content-Length 一致**
-* 判据:`curl -sI https://...` 应看到 `Proxy-agent` 响应头(值形如 `<proxy-agent>/<ver>`)✓
-* ⭐ **范围澄清(用户 2026-10-07)**:**本条的"外网" = 【中国大陆境外的网站】**(github.com / huggingface.co / pypi.org …)⇒ **它们必须走代理** ✓;
-  ⭐ **国内镜像不算"外网" ⇒ 直连更快、不要走代理** ✓
-  * ⭐ **`modelscope.cn` 与 `hf-mirror.com` 一律直连**:`env -u HTTP_PROXY -u HTTPS_PROXY -u http_proxy -u https_proxy NO_PROXY="*" no_proxy="*" <cmd>` ✓
-  * ⭐ **实测依据**:同一 50MB range 请求 —— 直连 ModelScope **16.87 MB/s** vs 走代理 **2.59 MB/s**(**快 6.5×** ✓);
-    3.44 GB 的模型:走代理 3.8 小时 ✗ → 直连 **3.5 分钟** ✓
-  * ⚠️ **另**:若 `NO_PROXY` 里含 `[::1]`,某些库解析会报 `Invalid port: ":1]"` ✗ ⇒ **该 token 应去掉** ✓
+> **用户原话（2026-10-24）**：「删除 proxy 设置等环境变量，本机不需要 proxy」
+
+⭐ **本机（harness VM）出网由环境统一处理，不需要、也不要再 export 任何
+`HTTP_PROXY` / `HTTPS_PROXY` / `http_proxy` / `https_proxy`** ✓
+* 旧的「访问外网必须显式带代理」规定**已作废**（代理值已从本机配置中移除）；
+* 若某个命令确实连不上（如 GitHub 偶发超时），先用 `curl -sI https://github.com` 判断是否网络问题，
+  **不要**再去翻旧文档找代理地址 ✗；
+* ⛔ 仍然**禁止**把任何内网 IP/端口、代理地址、凭据写进会被提交的文件（见下方「敏感信息纪律」）✓
+
 
 ## ⛔ vLLM 树治理(用户 2026-09-24 明确)
 

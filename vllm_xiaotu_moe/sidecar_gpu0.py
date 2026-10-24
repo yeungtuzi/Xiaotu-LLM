@@ -53,11 +53,8 @@ class SidecarRuntime:
         self.pools: dict[int, object] = {}
         self._slotmap_cpu: dict[int, object] = {}
         self._bufs: dict[int, tuple] = {}
-        # [xtu 2026-10-24] MXFP4 N-major GEMV 只对 qlen=1 正确；qlen>1 时 host_begin 直接放弃
-        # （不置 0 CPU 权重），避免命中专家被静默丢弃（见 docs/QUALITY_SIDECAR_SPEC_CONFLICT.md）。
-        self._eff_qlen = int(max_qlen) if self.use_fp8 else 1
         self._worker = _sc.SidecarWorker(
-            engine, table, n_layers, n_experts, hidden, self._eff_qlen, max_k,
+            engine, table, n_layers, n_experts, hidden, max_qlen, max_k,
             compute=self.compute,
         )
         self._dev = f"cuda:{self.device}"
@@ -71,6 +68,21 @@ class SidecarRuntime:
             )
             self.slots_dev = torch.empty(K, dtype=torch.int32, device=self._dev)
             self.wts_dev = torch.empty(K, dtype=torch.float32, device=self._dev)
+            _MP = int(max_qlen) * K
+            self._bslots_cpu = torch.zeros(_MP, dtype=torch.int32, pin_memory=True)
+            self._bwts_cpu = torch.zeros(_MP, dtype=torch.float32, pin_memory=True)
+            self._bslots_np = self._bslots_cpu.numpy()
+            self._bwts_np = self._bwts_cpu.numpy()
+            self._bslots_dev = torch.empty(_MP, dtype=torch.int32, device=self._dev)
+            self._bwts_dev = torch.empty(_MP, dtype=torch.float32, device=self._dev)
+            self._bx = torch.empty(int(max_qlen), self.hidden, dtype=torch.bfloat16, device=self._dev)
+            self._bbuf = (
+                torch.empty(_MP, 2 * self.inter, dtype=torch.float32, device=self._dev),
+                torch.empty(_MP, self.inter, dtype=torch.bfloat16, device=self._dev),
+                torch.empty(_MP, self.hidden, dtype=torch.float32, device=self._dev),
+                torch.empty(int(max_qlen), self.hidden, dtype=torch.float32, device=self._dev),
+                None,
+            )
             self.h_gpu = torch.empty(self.hidden, dtype=torch.bfloat16, device=self._dev)
             self.slots_cpu = torch.empty(K, dtype=torch.int32, pin_memory=True)
             self.wts_cpu = torch.empty(K, dtype=torch.float32, pin_memory=True)
@@ -123,6 +135,38 @@ class SidecarRuntime:
             self._bufs[qlen] = b
         return b
 
+
+    def _compute_mxfp4_batch(self, layer, qlen, k, ids_host, wts_host, out_host, hid_ptr):
+        pool = self.pools.get(int(layer))
+        if pool is None:
+            out_host.zero_(); return
+        sm = self._slotmap_cpu.get(int(layer))
+        if sm is None:
+            out_host.zero_(); return
+        import numpy as _np
+        from vllm_xiaotu_moe.sidecar_nmajor import forward_batch
+        n = qlen * k
+        slots = self._bslots_np[:n]; wts = self._bwts_np[:n]
+        _ids = ids_host.numpy() if hasattr(ids_host, "numpy") else _np.asarray(ids_host)
+        _w = wts_host.numpy() if hasattr(wts_host, "numpy") else _np.asarray(wts_host)
+        for t in range(qlen):
+            base = t * k; hit = 0
+            for j in range(k):
+                e = int(_ids[base + j]); w = float(_w[base + j])
+                if 0 <= e < int(sm.numel()):
+                    sc = int(sm[e])
+                    if sc >= pool.n_local and hit < k:
+                        slots[base + hit] = sc - pool.n_local; wts[base + hit] = w; hit += 1
+            for j in range(hit, k):
+                slots[base + j] = 0; wts[base + j] = 0.0
+        self._bslots_dev[:n].copy_(self._bslots_cpu[:n], non_blocking=True)
+        self._bwts_dev[:n].copy_(self._bwts_cpu[:n], non_blocking=True)
+        self._bx[:qlen].copy_(_hid_view(hid_ptr, qlen, self.hidden))
+        out = forward_batch(self._bx[:qlen], self._bslots_dev[:n], self._bwts_dev[:n],
+                            pool.planes, self.hidden, self.inter, int(pool.gk), k,
+                            BN=4, bufs=self._bbuf)
+        out_host[: qlen * self.hidden].copy_(out.reshape(-1))
+
     def compute(self, layer: int, qlen: int, k: int, ids_host, wts_host, out_host,
                 hid_ptr: int) -> None:
         pool = self.pools.get(int(layer))
@@ -130,10 +174,11 @@ class SidecarRuntime:
             out_host.zero_()
             return
         torch.cuda.set_device(self.device)
-        # MXFP4 只支持 qlen=1（N-major GEMV）；其它形状 fail-closed
+        # MXFP4：qlen=1 走 GEMV；qlen>1 走 slot-major 批量
         if not self.use_fp8:
             if qlen != 1:
-                out_host.zero_(); return
+                self._compute_mxfp4_batch(layer, qlen, k, ids_host, wts_host, out_host, hid_ptr)
+                return
         # MXFP4 + qlen=1：N-major 行 GEMV，只算命中 slot
         if (not self.use_fp8) and qlen == 1:
             sm = self._slotmap_cpu.get(int(layer))

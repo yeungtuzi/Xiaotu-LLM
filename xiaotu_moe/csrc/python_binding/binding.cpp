@@ -1108,6 +1108,9 @@ static void bind_moe_class(py::module& m, const char* name) {
         }, py::arg("ctl_addr"), py::arg("n_layers"), py::arg("n_experts"),
            py::arg("hidden"), py::arg("max_qlen"), py::arg("max_k"),
            py::arg("masks"), py::arg("ids"), py::arg("wts"), py::arg("out"))
+        .def("sidecar_set_min_hits", [](MOE&, uint64_t addr, uint32_t v) {
+            reinterpret_cast<xiaotu_sidecar::SidecarCtl*>(addr)->min_hits = v;
+        })
         .def("sidecar_set_enabled", [](MOE&, uint64_t addr, bool e) {
             reinterpret_cast<xiaotu_sidecar::SidecarCtl*>(addr)->enabled.store(e ? 1 : 0);
         }, py::arg("ctl_addr"), py::arg("enabled"))

@@ -109,7 +109,8 @@ class LayerPool:
 
     def __init__(self, engine, device: torch.device, hidden: int, inter: int,
                  group_k: int, n_local: int, pinned_local: list[int], layer_idx: int,
-                 layout: str = "mxfp4", topk: int = 0):
+                 layout: str = "mxfp4", topk: int = 0,
+                 scale_dtype: str = "e8m0", tensor_scale: bool = False):
         """⭐ 2026-10-15:`layout` 让同一个池同时服务两条后端的**不同槽布局**
         (`mxfp4` = `gpu_prefill`;`fp8` = `gpu_prefill_fp8`)✓
 
@@ -122,6 +123,15 @@ class LayerPool:
         from vllm_xiaotu_moe import gpu_prefill as _gp
         self.engine, self.dev = engine, device
         self.H, self.I, self.gk = int(hidden), int(inter), int(group_k)
+        # ⭐ NVFP4（2026-10-25）：与 MXFP4 的差异只有三处 —— 组大小 32→16（`gk` 已是参数）、
+        #    块尺度 e8m0→**E4M3**（两者都是 1 字节 ⇒ **plane 形状/dtype 完全不变**）、
+        #    外加一个**每张量的 F32 二级尺度**（`weight_scale_2`）。
+        #    ⚠️ 二级尺度**不放进 `planes`** —— 外部是 `*pool.planes` 按 4 元解包，
+        #       多一个会破坏内核签名 ⇒ 单独字段，由调用方显式传参 ✓
+        #    默认值 = 现状（e8m0 / 无二级尺度）⇒ **MXFP4 路径零回归** ✓
+        self.scale_dtype = str(scale_dtype)
+        self.has_tensor_scale = bool(tensor_scale)
+        self.tensor_scale_t = None      # (S,) float32；only when has_tensor_scale
         self.n_local, self.layer_idx = int(n_local), int(layer_idx)
         self.layout = str(layout)
         self.pinned = list(pinned_local)
@@ -169,6 +179,9 @@ class LayerPool:
                 torch.empty((S, rb2, self.H), dtype=torch.uint8, device=device),
                 torch.empty((S, self.I // self.gk, self.H), dtype=torch.uint8, device=device),
             )
+            if self.has_tensor_scale:
+                # 每槽一个标量（加载时从 `weight_scale_2` 拷入；先置 1.0 保证"未加载"时中性）
+                self.tensor_scale_t = torch.ones((S,), dtype=torch.float32, device=device)
         self.slot_of = {e: i for i, e in enumerate(self.pinned)}
         self.expert_of = list(self.pinned)   # ⭐ 反向表:与 slot_of 同步建立
         sm = torch.arange(self.n_local, dtype=torch.int32, device=device)

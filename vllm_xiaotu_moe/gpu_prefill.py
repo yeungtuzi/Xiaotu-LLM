@@ -107,6 +107,25 @@ def _dequant_e2m1_gather(nib, lut_ptr):
 
 
 @triton.jit
+def _e4m3_byte_to_f32(b):
+    """**E4M3 尺度字节** → f32（NVFP4 用）。
+
+    为什么不用 `tl.float8e4nv` 的 bitcast：MUSA 上的 Triton 对 float8 dtype 的
+    支持面不确定（厂商清单 §18），而这段**纯整数位运算**与我们
+    `_decode_flat_kernel` 里已验证过的解码完全同式 ⇒ 零新依赖。
+    e4m3 布局：bit7 符号 / bits6-3 指数(偏置 7) / bits2-0 尾数；无 inf，
+    subnormal（指数 0）按 1.953125e-03 线性解。
+    """
+    i = b.to(tl.int32)
+    ex = (i >> 3) & 0xF
+    m = i & 0x7
+    bits = ((ex + 120) << 23) | (m << 20)
+    v = tl.where(ex == 0, m.to(tl.float32) * 1.953125e-03,
+                 bits.to(tl.float32, bitcast=True))
+    return tl.where(((i >> 7) & 1) == 1, -v, v)
+
+
+@triton.jit
 def _dequant_e2m1_lut(nib):
     """Same e2m1 dequant as ``_dequant_e2m1_nibble`` via a 16-entry register LUT.
 
@@ -134,6 +153,9 @@ def _gate_up_kernel_split(
     BK: tl.constexpr,
     NS: tl.constexpr,
     LUT: tl.constexpr,
+    GKS: tl.constexpr = 32,        # ⭐ NVFP4 用 16；默认 32 = MXFP4 现状
+    SC_E4M3: tl.constexpr = 0,     # ⭐ 1 = 尺度是 E4M3 字节（NVFP4）；0 = e8m0（MXFP4）
+    TS: tl.constexpr = 1.0,        # ⭐ 每张量的 F32 二级尺度（NVFP4 的 weight_scale_2）
 ):
     """gate_up without the per-k-block join+trans+reshape.
 
@@ -179,14 +201,17 @@ def _gate_up_kernel_split(
                 w_e = _dequant_e2m1_nibble(b_lo & 0x0F)
                 w_o = _dequant_e2m1_nibble((b_lo >> 4) & 0x0F)
             scale = tl.load(
-                s13t_ptr + s_off + ((kk >> 5) + tl.arange(0, BK // 32))[:, None] * s13t_row_stride
+                s13t_ptr + s_off + ((kk // GKS) + tl.arange(0, BK // GKS))[:, None] * s13t_row_stride
                 + n[None, :])
-            sc = tl.exp2(scale.to(tl.float32) - 127.0)
+            if SC_E4M3:
+                sc = _e4m3_byte_to_f32(scale) * TS
+            else:
+                sc = tl.exp2(scale.to(tl.float32) - 127.0) * TS
             # k = 2j+e shares the block-32 scale with k = 2j, and j>>4 selects
             # the block, so the even and odd halves use the SAME [BK//2, BN]
             # scale tile (each block-32 row repeats 16 times).
             sc_h = tl.reshape(
-                tl.broadcast_to(sc[:, None, :], (BK // 32, 16, BN)), (BK // 2, BN))
+                tl.broadcast_to(sc[:, None, :], (BK // GKS, GKS // 2, BN)), (BK // 2, BN))
             b_e = (w_e * sc_h).to(tl.bfloat16)
             b_o = (w_o * sc_h).to(tl.bfloat16)
             acc = tl.dot(a_e, b_e, acc)
@@ -210,6 +235,9 @@ def _gate_up_kernel(
     BK: tl.constexpr,
     NS: tl.constexpr,
     LUT: tl.constexpr,
+    GKS: tl.constexpr = 32,        # ⭐ NVFP4 用 16；默认 32 = MXFP4 现状
+    SC_E4M3: tl.constexpr = 0,     # ⭐ 1 = 尺度是 E4M3 字节（NVFP4）；0 = e8m0
+    TS: tl.constexpr = 1.0,        # ⭐ 每张量 F32 二级尺度（weight_scale_2）
 ):
     pid_e = tl.program_id(0)
     pid_n = tl.program_id(1)
@@ -249,10 +277,13 @@ def _gate_up_kernel(
                 w_o = _dequant_e2m1_nibble(nib_odd)
             b_val = tl.reshape(tl.trans(tl.join(w_e, w_o)), (BK, BN)) # [BK, BN]
             scale = tl.load(
-                s13t_ptr + s_off + ((kk >> 5) + tl.arange(0, BK // 32))[:, None] * s13t_row_stride
+                s13t_ptr + s_off + ((kk // GKS) + tl.arange(0, BK // GKS))[:, None] * s13t_row_stride
                 + n[None, :])                                        # [BK//32, BN]
-            sc = tl.exp2(scale.to(tl.float32) - 127.0)
-            sc = tl.reshape(tl.broadcast_to(sc[:, None, :], (BK // 32, 32, BN)), (BK, BN))
+            if SC_E4M3:
+                sc = _e4m3_byte_to_f32(scale) * TS
+            else:
+                sc = tl.exp2(scale.to(tl.float32) - 127.0) * TS
+            sc = tl.reshape(tl.broadcast_to(sc[:, None, :], (BK // GKS, GKS, BN)), (BK, BN))
             b = (b_val * sc).to(tl.bfloat16)                         # [BK, BN]
             acc = tl.dot(a, b, acc)
         tl.store(
@@ -276,6 +307,9 @@ def _down_kernel(
     NS: tl.constexpr,
     LUT: tl.constexpr,
     LIMIT: tl.constexpr = 0.0,
+    GKS: tl.constexpr = 32,        # ⭐ NVFP4 用 16；默认 32 = MXFP4 现状
+    SC_E4M3: tl.constexpr = 0,     # ⭐ 1 = 尺度是 E4M3 字节（NVFP4）
+    TS: tl.constexpr = 1.0,        # ⭐ 每张量 F32 二级尺度（weight_scale_2）
 ):
     pid_e = tl.program_id(0)
     pid_h = tl.program_id(1)
@@ -320,10 +354,13 @@ def _down_kernel(
                 w_o = _dequant_e2m1_nibble(nib_odd)
             b_val = tl.reshape(tl.trans(tl.join(w_e, w_o)), (BK, BH)) # [BK, BH]
             scale = tl.load(
-                s2t_ptr + s_off + ((kk >> 5) + tl.arange(0, BK // 32))[:, None] * s2t_row_stride
+                s2t_ptr + s_off + ((kk // GKS) + tl.arange(0, BK // GKS))[:, None] * s2t_row_stride
                 + h[None, :])                                        # [BK//32, BH]
-            sc = tl.exp2(scale.to(tl.float32) - 127.0)
-            sc = tl.reshape(tl.broadcast_to(sc[:, None, :], (BK // 32, 32, BH)), (BK, BH))
+            if SC_E4M3:
+                sc = _e4m3_byte_to_f32(scale) * TS
+            else:
+                sc = tl.exp2(scale.to(tl.float32) - 127.0) * TS
+            sc = tl.reshape(tl.broadcast_to(sc[:, None, :], (BK // GKS, GKS, BH)), (BK, BH))
             b = (b_val * sc).to(tl.bfloat16)                         # [BK, BH]
             acc = tl.dot(act.to(tl.bfloat16), b, acc)
         # sem="relaxed": the accumulations into ``out`` are the only accesses to
@@ -352,6 +389,9 @@ def _down_kernel_split(
     NS: tl.constexpr,
     LUT: tl.constexpr,
     LIMIT: tl.constexpr = 0.0,
+    GKS: tl.constexpr = 32,        # ⭐ NVFP4 用 16；默认 32 = MXFP4 现状
+    SC_E4M3: tl.constexpr = 0,     # ⭐ 1 = 尺度是 E4M3 字节（NVFP4）；0 = e8m0
+    TS: tl.constexpr = 1.0,        # ⭐ 每张量 F32 二级尺度（weight_scale_2）
 ):
     """down projection, even/odd-k split (see _gate_up_kernel_split)."""
     pid_e = tl.program_id(0)
@@ -395,11 +435,14 @@ def _down_kernel_split(
                 w_e = _dequant_e2m1_nibble(b_lo & 0x0F)
                 w_o = _dequant_e2m1_nibble((b_lo >> 4) & 0x0F)
             scale = tl.load(
-                s2t_ptr + s_off + ((kk >> 5) + tl.arange(0, BK // 32))[:, None] * s2t_row_stride
+                s2t_ptr + s_off + ((kk // GKS) + tl.arange(0, BK // GKS))[:, None] * s2t_row_stride
                 + h[None, :])
-            sc = tl.exp2(scale.to(tl.float32) - 127.0)
+            if SC_E4M3:
+                sc = _e4m3_byte_to_f32(scale) * TS
+            else:
+                sc = tl.exp2(scale.to(tl.float32) - 127.0) * TS
             sc_h = tl.reshape(
-                tl.broadcast_to(sc[:, None, :], (BK // 32, 16, BH)), (BK // 2, BH))
+                tl.broadcast_to(sc[:, None, :], (BK // GKS, GKS // 2, BH)), (BK // 2, BH))
             b_e = (w_e * sc_h).to(tl.bfloat16)
             b_o = (w_o * sc_h).to(tl.bfloat16)
             acc = tl.dot(act_e.to(tl.bfloat16), b_e, acc)
@@ -859,9 +902,31 @@ def reserve_staging_for_profile(need_bytes: int, device=None) -> bool:
 
 
 def release_staging_reserve() -> None:
+    # ⭐ 2026-10-25（A69/A71 观测面）：释放前后各打一次 free，便于机械验证
+    #   「free 回升 ≈ 占位大小」⇒ 证明释放**真的**生效、且 empty_cache 也做了 ✓
+    try:
+        import torch as _t
+        _p = _t.cuda.current_device()
+        _f0, _tot = _t.cuda.mem_get_info(_p)
+        print("[xtu-kv-diag] 释放 staging 占位: free %.2f GiB / total %.2f GiB"
+              % (_f0 / 2**30, _tot / 2**30), flush=True)
+    except Exception as _e:  # noqa: BLE001
+        print(f"[xtu-kv-diag] 释放前取显存失败(不掩盖): {type(_e).__name__}: {_e}", flush=True)
+        _t = None
     """profile 结束立刻释放占位 ⇒ 那块显存留给随后分配的 KV / 真正的 staging ✓"""
     if _PROF_RESERVE:
         _PROF_RESERVE.clear()
+        # ⭐ A69：`clear()` 只是丢掉活引用，段仍留在 torch 缓存分配器里 ⇒
+        #   记账以为已归还，实际没还 ⇒ **必须** empty_cache 才真正还给驱动 ✓
+        try:
+            import torch as _t2
+            _t2.cuda.empty_cache()
+            _f1, _tot1 = _t2.cuda.mem_get_info(_t2.cuda.current_device())
+            print("[xtu-kv-diag] 释放 staging 占位: free %.2f GiB（已 empty_cache）"
+                  % (_f1 / 2**30,), flush=True)
+        except Exception as _e:  # noqa: BLE001
+            print(f"[xtu-kv-diag] 释放后 empty_cache 失败(不掩盖): "
+                  f"{type(_e).__name__}: {_e}", flush=True)
         print("[vllm-xtu-moe] profile 结束 ⇒ 释放 staging 占位(留给 KV)✓", flush=True)
 
 
@@ -1054,7 +1119,20 @@ def install_profile_guard() -> list[str]:
                     print("[vllm-xtu-moe] ⛔ profile 期 staging 记账失败(不掩盖)"
                           f" ⇒ 本次 KV 可能按『没有 staging』定容:"
                           f" {type(_e).__name__}: {_e}", flush=True)
-                return orig_dam(self, *a, **kw)
+                # ⭐⭐ 2026-10-25 修根因（A71）：`release_staging_reserve()` 此前
+                #   **没有任何调用点** ⇒ 占位 1.76 GiB 被计入 total_consumed 却永不释放，
+                #   运行期真缓冲再分配 1.76 GiB ⇒ 总占用比记账多 1.76 GiB（超分来源之一）。
+                #   位置：orig_dam 已测完 after_profile 并算出 available，KV 的
+                #   initialize_kv_cache 在其之后 ⇒ 此刻释放刚好把显存让给 KV ✓
+                try:
+                    _ret = orig_dam(self, *a, **kw)
+                finally:
+                    try:
+                        release_staging_reserve()
+                    except Exception as _e:  # noqa: BLE001
+                        print("[vllm-xtu-moe] ⛔ 释放 staging 占位失败(不掩盖): "
+                              f"{type(_e).__name__}: {_e}", flush=True)
+                return _ret
 
             determine_available_memory._xtu_shim = True  # type: ignore[attr-defined]
             _gpf_worker.determine_available_memory = determine_available_memory

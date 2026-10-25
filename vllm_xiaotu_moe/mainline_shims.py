@@ -584,18 +584,15 @@ def _install_gpu_prefill_profile_guard() -> list[str]:
 
 
 def _release_on() -> bool:
-    """释放开关是否打开(与 mixed_experts._release_source_enabled 同一判据)。
+    """释放**总是开启**(2026-10-22 用户定案,`USER_QA_LEDGER.md` #289)。
 
-    ⚠️ 这里必须门控:下面的"钩子前快照"会**持有**权重张量的引用。若对所有模型
-    (含 V4)都抓,就会把它们本可释放的存储多留一份 —— 那正是
-    "适配新模型不能破坏已有模型"的红线。
+    ⚠️ 反过来要注意:下面的"钩子前快照"会**持有**权重张量的引用,必须在释放时清掉
+    (`_release_source_weights()` 末尾已清 `layer._xiaotu_pre_pwal_src`),否则源内存
+    永远回不到 OS(cellJ/cellK 的 264 GiB 就是这么来的)。
+
+    保留本函数只为调用点可读;它不再读任何 env/文件开关。
     """
-    try:
-        from vllm_xiaotu_moe.mixed_experts import _release_source_enabled
-
-        return _release_source_enabled()
-    except Exception:  # noqa: BLE001
-        return False
+    return True
 
 
 def _notify_experts(method, layer) -> None:

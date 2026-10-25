@@ -1047,16 +1047,20 @@ def _ph_tick() -> None:
     print("[gpf-tile2] tile_ms_per_bandgroup=%.1f" % (_PH.get("tile", 0.0) * 1000.0),
           flush=True)
     _PH["tile"] = 0.0
-    print("[gpf-wall] seg=%.0fms bands=%d => %.1f ms/band"
-          % (_PH.get("wall_seg", 0.0) * 1000, 8,
+    print("[gpf-wall] seq=%d seg=%.0fms bands=%d => %.1f ms/band"
+          % (_PH.get("seq", 0) + 1, _PH.get("wall_seg", 0.0) * 1000, 8,
              _PH.get("wall_seg", 0.0) * 1000 / 8.0), flush=True)
     _PH["wall_seg"] = 0.0
     print("[gpf-km2] w2=%.1fms scd=%.1fms scc=%.1fms"
           % (_PH.get("w2_k", 0.0) * 1000, _PH.get("scd_k", 0.0) * 1000,
              _PH.get("scc_k", 0.0) * 1000), flush=True)
     _PH["w2_k"] = _PH["scd_k"] = _PH["scc_k"] = 0.0
-    print("[gpf-km] dma=%.1fms tr=%.1fms scale=%.1fms"
-          % (_PH.get("dma_k", 0.0) * 1000, _PH.get("tr_k", 0.0) * 1000,
+    # ⭐ 2026-10-26：加**层调用序号** `seq`，用于定位 A73「卡在第几层」。
+    #   原打印只有时间、没有归属 ⇒ 只能看出"停住了"，看不出"停在哪一层"，
+    #   而常驻层是 3/9/11/15/16/25/31/39，必须知道序号才能判断停点是否落在常驻层上。
+    _PH["seq"] = _PH.get("seq", 0) + 1
+    print("[gpf-km] seq=%d dma=%.1fms tr=%.1fms scale=%.1fms"
+          % (_PH["seq"], _PH.get("dma_k", 0.0) * 1000, _PH.get("tr_k", 0.0) * 1000,
              _PH.get("sc_k", 0.0) * 1000), flush=True)
     _PH["dma_k"] = _PH["tr_k"] = _PH["sc_k"] = 0.0
     for k in ("decode", "gather", "bmm1", "act", "bmm2", "scatter"):

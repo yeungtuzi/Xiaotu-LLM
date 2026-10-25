@@ -281,3 +281,13 @@ curl -s --noproxy 127.0.0.1 http://127.0.0.1:8080/metrics | grep -E "lookup_(req
 | 启动失败语义 | **不做优雅回退** | 参数不满足 ⇒ **vLLM 启动即失败**并在日志给出账目;改 `MBT` / 关 GPU 预填是**用户的选择** |
 
 ⛔ **照抄 `KV_CACHE_BYTES=<n>` 启动现在【已经无效】**:`serve_v41.sh` 会**忽略并告警**(传参行已整条删除)⇒ 不会重开旁路,但也**别指望它封顶** ✓;<br>⚠️ 真正会重开旁路的是**直接给 vLLM 传 `--kv-cache-memory`**,或走**仍封顶的脚本**(`serve_glm53_mainline.sh` / `serve_qwen38.sh`)✗
+
+---
+
+## 2026-10-25 生产口径补充：思考解析器 = `deepseek_v41`（显式 env，不改脚本默认）
+
+* 启动时**显式**传 `REASONING_PARSER=deepseek_v41`（脚本默认仍是 `deepseek_v3`，未翻转默认值）；
+* 该解析器把思考放在 **`message.reasoning`**（不是 `reasoning_content`）——客户端/探针读错字段会误判"思考丢失"，
+  详见 `docs/EXPERIMENTS.md` B1068 与 `IRON_RULES.md` R78；
+* 启动日志不再出现 `Auto-initialization of reasoning token IDs failed`；
+* 工具解析器同为 `deepseek_v41`；实测 `tool_call_parser='deepseek_v41'`、`reasoning_parser='deepseek_v41'`。

@@ -34133,3 +34133,50 @@ H2D 字节 = 该 chunk 实际触达、且未驻留的 (layer, expert) × 每槽�
 
 【预期】若 CPU 能无痛吸收 10–20% 字节,prefill 约 +11–25%(按 `1/(1-f)` 上限打折);
 但 CPU 计算慢,实际更可能 +5–15%。先做 15K/64K 冷 prefill,与当前全 GPU 路径 A/B。
+
+### B1068(2026-10-25)⭐ **纠错:`reasoning` ≠ `reasoning_content` —— 我差点把"字段名不同"误判成"v41 解析器吞思考"**
+
+**背景**:用户问"模型就是 v41,为什么还在用 v3"。我把 `REASONING_PARSER` 显式设为 `deepseek_v41`
+起了一臂(TAG=`ds41f_prod_r41`),然后用探针读 `message.reasoning_content` —— 得到 **恒为 0**,
+于是下了结论:**"v41 解析器把思考吞了,必须回滚 v3"** ✗
+
+**用户一句话推翻**:「上网搜索看看社区和 vllm,这个模型已经出来一阵子了,不可能有这么大的问题存在」
+⇒ 逼我去 dump 原始 JSON,而不是继续在 `reasoning_content` 上打转 ✓
+
+**实际事实**:vLLM 0.30 的 **parser engine 路径**(`deepseek_v41`)把思考放在 **`message.reasoning`**,
+legacy 解析器(`deepseek_v3`)才走 `reasoning_content`。原始响应:
+
+```json
+{"message": {
+  "content": "第47天。因为每天面积翻倍……",
+  "reasoning": "We need answer Chinese. Need be careful classic: doubles daily, covers whole on day48, half on day47."
+}}
+```
+
+⇒ 模型思考**一直在**,只是**我读错了字段** ✗
+
+**验证配方(以后必须照做,别再猜)**
+```bash
+# ① 先 dump 原始 message,不要预设字段名
+python -c 'import json,urllib.request as u; ...'   # 打印 choices[0].message 的**全部键**
+# ② 再看字段:reasoning(新) / reasoning_content(旧)
+# ③ 交叉验证:绕过 chat 接口,直接用 /v1/completions 续写同一 prompt
+#    若 raw 输出含 </think> ⇒ 模型确实思考了,问题在解析/字段层,不在模型
+# ④ 端到端:查 DSH 会话里 assistant/message 的 reasoning 块是否非空
+```
+
+**实测数据(修正后)**
+| 检查 | 结果 |
+|---|---|
+| `reasoning_parser=deepseek_v41` / `tool_call_parser=deepseek_v41` | 生效 ✓ |
+| `Auto-initialization of reasoning token IDs failed` | **0 次**(v3 时代有)✓ |
+| `message.reasoning` 长度 | 233 字符 ✓,`content` 56 字符 ✓ |
+| DSH 会话侧 reasoning 块 | 非空 ✓(21:40 重启后的会话仍正常)|
+
+**教训(可泛化)**
+1. ⛔ **不要用"某字段为空"直接推断"功能坏了"** —— 先 dump **整个响应对象**看键名 ✓
+2. ⭐ **跨版本字段名会变**(`reasoning_content` → `reasoning`),测量脚本必须**同时检查两者**,
+   或直接打全量 JSON ✓
+3. ⭐ **"不可能有这么大的问题"是有效先验** —— 一个已发布模型 + 主流推理框架,
+   出现"整段思考丢失"这种量级的 bug 概率极低 ⇒ 先怀疑自己的测量口径 ✓
+4. 结论写进台账前,必须有**原始证据**(JSON/日志),不能只有探针的派生值 ✓

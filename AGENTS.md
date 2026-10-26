@@ -67,6 +67,8 @@
   ⇒ 合并完即删除 `feature/musa-correctness`，**不再保留长命 MUSA 分支**；
   ⛔ 禁止平台专用实现副本 / 平台专用依赖；平台判定只允许在 `musa_correctness.py` 读 `GPU_DEVICE`
   （细则与验收矩阵见 `dev-docs/MERGE_MUSA_TO_MAINLINE_PLAN.md` §9）
+  ⭐ 机械检查：`bash scripts/check_single_code.sh`（GPU_DEVICE 单点读取 / 无平台副本 /
+  无顶层 `torch_musa` / 无冲突标记；本机无 vllm 时自动跳过 import 项）
 
 ## ⛔⛔⛔ 【环境事实 · 2026-10-15】这是**两台机器**,别搞混 ⇒ 先读 `dev-docs/ENV_TWO_MACHINES.md`
 

@@ -36,7 +36,12 @@ def musa_path_active() -> bool:
     """Whether runtime compute should use the MUSA CPU-fallback path."""
     if os.environ.get("XTU_MUSA_CORRECTNESS") == "1":
         return True
-    mode = (os.environ.get("GPU_DEVICE") or "").strip().upper()
+    # ``GPU_DEVICE`` unset and ``CUDA`` both mean the default CUDA path: that is
+    # the behaviour of the pre-merge mainline, so it must not depend on the
+    # hardware the process happens to run on.  Only an *unknown, non-empty*
+    # value falls back to platform auto-detection (``current_platform.is_musa``);
+    # a bare unset never reaches that fallback.
+    mode = (os.environ.get("GPU_DEVICE") or "CUDA").strip().upper()
     if mode in ("MUSA", "MTGPU", "S4000"):
         return True
     if mode == "CUDA":

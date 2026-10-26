@@ -128,7 +128,11 @@ export XIAOTU_ENV_FILE="$ENVFILE"
 #   用最小集跑通基线，再**一次加回一个**。`XIAOTU_MOE_THREADS` 故意不投递（用引擎默认）。
 for v in XIAOTU_GPF_GEMM XIAOTU_GPF_PIN XIAOTU_GPF_PHASE_LOG \
          XIAOTU_GPF_W2TN XIAOTU_GPF_W13TN XIAOTU_GPF_CPT XIAOTU_GPF_EVT XIAOTU_GPF_EVT_EVERY XIAOTU_GPF_DECODE_BLK XIAOTU_GPF_DECODE_WARPS XIAOTU_GPF_BOUNDS_PIPE XIAOTU_GPF_BOUNDS_REUSE XIAOTU_GPF_PROF XIAOTU_GPF_NOSYNC XIAOTU_GPF_STAGE_TILE_E XIAOTU_GPF_BMM_MAXROWS XIAOTU_GPF_BMM_CHUNK XIAOTU_GPF_DMA_BENCH XIAOTU_GPF_DMA_CPU XIAOTU_GPF_STAGE_NSLOTS XIAOTU_GPF_DMA_DEBUG \
-         XIAOTU_MOE_GPU_RESIDENT_LAYERS XIAOTU_SPEC_DECODE; do   # decode 端到端基准需要投递层常驻
+         XIAOTU_MOE_GPU_RESIDENT_LAYERS XIAOTU_SPEC_DECODE \
+         GPU_DEVICE XTU_MUSA_CORRECTNESS; do   # decode 端到端基准需要投递层常驻
+# ⭐ GPU_DEVICE 必须进 env-file：EngineCore 会重建 environ 并丢掉不认识的名字，
+#   而 MUSA 路径的判定发生在 **worker 进程**（mixed_experts._musa_active）。
+#   不投递 ⇒ launcher 里 `GPU_DEVICE=MUSA` 在 worker 侧等于没设（且日志无声）。
   val="$(eval "printf '%s' \"\${$v:-}\"")"
   [ -n "$val" ] && printf '%s=%s\n' "$v" "$val" >> "$ENVFILE"
 done

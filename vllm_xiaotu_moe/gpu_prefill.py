@@ -488,15 +488,39 @@ def _down_kernel_split(
 # 逐层上涨 ~0.42 GiB,40 层就是 ~17 GiB —— 直接把 free 压到预填充阈值之下。
 # `inter` 是 `torch.empty` 语义(只读被写过的段)⇒ 复用完全等价。
 _BUF_MOE: dict = {}
+_BOUND_BUF_LOGGED: dict = {}
 
 
 def _reuse_moe(key, shape, dtype, device):
-    k = (str(device), key, tuple(int(v) for v in shape), dtype)
+    """按**定长**复用；行数按 2 的幂向上取整 ⇒ 尺寸类有限，**永不随 qlen 累积**。
+
+    ⚠️ 背景（2026-10-26 审计）：旧实现把**整个 shape**（含行维 `A = T*K`）放进 key ⇒
+    每个新的 chunk 长度都新建一块、模块级 dict 无淘汰 ⇒ 显存随流量"只增不减"。
+    新实现：key 只含**列维**，行维按 2 的幂向上取整（MBT=8192/K=8 ⇒ 收敛到 65536），
+    大于当前容量才扩容一次。`XIAOTU_MOE_BOUND_BUF=0` 回退旧行为。
+    """
+    if os.environ.get("XIAOTU_MOE_BOUND_BUF", "1") != "1":
+        k = (str(device), key, tuple(int(v) for v in shape), dtype)
+        t = _BUF_MOE.get(k)
+        if t is None or tuple(t.shape) != tuple(int(v) for v in shape):
+            t = torch.empty(tuple(int(v) for v in shape), dtype=dtype, device=device)
+            _BUF_MOE[k] = t
+        return t
+    rows = int(shape[0])
+    tail = tuple(int(v) for v in shape[1:])
+    k = (str(device), key, tail, dtype)
     t = _BUF_MOE.get(k)
-    if t is None or tuple(t.shape) != tuple(int(v) for v in shape):
-        t = torch.empty(tuple(int(v) for v in shape), dtype=dtype, device=device)
+    if t is None or int(t.shape[0]) < rows:
+        cap = max(rows, int(t.shape[0]) if t is not None else 0)
+        cap = 1 << max(0, (cap - 1).bit_length())   # 2 的幂
+        t = torch.empty((cap,) + tail, dtype=dtype, device=device)
         _BUF_MOE[k] = t
-    return t
+        if not _BOUND_BUF_LOGGED.get(k):
+            _BOUND_BUF_LOGGED[k] = True
+            print(f"[xtu-bound] {key}: 定长缓冲 {cap}x{tail} "
+                  f"({t.numel() * t.element_size() / 2**20:.0f} MiB, 按 2 的幂上行、只增到上限)",
+                  flush=True)
+    return t[:rows]
 
 
 _SEG_BUF = {}

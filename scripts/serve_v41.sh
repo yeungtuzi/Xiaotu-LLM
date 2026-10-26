@@ -110,10 +110,12 @@ TP="${TP:-2}"
 # ╠══════════════════════════════════════════════════════════════════════════════╣
 # ║ 口径:1M 上下文 + GPU 预填 + dspark(k=5)+ FULL_DECODE_ONLY                  ║
 # ║   MAXLEN=1048576  MBT=8192  MAXSEQS=1  GPUS=1,2  TP=2  GPU_UTIL=0.90        ║
+# ║   ⚠️【已作废 2026-10-26】GPU_UTIL 默认值已由 0.90 下调为 0.80（理由见 :169）；   ║
+# ║      历史上 0.90 是 1M 上下文时代的口径，与"长上下文会贴着显存跑"冲突 ✗          ║
 # ║   EAGER=0  COMPILE=1  SPEC=1  KV_DTYPE=fp8_ds_mla                          ║
 # ║   VLLM_XIAOTU_GPU_PREFILL_MIN_TOKENS=384  (ACT_RESERVE 已于 2026-10-09 删除)  ║
 # ║   KV 池大小**交给 vLLM profile**(⛔ 不再传 KV_CACHE_BYTES;见下方改动说明)  ║
-# ║   PYTORCH_CUDA_ALLOC_CONF=expandable_segments:False                         ║
+# ║   PYTORCH_CUDA_ALLOC_CONF=expandable_segments:True（2026-10-26 默认开，治碎片）                         ║
 # ║                                                                            ║
 # ║ 实测(2026-10-03,TP=2/GPU1,2/dspark/KV 2.5 GiB):                            ║
 # ║   池 1,190,518 tok(≥1M ✓)、16k prefill **988 tok/s**、                    ║
@@ -149,7 +151,12 @@ fi
 #   GPUS=1,2 TP=2 MAXLEN=1048576 MBT=8192  bash scripts/bringup_prod_8070.sh
 # ⚠️ 【2026-10-03 用户明令】TP=2 一律 GPU1+GPU2;GPU0 只有 x8 ⇒ 只做单卡调试(IRON_RULES R19)。
 # (本脚本默认 MAXLEN=2048 是**冒烟**口径,别拿默认值当生产。)
-MBT="${MBT:-4096}"
+# ⭐ 2026-10-26:默认值由 4096 改回 **8192**,与本节上面记的生产口径一致(此前二者漂移)。
+#   实测(同日,20k 冷预填、加盐、排除首请求开销):MBT=8192 ≈ **938 tok/s**(两次 938/939,差 0.3%);
+#   150k 长预填 **772 tok/s(194 s)** 且**无 OOM** —— 因为索引器已按 query 行分块
+#   (行块 512、kv≥8192 才启用,见 vllm/model_executor/layers/sparse_attn_indexer.py),
+#   logits 尖峰与 MBT 解耦。代价:KV 池 9.44x → 3.13x(仍满足 2×512K)。
+MBT="${MBT:-8192}"
 # ── 【2026-10-04 补救】让长预填**不饿死正在解码的请求** ────────────────────────────
 # 实测(本机 V4.1,`MAXSEQS=4`,prompt 32768):
 #   `LPT=0`(默认,即 vLLM 原行为)⇒ 一个 32768-token 的 prompt 按 `MBT=8192` 连跑 4 个 step,
@@ -166,7 +173,15 @@ MBT="${MBT:-4096}"
 LPT="${LPT:-0}"
 LPT_ADAPTIVE="${LPT_ADAPTIVE:-0}"
 LOAD="${LOAD:-auto}"           # 【本机+V4.1 默认】真实权重(dummy 只用于开发自测)
-GPU_UTIL="${GPU_UTIL:-0.90}"   # 【本机+V4.1 默认】生产值
+# 【2026-10-26】默认 0.90 → **0.80**（单调更保守，R38 快档）。
+#   依据（实测，dev-docs/INCIDENT_2026-10-26_XID31.md §15.1/§18）：
+#     * 0.90 ⇒ 预留 0.9×39.49 = 35.5 GiB/卡，扣掉固定 footprint 29.40 后只剩 ~6 GiB 给 KV，
+#       且**稳态一定会被填满**（r41 实测空闲也不归还，稳态 38.4/39.49 GiB）⇒ 直接进饱和态；
+#     * 0.80 = 生产实际在用的值（31.59 GiB），是本配置**能起来且 KV 够用**的那一档；
+#       ⚠️ 不要更低：0.745 是物理下限（固定 footprint 29.40 > 0.74×39.49 ⇒ KV 为负、起不来）。
+#     * 默认值 0.90 是 1M 上下文时代的遗留，**与"长上下文会贴着显存跑"这件事相冲突**。
+#   ⚠️ 本改动**不影响正在运行的服务**（生产启动时显式传了 GPU_UTIL=0.80），只影响"忘了传"的下一次。
+GPU_UTIL="${GPU_UTIL:-0.80}"   # 【本机+V4.1 默认】生产值（2026-10-26 由 0.90 下调，见上）
 # ⛔ 2026-10-09(R38 三审查出,预先存在的缺陷):本脚本 :443 会读 `$KV_DTYPE`,但**从未赋默认值**
 #   ⇒ 在 `set -u` 下,不设 KV_DTYPE 的调用者会打 `unbound variable`,并**静默丢掉 `--kv-cache-dtype`** ✗
 #   (生产 `bringup_prod_8070.sh` 设了它所以无感;`scripts/ab_config.py` 等没设 ⇒ 会中招)
@@ -324,6 +339,21 @@ THREADS_DEFAULT="${THREADS_DEFAULT:-60}"
 #   SPIN=300 → 0.44 ms/层(快 2.2×);  SPIN=1000/未设 → 0.44 / 0.43
 # ⇒ 正确区间是"几百微秒",既不是 0 也不是 5000。
 SPIN_DEFAULT="${SPIN_DEFAULT:-300}"
+# ⭐⭐ 【2026-10-26】tile ring 默认 **48**（插件原默认 = `max(1, E//3)` = 128，见
+#   `vllm_xiaotu_moe/gpu_prefill.py: staging_tile_experts()`）。
+#   📌 **先量后改**：H2D 探针 `ops/a100-stress/h2d_tile_probe.py` 实测（GPU1，pinned 源→设备槽）：
+#        tile=128/96/72/48 ⇒ 26.83 / 26.82 / 26.81 / **26.79** GB/s（差 0.15%）
+#        `sync_each`（每次拷贝都等事件 = ping/pong 最坏情形）同样平坦 ⇒ 每次拷贝固定开销 < 50 µs
+#      ⇒ **tile 96/72/48 对 H2D 实际性能无影响**；选 48 是因为"代价相同、省得最多"。
+#   📌 收益（ds41f E=384，锚点 tile=128 每槽 1148 MiB，实测于 e1_tile48 实例）：
+#        profile 占位 2.52 → **0.95 GiB** ⇒ KV 池 2.57 → **4.14 GiB**
+#        KV token 1,018,640 → **1,642,513**（512K 并发 1.94× → **3.13×**）
+#      ⇒ 这就是"2×512K 上下文放得下"的那 1.57 GiB（用户 2026-10-26 的目标）。
+#   ⚠️ 该 env 对 `gpu_prefill_fp8.py`（glm/qfn，E=288 ⇒ 原默认 96）**同样生效**
+#      ⇒ 默认值只放在本脚本（v41 专用），**不**改插件默认，免得动其它模型的口径。
+#   ⚠️ 只 export 不够：必须同时进下面的 env 文件桥**白名单** + `nohup env` 清单，
+#      否则 EngineCore 会**静默丢弃**它且无任何报错（本文件 :337-344 的 B600 记录）✗
+STAGE_TILE_E="${XIAOTU_GPF_STAGE_TILE_E:-48}"
 XTU_ENV_FILE="${XIAOTU_ENV_FILE:-/tmp/xiaotu_env}"
 {
   echo "XIAOTU_MOE_THREADS=${XIAOTU_MOE_THREADS:-$THREADS_DEFAULT}"
@@ -360,6 +390,14 @@ XTU_ENV_FILE="${XIAOTU_ENV_FILE:-/tmp/xiaotu_env}"
   #   ⚠️ 依赖:`VLLM_EXPERTS_LOAD_DEVICE=cpu`(下面已设)+ 真实 checkpoint。
   #       `--load-format dummy` 时**不读真表**(保留占位填充,省 189 GiB 磁盘读,§565)。
   echo "XIAOTU_ENGRAM_LAST=${XIAOTU_ENGRAM_LAST:-1}"
+  # 【2026-10-26】tile ring 尺寸进白名单（否则 EngineCore 静默丢弃 ⇒ 仍是 128，且无报错）
+  echo "XIAOTU_GPF_STAGE_TILE_E=$STAGE_TILE_E"
+  # ⭐【2026-10-26】PyTorch 分配器：**expandable_segments**。三次崩溃的共同形态是
+  #   "free 只剩 ~1.1 GiB，任何一次临时分配就死"(Xid / 512 MiB OOM / new_empty 失败)，
+  #   而 free 很小并不代表总量不够：非 expandable 分配器会把大块切成不可复用的段 ⇒
+  #   碎片化下即使 free=1.1 GiB 也拿不出连续块。expandable_segments 让段可增长/合并。
+  #   默认开启；要回退显式设 PYTORCH_CUDA_ALLOC_CONF=expandable_segments:False。
+  echo "PYTORCH_CUDA_ALLOC_CONF=${PYTORCH_CUDA_ALLOC_CONF:-expandable_segments:True}"
   # 【§504 的结论,§519 更正】**多 rank 同机时"分片单位"与"核切分单位"必须一致**:
   #   * §504 遇到的问题是真的:NPS1(2 node)+TP=2 时按 node 分片会退化成 nshard_=1 ⇒
   #     分片路径失效、退回"每 socket 一份副本"⇒ **权重存 2 份**;
@@ -449,6 +487,8 @@ fi
   XIAOTU_MOE_NSLICE_SMALL="${XIAOTU_MOE_NSLICE_SMALL:-0}" \
   XIAOTU_MOE_ASYNC="${XIAOTU_MOE_ASYNC:-0}" \
   XIAOTU_MOE_SPIN_IDLE_US="${XIAOTU_MOE_SPIN_IDLE_US:-$SPIN_DEFAULT}" \
+  XIAOTU_GPF_STAGE_TILE_E="$STAGE_TILE_E" \
+  PYTORCH_CUDA_ALLOC_CONF="${PYTORCH_CUDA_ALLOC_CONF:-expandable_segments:True}" \
   ${XIAOTU_MOE_RANK_SPLIT:+XIAOTU_MOE_RANK_SPLIT=$XIAOTU_MOE_RANK_SPLIT} \
   OMP_NUM_THREADS=1 \
   $JIT_ENV \

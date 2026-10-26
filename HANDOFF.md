@@ -7,7 +7,7 @@
 
 | 项 | 值 |
 |---|---|
-| 唯一主线 | **`main`** @ **`5cb0d63`**（tag `cuda和musa线初次合并`） |
+| 唯一主线 | **`main`**（HEAD；内容合并 `49b0974`，里程碑 tag `cuda和musa线初次合并` → `5cb0d63`） |
 | 原 MUSA 分支 | 已归档为 **`archive/musa-merged-20261026`**（同一提交，不再作为开发线） |
 | `dev/mainline` | **已删除**（本地与远端）；历史已全部包含在 `main` |
 | 回基 | `a76f6ce`（merge `origin/main`，补齐 115 个提交） |

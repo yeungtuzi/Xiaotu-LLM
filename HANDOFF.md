@@ -3,21 +3,24 @@
 > 本文件只保留**当前入口**。过程稿已归档：`dev-docs/archive/2026-10-26-stage-close/`。
 > 上一版（2026-10-22，MUSA qfn 排障）原文见该目录 `HANDOFF_2026-10-22_MUSA.md`。
 
-## 两条线的阶段结论
+## 合并状态（2026-10-26 已执行）
 
-| 线 | 分支 | 阶段成果 | 权威文档 |
-|---|---|---|---|
-| **主线**（A100 / CUDA） | `dev/mainline` | draft 常驻 GPU + 2×512K KV；C=1/C=2 步时 81.5 / 113.7 ms，KV 池 4.42× | `docs/BENCH_ds41f_2026-10-26.md` |
-| **MUSA**（MTT S4000 MP22×2） | `feature/musa-correctness` | 形态 A（FP8 混合）与形态 B（NVFP4 全驻留）均跑通；MP22 线收尾 | `dev-docs/MUSA_MP22_STAGE_REPORT_2026-10-26.md`（v2.0，唯一权威版） |
+| 项 | 值 |
+|---|---|
+| 唯一代码线 | **`dev/mainline`** @ **`da53c16`** |
+| 原 MUSA 分支 | 已归档为 **`archive/musa-merged-20261026`**（同一提交，不再作为开发线） |
+| 回基 | `a76f6ce`（merge `origin/main`，补齐 115 个提交） |
+| 吸收主线 | `7183162`（merge 阶段收尾 4 个提交） |
+| 单代码守卫 | `da53c16`（`scripts/check_single_code.sh`） |
+| 详见 | `dev-docs/MERGE_EXECUTION_2026-10-26.md` |
 
+- ⭐ **终态（用户 2026-10-26 定）**：**一份代码，同时支持 CUDA 与 MUSA，用 `GPU_DEVICE` 门控**。
+  MUSA 差异只在 `musa_correctness.py` 单点判定 + 同一函数内的分支；⛔ 不保留平台专用实现副本。
 - **MUSA 结论**：瓶颈是每步固定开销（约 613 ms/token、12.9 ms/层，首疑每层 TP 归约与 62 µs 发射），
   属平台侧；**不再投入内核级优化**，5 个厂商问题作为会议议程，后续平台（S5000）沿用 roofline 方法验收。
 - **主线结论**：2×512K 达成（2.21× 余量）；`BENCH_ds41f` §3 正确性尚未做，留档仍不完整。
-- ⭐ **合并终态（用户 2026-10-26 定）**：**一份代码，同时支持 CUDA 与 MUSA，用 `GPU_DEVICE` 门控**
-  ⇒ 合并完成后删除 `feature/musa-correctness`，不保留长命 MUSA 分支；
-  路径见 `dev-docs/MERGE_MUSA_TO_MAINLINE_PLAN.md`（§9 为门控契约与双路径验收矩阵）。
 
-## 运行状态（2026-10-26 21:xx 核实）
+## 运行状态（2026-10-26 21:33 核实）
 
 - **生产 8700：未运行**。最后一版 `dsv41_prod_r53` 于 10-26 12:45 正常 shutdown；
   A100 三卡 0 MiB、无计算进程、8700 未监听。
@@ -26,10 +29,9 @@
 
 ## 分支 / 工作树
 
-- 主开发树：`/root/lvllm/repos/vllm-xiaotu-moe`（`feature/musa-correctness`）
+- 主开发树：`/root/lvllm/repos/vllm-xiaotu-moe`（当前在 `archive/musa-merged-20261026`，与主分支同提交）
 - 主线基准 worktree：`/root/lvllm/repos/vllm-mainline`（`dev/mainline`）
-- ⚠️ MUSA 分支已落后 `origin/main` **115 个提交**（非合并 96 个），merge-base 为 `b6a30b9`，**不是直系后代**。
-  合并与回基路径见 `dev-docs/MERGE_MUSA_TO_MAINLINE_PLAN.md`。
+- **后续开发只从 `dev/mainline` 开短命 topic 分支**；不要再恢复 `feature/musa-correctness`。
 
 ## 未决 / 下一步
 

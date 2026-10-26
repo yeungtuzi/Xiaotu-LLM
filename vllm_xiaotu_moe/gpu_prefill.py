@@ -146,7 +146,7 @@ def _gate_up_kernel_split(
     seg_ptr,
     w13t_ptr, w13t_row_stride, s13t_ptr, s13t_row_stride,
     inter_ptr, inter_ld,
-    W13_E, S13_E,
+    W13_E, S13_E, ts_ptr,
     H: tl.constexpr,
     BM: tl.constexpr,
     BN: tl.constexpr,
@@ -156,6 +156,7 @@ def _gate_up_kernel_split(
     GKS: tl.constexpr = 32,        # ⭐ NVFP4 用 16；默认 32 = MXFP4 现状
     SC_E4M3: tl.constexpr = 0,     # ⭐ 1 = 尺度是 E4M3 字节（NVFP4）；0 = e8m0（MXFP4）
     TS: tl.constexpr = 1.0,        # ⭐ 每张量的 F32 二级尺度（NVFP4 的 weight_scale_2）
+    HAS_TS: tl.constexpr = 0,    # ⭐ 1 = 每专家二级尺度从 ts_ptr[pid_e] 取（NVFP4）
 ):
     """gate_up without the per-k-block join+trans+reshape.
 
@@ -203,10 +204,14 @@ def _gate_up_kernel_split(
             scale = tl.load(
                 s13t_ptr + s_off + ((kk // GKS) + tl.arange(0, BK // GKS))[:, None] * s13t_row_stride
                 + n[None, :])
-            if SC_E4M3:
-                sc = _e4m3_byte_to_f32(scale) * TS
+            if HAS_TS:
+                _tsv = tl.load(ts_ptr + pid_e)   # ⭐ 每专家的 fp32 二级尺度(weight_scale_2)
             else:
-                sc = tl.exp2(scale.to(tl.float32) - 127.0) * TS
+                _tsv = TS
+            if SC_E4M3:
+                sc = _e4m3_byte_to_f32(scale) * _tsv
+            else:
+                sc = tl.exp2(scale.to(tl.float32) - 127.0) * _tsv
             # k = 2j+e shares the block-32 scale with k = 2j, and j>>4 selects
             # the block, so the even and odd halves use the SAME [BK//2, BN]
             # scale tile (each block-32 row repeats 16 times).
@@ -228,7 +233,7 @@ def _gate_up_kernel(
     seg_ptr,
     w13t_ptr, w13t_row_stride, s13t_ptr, s13t_row_stride,  # [E, H//2, 2I] / [E, H//32, 2I]
     inter_ptr, inter_ld,
-    W13_E, S13_E, lut_ptr,
+    W13_E, S13_E, lut_ptr, ts_ptr,
     H: tl.constexpr,
     BM: tl.constexpr,
     BN: tl.constexpr,
@@ -238,6 +243,7 @@ def _gate_up_kernel(
     GKS: tl.constexpr = 32,        # ⭐ NVFP4 用 16；默认 32 = MXFP4 现状
     SC_E4M3: tl.constexpr = 0,     # ⭐ 1 = 尺度是 E4M3 字节（NVFP4）；0 = e8m0
     TS: tl.constexpr = 1.0,        # ⭐ 每张量 F32 二级尺度（weight_scale_2）
+    HAS_TS: tl.constexpr = 0,    # ⭐ 1 = 每专家二级尺度从 ts_ptr[pid_e] 取（NVFP4）
 ):
     pid_e = tl.program_id(0)
     pid_n = tl.program_id(1)
@@ -275,14 +281,22 @@ def _gate_up_kernel(
             else:
                 w_e = _dequant_e2m1_nibble(nib_even)
                 w_o = _dequant_e2m1_nibble(nib_odd)
-            b_val = tl.reshape(tl.trans(tl.join(w_e, w_o)), (BK, BN)) # [BK, BN]
+            # ⭐ A78-9（2026-10-26）：`tl.trans` 对 **3 维**张量在本机 Triton 上直接
+            #   报 `permute dims must have the same length as input shape`；而且即使能编，
+            #   `trans` 是**整体反序** (2,BN,BK//2) ⇒ 语义也不对。
+            #   正确：join 得 (BK//2, BN, 2)，要按 k=2j+e 交错 ⇒ permute (0,2,1) 再 reshape ✓
+            b_val = tl.reshape(tl.permute(tl.join(w_e, w_o), (0, 2, 1)), (BK, BN))  # [BK, BN]
             scale = tl.load(
                 s13t_ptr + s_off + ((kk // GKS) + tl.arange(0, BK // GKS))[:, None] * s13t_row_stride
                 + n[None, :])                                        # [BK//32, BN]
-            if SC_E4M3:
-                sc = _e4m3_byte_to_f32(scale) * TS
+            if HAS_TS:
+                _tsv = tl.load(ts_ptr + pid_e)   # ⭐ 每专家的 fp32 二级尺度(weight_scale_2)
             else:
-                sc = tl.exp2(scale.to(tl.float32) - 127.0) * TS
+                _tsv = TS
+            if SC_E4M3:
+                sc = _e4m3_byte_to_f32(scale) * _tsv
+            else:
+                sc = tl.exp2(scale.to(tl.float32) - 127.0) * _tsv
             sc = tl.reshape(tl.broadcast_to(sc[:, None, :], (BK // GKS, GKS, BN)), (BK, BN))
             b = (b_val * sc).to(tl.bfloat16)                         # [BK, BN]
             acc = tl.dot(a, b, acc)
@@ -298,7 +312,7 @@ def _down_kernel(
     seg_ptr,
     w2t_ptr, w2t_row_stride, s2t_ptr, s2t_row_stride,  # [E, I//2, H] / [E, I//32, H]
     out_ptr, out_ld,
-    W2_E, S2_E, lut_ptr,
+    W2_E, S2_E, lut_ptr, ts_ptr,
     H: tl.constexpr,
     I: tl.constexpr,
     BM: tl.constexpr,
@@ -310,6 +324,7 @@ def _down_kernel(
     GKS: tl.constexpr = 32,        # ⭐ NVFP4 用 16；默认 32 = MXFP4 现状
     SC_E4M3: tl.constexpr = 0,     # ⭐ 1 = 尺度是 E4M3 字节（NVFP4）
     TS: tl.constexpr = 1.0,        # ⭐ 每张量 F32 二级尺度（weight_scale_2）
+    HAS_TS: tl.constexpr = 0,    # ⭐ 1 = 每专家二级尺度从 ts_ptr[pid_e] 取（NVFP4）
 ):
     pid_e = tl.program_id(0)
     pid_h = tl.program_id(1)
@@ -352,14 +367,19 @@ def _down_kernel(
             else:
                 w_e = _dequant_e2m1_nibble(nib_even)
                 w_o = _dequant_e2m1_nibble(nib_odd)
-            b_val = tl.reshape(tl.trans(tl.join(w_e, w_o)), (BK, BH)) # [BK, BH]
+            # A78-9：同上，用 permute(0,2,1) 而不是 3 维的 tl.trans
+            b_val = tl.reshape(tl.permute(tl.join(w_e, w_o), (0, 2, 1)), (BK, BH))  # [BK, BH]
             scale = tl.load(
                 s2t_ptr + s_off + ((kk // GKS) + tl.arange(0, BK // GKS))[:, None] * s2t_row_stride
                 + h[None, :])                                        # [BK//32, BH]
-            if SC_E4M3:
-                sc = _e4m3_byte_to_f32(scale) * TS
+            if HAS_TS:
+                _tsv = tl.load(ts_ptr + pid_e)   # ⭐ 每专家的 fp32 二级尺度(weight_scale_2)
             else:
-                sc = tl.exp2(scale.to(tl.float32) - 127.0) * TS
+                _tsv = TS
+            if SC_E4M3:
+                sc = _e4m3_byte_to_f32(scale) * _tsv
+            else:
+                sc = tl.exp2(scale.to(tl.float32) - 127.0) * _tsv
             sc = tl.reshape(tl.broadcast_to(sc[:, None, :], (BK // GKS, GKS, BH)), (BK, BH))
             b = (b_val * sc).to(tl.bfloat16)                         # [BK, BH]
             acc = tl.dot(act.to(tl.bfloat16), b, acc)
@@ -380,7 +400,7 @@ def _down_kernel_split(
     seg_ptr,
     w2t_ptr, w2t_row_stride, s2t_ptr, s2t_row_stride,
     out_ptr, out_ld,
-    W2_E, S2_E,
+    W2_E, S2_E, ts_ptr,
     H: tl.constexpr,
     I: tl.constexpr,
     BM: tl.constexpr,
@@ -392,6 +412,7 @@ def _down_kernel_split(
     GKS: tl.constexpr = 32,        # ⭐ NVFP4 用 16；默认 32 = MXFP4 现状
     SC_E4M3: tl.constexpr = 0,     # ⭐ 1 = 尺度是 E4M3 字节（NVFP4）；0 = e8m0
     TS: tl.constexpr = 1.0,        # ⭐ 每张量 F32 二级尺度（weight_scale_2）
+    HAS_TS: tl.constexpr = 0,    # ⭐ 1 = 每专家二级尺度从 ts_ptr[pid_e] 取（NVFP4）
 ):
     """down projection, even/odd-k split (see _gate_up_kernel_split)."""
     pid_e = tl.program_id(0)
@@ -437,10 +458,14 @@ def _down_kernel_split(
             scale = tl.load(
                 s2t_ptr + s_off + ((kk // GKS) + tl.arange(0, BK // GKS))[:, None] * s2t_row_stride
                 + h[None, :])
-            if SC_E4M3:
-                sc = _e4m3_byte_to_f32(scale) * TS
+            if HAS_TS:
+                _tsv = tl.load(ts_ptr + pid_e)   # ⭐ 每专家的 fp32 二级尺度(weight_scale_2)
             else:
-                sc = tl.exp2(scale.to(tl.float32) - 127.0) * TS
+                _tsv = TS
+            if SC_E4M3:
+                sc = _e4m3_byte_to_f32(scale) * _tsv
+            else:
+                sc = tl.exp2(scale.to(tl.float32) - 127.0) * _tsv
             sc_h = tl.reshape(
                 tl.broadcast_to(sc[:, None, :], (BK // GKS, GKS // 2, BH)), (BK // 2, BH))
             b_e = (w_e * sc_h).to(tl.bfloat16)
@@ -474,6 +499,70 @@ def _reuse_moe(key, shape, dtype, device):
     return t
 
 
+_SEG_BUF = {}
+
+
+def _seg_buf(name, shape, dtype, device, init=None):
+    """segmentation 用的**持久缓冲**（捕获期零分配）。"""
+    k = (str(device), name, tuple(int(v) for v in shape), dtype)
+    t = _SEG_BUF.get(k)
+    if t is None:
+        t = torch.empty(tuple(int(v) for v in shape), dtype=dtype, device=device)
+        if init is not None:
+            init(t)
+        _SEG_BUF[k] = t
+    return t
+
+
+def _build_segmentation_reuse(topk_ids, topk_weights, num_experts, device):
+    """`_build_segmentation` 的**零分配**版本（`XIAOTU_MOE_SEG_REUSE=1` 启用）。
+
+    与逐次分配版**语义完全一致**（垃圾桶桶、稳定排序、scatter_add 计数），
+    但所有中间张量都来自持久缓存、所有写入都是 in-place ⇒ 捕获期不产生任何分配。
+    目的：排除"捕获期分配/释放池内存"这一类可疑点（HANDOFF §74）。
+    """
+    T, K = topk_ids.shape
+    A = T * K
+    E = int(num_experts)
+    ids_v = topk_ids.reshape(-1)
+    wts_v = topk_weights.reshape(-1)
+
+    ids_c = _seg_buf("ids_c", (A,), torch.int32, device)
+    ids_c.copy_(ids_v)                                   # copy_ 自带类型转换
+    bad = _seg_buf("bad", (A,), torch.bool, device)
+    bad2 = _seg_buf("bad2", (A,), torch.bool, device)
+    torch.lt(ids_c, 0, out=bad)
+    torch.ge(ids_c, E, out=bad2)
+    bad.logical_or_(bad2)
+    ids_c.masked_fill_(bad, E)                            # 垃圾桶桶 = E
+
+    vals = _seg_buf("vals", (A,), torch.int32, device)
+    order = _seg_buf("order", (A,), torch.int64, device)
+    torch.sort(ids_c, stable=True, out=(vals, order))     # 输出到缓存
+
+    tok_ids = _seg_buf(
+        "tok_ids", (A,), torch.int64, device,
+        init=lambda t: t.copy_(torch.arange(T, device=device).repeat_interleave(K)))
+    sorted_tok = _seg_buf("sorted_tok", (A,), torch.int64, device)
+    torch.index_select(tok_ids, 0, order, out=sorted_tok)
+
+    wts_tmp = _seg_buf("wts_tmp", (A,), torch.float32, device)
+    wts_tmp.copy_(wts_v)                                  # copy_ 自带类型转换
+    sorted_wts = _seg_buf("sorted_wts", (A,), torch.float32, device)
+    torch.index_select(wts_tmp, 0, order, out=sorted_wts)
+
+    idx64 = _seg_buf("idx64", (A,), torch.int64, device)
+    idx64.copy_(ids_c)
+    ones = _seg_buf("ones", (A,), torch.int32, device, init=lambda t: t.fill_(1))
+    counts = _seg_buf("counts", (E + 1,), torch.int32, device)
+    counts.zero_()
+    counts.scatter_add_(0, idx64, ones)
+    seg_start = _seg_buf("seg_start", (E + 1,), torch.int32, device)
+    seg_start[0].zero_()
+    torch.cumsum(counts[:E], 0, out=seg_start[1:])
+    return sorted_tok, sorted_wts, seg_start, A
+
+
 def _build_segmentation(topk_ids, topk_weights, num_experts, device):
     """把 [T,K] 路由压成按专家分段的排序列表(供两个 Triton 内核按段遍历)。
 
@@ -486,6 +575,8 @@ def _build_segmentation(topk_ids, topk_weights, num_experts, device):
     返回的 ``A`` 固定为 ``T*K``(内核只按段边界取行,``A`` 只用来定缓冲大小;
     注意 ``inter`` 是按 **token id** 索引的,所以行数本来就要 ≥ T)。
     """
+    if os.environ.get("XIAOTU_MOE_SEG_REUSE", "0") == "1":
+        return _build_segmentation_reuse(topk_ids, topk_weights, num_experts, device)
     T, K = topk_ids.shape
     ids = topk_ids.to(torch.int32).reshape(-1)
     wts = topk_weights.to(torch.float32).reshape(-1)
@@ -549,6 +640,7 @@ def _gp_add(T: int, A: int, seg_s: float, rest_s: float) -> None:
 _CAPTURE_DEPTH = 0
 _CAPTURE_GUARD = threading.Lock()
 _CAPTURE_WATCH_INSTALLED = False
+_CAP_FREE = []
 
 
 def capture_in_progress() -> bool:
@@ -627,6 +719,13 @@ def _install_capture_watch() -> None:
             global _CAPTURE_DEPTH
             with _CAPTURE_GUARD:
                 _CAPTURE_DEPTH += 1
+            if os.environ.get("XIAOTU_CAP_MEM") == "1":
+                # 记录"每张图吃多少显存"（vLLM 在 MUSA 上跳过了 profile_cudagraph_memory，
+                # 所以我们自己量；只读 mem_get_info，零副作用）
+                try:
+                    _CAP_FREE.append(torch.musa.mem_get_info()[0] / 2**20)
+                except Exception:  # noqa: BLE001
+                    _CAP_FREE.append(-1.0)
             try:
                 return _begin(self, *a, **k)
             except BaseException:
@@ -639,6 +738,14 @@ def _install_capture_watch() -> None:
             try:
                 return _end(self, *a, **k)
             finally:
+                if os.environ.get("XIAOTU_CAP_MEM") == "1" and _CAP_FREE:
+                    try:
+                        free_now = torch.musa.mem_get_info()[0] / 2**20
+                        before = _CAP_FREE.pop()
+                        print("[cap-mem] graph#%d 期间显存减少 %.0f MiB（capture 前空闲 %.0f MiB）"
+                              % (len(_CAP_FREE) + 1, before - free_now, before), flush=True)
+                    except Exception:  # noqa: BLE001
+                        pass
                 with _CAPTURE_GUARD:
                     _CAPTURE_DEPTH = max(0, _CAPTURE_DEPTH - 1)
 
@@ -902,8 +1009,11 @@ def reserve_staging_for_profile(need_bytes: int, device=None) -> bool:
 
 
 def release_staging_reserve() -> None:
-    # ⭐ 2026-10-25（A69/A71 观测面）：释放前后各打一次 free，便于机械验证
-    #   「free 回升 ≈ 占位大小」⇒ 证明释放**真的**生效、且 empty_cache 也做了 ✓
+    """profile 结束立刻释放占位 ⇒ 那块显存留给随后分配的 KV / 真正的 staging ✓
+
+    ⭐ 2026-10-25（A69/A71）：释放前后各打一次 free，便于**机械验证**
+    「free 回升 ≈ 占位大小」⇒ 证明释放真的生效、且 empty_cache 也做了 ✓
+    """
     try:
         import torch as _t
         _p = _t.cuda.current_device()
@@ -912,8 +1022,6 @@ def release_staging_reserve() -> None:
               % (_f0 / 2**30, _tot / 2**30), flush=True)
     except Exception as _e:  # noqa: BLE001
         print(f"[xtu-kv-diag] 释放前取显存失败(不掩盖): {type(_e).__name__}: {_e}", flush=True)
-        _t = None
-    """profile 结束立刻释放占位 ⇒ 那块显存留给随后分配的 KV / 真正的 staging ✓"""
     if _PROF_RESERVE:
         _PROF_RESERVE.clear()
         # ⭐ A69：`clear()` 只是丢掉活引用，段仍留在 torch 缓存分配器里 ⇒
@@ -2041,6 +2149,11 @@ def gpu_moe_layer(
     slot: "PrefetchSlot | None" = None,
     out_dtype=None,
     swiglu_limit: float = 0.0,
+    group_k: int = 32,
+    scale_kind: "str | None" = None,   # "e4m3"(NVFP4) | "e8m0"(MXFP4)；None=按 dtype 推断
+    s13_ts=None,
+    s2_ts=None,
+    out=None,
 ):
     """One layer's routed MoE on GPU (K-major raw bytes, in-kernel fp4 dequant).
 
@@ -2056,6 +2169,15 @@ def gpu_moe_layer(
     E = w13.shape[0]
     device = torch.device(device) if not isinstance(device, torch.device) else device
     _t0 = time.perf_counter() if _GP_TIMING else 0.0
+    # ⚠️ 顺序要紧：**先按原 dtype 判 kind，再换成 uint8 视图** ——
+    #   反过来会让下面的 `_dt` 看到 uint8 而误判成 e8m0（实测：inter≈1e-20、out=0，
+    #   2026-10-26 离线单测抓到的第一个假阴性）
+    _dt = getattr(s13, "dtype", None)
+    _kind = scale_kind or ("e4m3" if _dt == torch.float8_e4m3fn else "e8m0")
+    if _dt == torch.float8_e4m3fn:
+        s13 = s13.view(torch.uint8)      # fp8 ⇒ uint8 视图（字节不变，内核按字节解码）
+    if getattr(s2, "dtype", None) == torch.float8_e4m3fn:
+        s2 = s2.view(torch.uint8)
     if slot is not None:
         # 【不要在图捕获期间 wait_event】常驻层的 slot.ready 是在**捕获外**
         # (构建时)record 的,图内等待它会触发 cudaErrorStreamCaptureIsolation
@@ -2075,9 +2197,24 @@ def gpu_moe_layer(
         w2_t = _kmajor_bytes(_pinned(w2).to(device, non_blocking=True))
         s2_t = _kmajor_bytes(_pinned(s2).to(device, non_blocking=True))
 
+    # ⭐ `XIAOTU_MOE_STEPTRACE=1`：捕获期挂死定位（分点打印，最后一条 = 挂在那之前的阶段）
+    _tr = os.environ.get("XIAOTU_MOE_STEPTRACE", "0") == "1"
+
+    def _trp(tag):
+        if _tr:
+            print(f"[step-trace] {tag} T={T} E={E} A={A if 'A' in dir() else '?'} "
+                  f"capture={torch.cuda.is_current_stream_capturing()}", flush=True)
+
+    _trp("A: 进入 gpu_moe_layer")
     tok, wts, seg_start, A = _build_segmentation(topk_ids, topk_weights, E, device)
     _t1 = time.perf_counter() if _GP_TIMING else 0.0
-    out = torch.zeros((T, H), dtype=out_dtype or torch.bfloat16, device=device)
+    _trp("B: segmentation 完成")
+    if out is None:
+        out = torch.zeros((T, H), dtype=out_dtype or torch.bfloat16, device=device)
+    else:
+        # ⭐ 调用方给**持久缓冲**（地址稳定）⇒ 图捕获的 eager-break 段可以安全复用
+        out.zero_()
+    _trp("C: out 分配完成")
     if T == 0 or K == 0:
         # 形状判空(不是数据判空):A 现在是固定的 T*K,空批之外不会为 0。
         # 全部 id 无效时它们都落进垃圾桶段,每个专家的段为空 ⇒ 内核不写 out。
@@ -2116,12 +2253,27 @@ def gpu_moe_layer(
     _lut = os.environ.get("XIAOTU_GPU_PREFILL_LUT", "0") == "1"
     NW = int(os.environ.get("XIAOTU_GPU_PREFILL_WARPS", "4"))
     lut_t = _e2m1_table(device)
+    # ⭐⭐ NVFP4（A78-4，2026-10-26）：`GKS`/`SC_E4M3`/`TS` 这三个 constexpr 一直存在
+    #   却**从来没被传过** ⇒ 默认 e8m0 + GKS=32 ⇒ 喂 e4m3 组尺度会静默错数 ✗
+    #   现在按尺度 dtype 自动选：fp8_e4m3 = NVFP4(组 16) / uint8 = MXFP4(组 32, e8m0) ✓
+    #   `s13_ts`/`s2_ts` 非空 ⇒ 每专家一个 fp32 二级尺度(weight_scale_2)，经 ts_ptr 传内核。
+    # ⚠️ 内核要的是**原始字节**（`_e4m3_byte_to_f32` 做位运算）⇒ 传进去的尺度必须是
+    #   uint8；fp8 张量会让 `tl.load` 得到 fp8 类型、位运算直接编译失败
+    #   （实测 `cannot cast fp8e4nv[...] to int32`，2026-10-26）。
+    #   而**真模型里 NVFP4 的尺度参数本来就是 uint8**（e4m3 的位模式）⇒ 无法用 dtype 区分
+    #   NVFP4/MXFP4 ⇒ 加显式 `scale_kind`（None 时按 dtype 推断，兼容旧调用）。
+    _sc_e4m3 = 1 if _kind == "e4m3" else 0
+    _has_ts = s13_ts is not None
+    _ts13 = s13_ts if _has_ts else s13_t
+    _ts2 = s2_ts if _has_ts else s2_t
+    _nvkw = dict(GKS=int(group_k), SC_E4M3=_sc_e4m3, HAS_TS=1 if _has_ts else 0)
     if _variant == "split":
         _gate_up_kernel_split[(E, triton.cdiv(2 * I, BN))](
             x, x.stride(0), tok, seg_start,
             w13_t, w13_t.stride(1), s13_t, s13_t.stride(1),
             inter, inter.stride(0), W13_E, S13_E,
             H=H, BM=BM, BN=BN, BK=BK, NS=NS, LUT=_lut, num_warps=NW,
+            ts_ptr=_ts13, **_nvkw,
         )
         _down_kernel_split[(E, triton.cdiv(H, BH))](
             inter, inter.stride(0), tok, wts, seg_start,
@@ -2129,21 +2281,38 @@ def gpu_moe_layer(
             out, out.stride(0), W2_E, S2_E,
             H=H, I=I, BM=BM, BH=BH, BK=BK, NS=NS, LUT=_lut,
             LIMIT=float(swiglu_limit), num_warps=NW,
+            ts_ptr=_ts2, **_nvkw,
         )
     else:
+        if os.environ.get("XIAOTU_MOE_BISECT_SEG") == "1":
+            # 只做 segmentation（不 launch 任何 MoE 内核）——二分定位用
+            _trp("D: 内核 launch 完成")
+            return out
         _gate_up_kernel[(E, triton.cdiv(2 * I, BN))](
             x, x.stride(0), tok, seg_start,
             w13_t, w13_t.stride(1), s13_t, s13_t.stride(1),
             inter, inter.stride(0), W13_E, S13_E, lut_t,
             H=H, BM=BM, BN=BN, BK=BK, NS=NS, LUT=_lut, num_warps=NW,
+            ts_ptr=_ts13, **_nvkw,
         )
+        if os.environ.get("XIAOTU_MOE_BISECT_UP") == "1":
+            # 只做 gate_up（跳过 down + 原子加）——二分定位用
+            _trp("D: 内核 launch 完成")
+            return out
         _down_kernel[(E, triton.cdiv(H, BH))](
             inter, inter.stride(0), tok, wts, seg_start,
             w2_t, w2_t.stride(1), s2_t, s2_t.stride(1),
             out, out.stride(0), W2_E, S2_E, lut_t,
             H=H, I=I, BM=BM, BH=BH, BK=BK, NS=NS, LUT=_lut,
             LIMIT=float(swiglu_limit), num_warps=NW,
+            ts_ptr=_ts2, **_nvkw,
         )
+    if os.environ.get("XIAOTU_GPF_STAGE") == "1":
+        # 诊断：内核到底有没有写数据（inter=gate_up 输出、out=最终输出）
+        print(f"[gpf-stage] T={T} A={A} variant={_variant} E={E} I={I} H={H} "
+              f"GKS={group_k} e4m3={_sc_e4m3} has_ts={_has_ts} "
+              f"inter.max={float(inter.abs().max()) if T else 0.0} "
+              f"out.max={float(out.abs().max()) if T else 0.0}", flush=True)
     if _GP_TIMING:
         _gp_add(T, A, _t1 - _t0, time.perf_counter() - _t1)
         if slot is not None and getattr(slot, "t0", None) is not None:
@@ -2155,9 +2324,15 @@ def gpu_moe_layer(
         # Mark the slot free only after these kernels have actually finished.
         # ⭐ 2026-10-20:旧实现每次调用都 new 一个 Event;PIN 路径每层每 forward 调一次
         #   ⇒ 长时间压测累计大量 CUDA event(与 as_slot 同族泄漏)。复用同一个 event。
-        if getattr(slot, "busy", None) is None:
-            slot.busy = torch.cuda.Event()
-        slot.busy.record(torch.cuda.current_stream(device))
+        # ⛔【捕获期不要 record event】MUSA 上在**捕获中的流**里 record 事件，
+        #   会让 `cudaStreamEndCapture` 返回 invalid argument（实测：关掉 MoE 断点后
+        #   两 rank 都捕获成功；开着就有一侧失败）。事件只用于"层用完可以复用"的调度，
+        #   常驻层在捕获后本来就不走预取 ⇒ 捕获期跳过它，语义不变 ✓
+        if not torch.cuda.is_current_stream_capturing():
+            if getattr(slot, "busy", None) is None:
+                slot.busy = torch.cuda.Event()
+            slot.busy.record(torch.cuda.current_stream(device))
+    _trp("D: 内核 launch 完成")
     return out
 
 
@@ -2183,12 +2358,14 @@ def _moe_tile_launch(x, tok, wts, seg_local, w13_t, s13_t, w2_t, s2_t,
             w13_t, w13_t.stride(1), s13_t, s13_t.stride(1),
             inter_view, inter_view.stride(0), W13_E, S13_E,
             H=H, BM=BM, BN=BN, BK=BK, NS=NS, LUT=LUT, num_warps=NW,
+            ts_ptr=s13_t,
         )
         _down_kernel_split[(E_t, triton.cdiv(H, BH))](
             inter_view, inter_view.stride(0), tok, wts, seg_local,
             w2_t, w2_t.stride(1), s2_t, s2_t.stride(1),
             out, out.stride(0), W2_E, S2_E,
             H=H, I=I, BM=BM, BH=BH, BK=BK, NS=NS, LUT=LUT, num_warps=NW,
+            ts_ptr=s2_t,
         )
     else:
         _gate_up_kernel[(E_t, triton.cdiv(2 * I, BN))](
@@ -2196,12 +2373,14 @@ def _moe_tile_launch(x, tok, wts, seg_local, w13_t, s13_t, w2_t, s2_t,
             w13_t, w13_t.stride(1), s13_t, s13_t.stride(1),
             inter_view, inter_view.stride(0), W13_E, S13_E, lut_t,
             H=H, BM=BM, BN=BN, BK=BK, NS=NS, LUT=LUT, num_warps=NW,
+            ts_ptr=s13_t,
         )
         _down_kernel[(E_t, triton.cdiv(H, BH))](
             inter_view, inter_view.stride(0), tok, wts, seg_local,
             w2_t, w2_t.stride(1), s2_t, s2_t.stride(1),
             out, out.stride(0), W2_E, S2_E, lut_t,
             H=H, I=I, BM=BM, BH=BH, BK=BK, NS=NS, LUT=LUT, num_warps=NW,
+            ts_ptr=s2_t,
         )
 
 

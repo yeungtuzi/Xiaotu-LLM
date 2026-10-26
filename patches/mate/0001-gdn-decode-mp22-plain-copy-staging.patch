@@ -1,0 +1,287 @@
+diff --git a/mate/gdn_kernels/tilelang/gdn_decode.py b/mate/gdn_kernels/tilelang/gdn_decode.py
+index eff55cd..e987c3a 100644
+--- a/mate/gdn_kernels/tilelang/gdn_decode.py
++++ b/mate/gdn_kernels/tilelang/gdn_decode.py
+@@ -6,6 +6,7 @@ by ``mate.gdn_decode``.
+ """
+ 
+ import functools
++import os
+ 
+ import tilelang
+ import tilelang.language as T
+@@ -31,6 +32,54 @@ _AUTO_TUNED_LARGE_BATCH_CONFIG = (4, 1, 8)
+ _LOW_PARALLEL_SPLIT_CTA_THRESHOLD = 256
+ _LOW_PARALLEL_SPLIT_CONFIG = (8, 1, 4)
+ 
++# TMA (Tensor Memory Accelerator) first appears on MP31.  Older MUSA targets
++# such as MP22 (MTT S4000) reject the explicit ``T.tma_copy`` lowering, so the
++# state staging has to go through plain shared-memory copies there.
++_TMA_MIN_ARCH = (3, 1)
++_TMA_ENV_OVERRIDE = "MATE_GDN_DECODE_TMA"
++_FALSE_VALUES = ("0", "false", "off", "no")
++_TRUE_VALUES = ("1", "true", "on", "yes")
++
++
++@functools.lru_cache(maxsize=8)
++def _device_arch(device_index: int) -> tuple[int, int] | None:
++    try:
++        import torch_musa
++
++        props = torch_musa.get_device_properties(device_index)
++    except Exception:
++        return None
++    return (int(props.major), int(props.minor))
++
++
++def target_supports_tma() -> bool:
++    """Whether the active MUSA target exposes TMA copy/store instructions.
++
++    ``MATE_GDN_DECODE_TMA`` can force the decision (``1``/``0``); it exists so
++    the non-TMA path can also be exercised on TMA-capable hardware.
++    """
++    override = os.environ.get(_TMA_ENV_OVERRIDE)
++    if override is not None:
++        value = override.strip().lower()
++        if value in _FALSE_VALUES:
++            return False
++        if value in _TRUE_VALUES:
++            return True
++        raise ValueError(
++            f"{_TMA_ENV_OVERRIDE} must be one of {_TRUE_VALUES + _FALSE_VALUES}, "
++            f"got {override!r}."
++        )
++
++    try:
++        device_index = torch.musa.current_device()
++    except Exception:
++        # Unknown target: keep the historical TMA path.
++        return True
++    arch = _device_arch(device_index)
++    if arch is None:
++        return True
++    return arch >= _TMA_MIN_ARCH
++
+ 
+ def _exp2_f32(value):
+     return T.exp2(value * _LOG2E)
+@@ -87,6 +136,7 @@ def _build_decode_fp32_vk_kernel_factory(
+     num_blocks_per_state: int,
+     stage: int,
+     use_identity_state_indices: bool,
++    use_tma: bool,
+ ):
+     if qk_head <= 0:
+         raise ValueError("qk_head must be positive.")
+@@ -241,7 +291,8 @@ def _build_decode_fp32_vk_kernel_factory(
+                 sum_hq = T.alloc_local([1], "float32")
+                 stage_idx_var = T.alloc_var(T.int32)
+ 
+-                mbars = T.alloc_barrier(mbarrier_list)
++                if use_tma:
++                    mbars = T.alloc_barrier(mbarrier_list)
+ 
+                 qk_hid = hid // head_group_size
+                 tid = T.get_thread_binding()
+@@ -256,17 +307,32 @@ def _build_decode_fp32_vk_kernel_factory(
+                 if state_slot >= 0:
+                     # Prologue: preload state tiles into stage buffers.
+                     prefetch_count = min(stage, num_v_tiles_per_block)
+-                    for i in T.serial(prefetch_count):
+-                        prologue_v_tile = start_v_tile + i
+-                        prologue_v_base = prologue_v_tile * v_tile
+-                        T.tma_copy(
+-                            state[state_slot, hid, prologue_v_base, 0],
+-                            state_load_stage[i, :, :],
+-                            barrier=mbars[i],
+-                            inner_cache_policy=_STATE_TME_INNER_CACHE_POLICY,
+-                            outer_cache_policy=_STATE_TME_OUTER_CACHE_POLICY,
+-                        )
+-                        T.mbarrier_arrive(mbarrier=mbars[i])
++                    if use_tma:
++                        for i in T.serial(prefetch_count):
++                            prologue_v_tile = start_v_tile + i
++                            prologue_v_base = prologue_v_tile * v_tile
++                            T.tma_copy(
++                                state[state_slot, hid, prologue_v_base, 0],
++                                state_load_stage[i, :, :],
++                                barrier=mbars[i],
++                                inner_cache_policy=_STATE_TME_INNER_CACHE_POLICY,
++                                outer_cache_policy=_STATE_TME_OUTER_CACHE_POLICY,
++                            )
++                            T.mbarrier_arrive(mbarrier=mbars[i])
++                    else:
++                        for i in T.serial(prefetch_count):
++                            prologue_v_tile = start_v_tile + i
++                            prologue_v_base = prologue_v_tile * v_tile
++                            T.copy(
++                                state[
++                                    state_slot,
++                                    hid,
++                                    prologue_v_base : prologue_v_base + v_tile,
++                                    0:dim_k,
++                                ],
++                                state_load_stage[i, :, :],
++                            )
++                        T.sync_threads()
+ 
+                     alpha_reg[0] = 0.0
+                     beta_reg[0] = 0.0
+@@ -331,26 +397,38 @@ def _build_decode_fp32_vk_kernel_factory(
+                         if local_v_tile > 0:
+                             # Keep one TME store overlapped with compute, but wait before
+                             # reusing its shared-memory stage two iterations later.
+-                            if local_v_tile > 1:
++                            if use_tma and local_v_tile > 1:
+                                 T.tma_store_wait()
+                             global_prev_v_base = global_v_base - v_tile
+-                            T.tma_copy(
+-                                state_store_stage[(local_v_tile - 1) % 2, :, :],
+-                                state[
+-                                    state_slot,
+-                                    hid,
+-                                    global_prev_v_base : global_prev_v_base + v_tile,
+-                                    :,
+-                                ],
+-                                inner_cache_policy=_STATE_TME_INNER_CACHE_POLICY,
+-                                outer_cache_policy=_STATE_TME_OUTER_CACHE_POLICY,
+-                            )
++                            if use_tma:
++                                T.tma_copy(
++                                    state_store_stage[(local_v_tile - 1) % 2, :, :],
++                                    state[
++                                        state_slot,
++                                        hid,
++                                        global_prev_v_base : global_prev_v_base + v_tile,
++                                        :,
++                                    ],
++                                    inner_cache_policy=_STATE_TME_INNER_CACHE_POLICY,
++                                    outer_cache_policy=_STATE_TME_OUTER_CACHE_POLICY,
++                                )
++                            else:
++                                T.copy(
++                                    state_store_stage[(local_v_tile - 1) % 2, :, :],
++                                    state[
++                                        state_slot,
++                                        hid,
++                                        global_prev_v_base : global_prev_v_base + v_tile,
++                                        0:dim_k,
++                                    ],
++                                )
+                             # Keep the CTA in step after the issuing warp commits the store.
+                             T.sync_threads()
+ 
+-                        T.mbarrier_wait_parity(
+-                            mbarrier=mbars[stage_idx_var], parity=parity
+-                        )
++                        if use_tma:
++                            T.mbarrier_wait_parity(
++                                mbarrier=mbars[stage_idx_var], parity=parity
++                            )
+ 
+                         for row_base in range(0, v_tile, 4):
+                             row_idx = row_base + warp
+@@ -400,35 +478,59 @@ def _build_decode_fp32_vk_kernel_factory(
+                         if next_local_v_tile < num_v_tiles_per_block:
+                             global_next_v_tile = start_v_tile + next_local_v_tile
+                             global_next_v_base = global_next_v_tile * v_tile
+-                            T.tma_copy(
+-                                state[state_slot, hid, global_next_v_base, 0],
+-                                state_load_stage[stage_idx_var, :, :],
+-                                barrier=mbars[stage_idx_var],
+-                                inner_cache_policy=_STATE_TME_INNER_CACHE_POLICY,
+-                                outer_cache_policy=_STATE_TME_OUTER_CACHE_POLICY,
+-                            )
+-                            T.mbarrier_arrive(mbarrier=mbars[stage_idx_var])
++                            if use_tma:
++                                T.tma_copy(
++                                    state[state_slot, hid, global_next_v_base, 0],
++                                    state_load_stage[stage_idx_var, :, :],
++                                    barrier=mbars[stage_idx_var],
++                                    inner_cache_policy=_STATE_TME_INNER_CACHE_POLICY,
++                                    outer_cache_policy=_STATE_TME_OUTER_CACHE_POLICY,
++                                )
++                                T.mbarrier_arrive(mbarrier=mbars[stage_idx_var])
++                            else:
++                                T.copy(
++                                    state[
++                                        state_slot,
++                                        hid,
++                                        global_next_v_base : global_next_v_base + v_tile,
++                                        0:dim_k,
++                                    ],
++                                    state_load_stage[stage_idx_var, :, :],
++                                )
++                                T.sync_threads()
+ 
+                     # Epilogue: store the last updated state tile.
+                     global_prev_v_base_epi = (
+                         start_v_tile + num_v_tiles_per_block - 1
+                     ) * v_tile
+-                    T.tma_copy(
+-                        state_store_stage[(num_v_tiles_per_block - 1) % 2, :, :],
+-                        state[
+-                            state_slot,
+-                            hid,
+-                            global_prev_v_base_epi : global_prev_v_base_epi + v_tile,
+-                            :,
+-                        ],
+-                        inner_cache_policy=_STATE_TME_INNER_CACHE_POLICY,
+-                        outer_cache_policy=_STATE_TME_OUTER_CACHE_POLICY,
+-                    )
++                    if use_tma:
++                        T.tma_copy(
++                            state_store_stage[(num_v_tiles_per_block - 1) % 2, :, :],
++                            state[
++                                state_slot,
++                                hid,
++                                global_prev_v_base_epi : global_prev_v_base_epi + v_tile,
++                                :,
++                            ],
++                            inner_cache_policy=_STATE_TME_INNER_CACHE_POLICY,
++                            outer_cache_policy=_STATE_TME_OUTER_CACHE_POLICY,
++                        )
++                    else:
++                        T.copy(
++                            state_store_stage[(num_v_tiles_per_block - 1) % 2, :, :],
++                            state[
++                                state_slot,
++                                hid,
++                                global_prev_v_base_epi : global_prev_v_base_epi + v_tile,
++                                0:dim_k,
++                            ],
++                        )
+ 
+                     if tid < num_v_tiles_per_block * v_tile:
+                         o[bid, hid, start_v_tile * v_tile + tid] = output_tile[tid]
+ 
+-                    T.tma_store_wait()
++                    if use_tma:
++                        T.tma_store_wait()
+                 else:
+                     if tid < num_v_tiles_per_block * v_tile:
+                         o[bid, hid, start_v_tile * v_tile + tid] = T.cast(
+@@ -455,6 +557,7 @@ def _get_decode_fp32_vk_kernel(
+     num_blocks_per_state: int,
+     stage: int,
+     use_identity_state_indices: bool,
++    use_tma: bool,
+ ):
+     return _build_decode_fp32_vk_kernel_factory(
+         qk_head=qk_head,
+@@ -470,6 +573,7 @@ def _get_decode_fp32_vk_kernel(
+         num_blocks_per_state=num_blocks_per_state,
+         stage=stage,
+         use_identity_state_indices=use_identity_state_indices,
++        use_tma=use_tma,
+     )()
+ 
+ 
+@@ -528,6 +632,7 @@ def run_gated_delta_rule_decode_vk_fp32(
+         num_blocks_per_state=kernel_config["num_blocks_per_state"],
+         stage=kernel_config["stage"],
+         use_identity_state_indices=use_identity_state_indices,
++        use_tma=target_supports_tma(),
+     )
+ 
+     kernel_fn(

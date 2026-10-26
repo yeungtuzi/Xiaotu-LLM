@@ -1926,6 +1926,25 @@ class _XiaotuExpertsMixin:
                 and not in_profile_run()
                 and not torch.cuda.is_current_stream_capturing()
             )
+            # ⭐【2026-10-27 · XTU 诊断】真实流量(非 profile 期)才打印，最多 24 条：
+            #   目的=定位"长预填仍在 CPU 跑"的确切原因(见 INCIDENT §29)。
+            _dbg = globals().setdefault("_GPF_DBG", {"n": 0})
+            if (not in_profile_run()) and _dbg["n"] < 24:
+                _dbg["n"] += 1
+                try:
+                    from vllm_xiaotu_moe.gpu_prefill import (
+                        _IN_PROFILE_RUN, _IN_STARTUP, _IN_WARMUP,
+                    )
+                    print(
+                        "[xtu-gp-decision] qlen=%d gp_on=%s gp_min=%d gpu_pf=%s "
+                        "prof=%s startup=%s warmup=%s capturing=%s resident=%s"
+                        % (qlen, _gp_on, _gp_min, _gpu_pf, in_profile_run(),
+                           _IN_STARTUP[0], _IN_WARMUP[0],
+                           torch.cuda.is_current_stream_capturing(), _resident),
+                        flush=True,
+                    )
+                except Exception:
+                    pass
         # ⚠️ 释放条件是 `_gp_on`,不是 `_gpu_pf`。引擎是**惰性**建的:第一个请求
         # 若是长 prefill 就走 GPU、不建引擎;而紧接着的解码步(qlen < 阈值)会把引擎
         # 建起来 —— 那一刻若把源权重释放掉,下一次长 prefill 就没得流式读了。
@@ -2338,12 +2357,21 @@ class _XiaotuExpertsMixin:
                                 #   `out.to(dtype)` 才抛出 cudaStreamCaptureStatusInvalidated)✗
                                 #   ⇒ 心跳**只保留 host 侧信息**(时间/层名/qlen/计数/显存分配量)，
                                 #   不再读任何 device 值 ✓(alloc 是 host 计数器,不同步 ✓)
+                                # ⭐【2026-10-26】显存三连探针：alloc(活张量) / resv(allocator 缓存)
+                                #   / free(驱动视角空闲)。判据：若 resv 远大于 alloc 且 free 掉到 1 GiB 级，
+                                #   则是**缓存/碎片**问题(可用 empty_cache / expandable_segments 治)，
+                                #   而不是真的被活张量占满。全部是 host 计数器 + mem_get_info(不建上下文)✓
+                                _al = torch.cuda.memory_allocated(_dev) / 2**30
+                                _rs = torch.cuda.memory_reserved(_dev) / 2**30
+                                try:
+                                    _fr = torch.cuda.mem_get_info(_dev)[0] / 2**30
+                                except Exception:
+                                    _fr = -1.0
                                 print("[xtu-pf-progress] %s device=%s layer=%s qlen=%d call=%d "
-                                      "alloc=%.1fGiB"
+                                      "alloc=%.2fGiB resv=%.2fGiB free=%.2fGiB"
                                       % (time.strftime("%H:%M:%S"), _dev,
                                          getattr(layer, "layer_name", "?"), qlen,
-                                         _PF_CALL["n"],
-                                         torch.cuda.memory_allocated(_dev) / 2**30),
+                                         _PF_CALL["n"], _al, _rs, _fr),
                                       flush=True)
                         except Exception:  # noqa: BLE001  心跳绝不能影响主流程 ✓
                             pass

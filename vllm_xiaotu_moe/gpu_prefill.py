@@ -1119,6 +1119,68 @@ def _reserve_staging_from_model(runner) -> None:
     reserve_staging_for_profile(need)
 
 
+# ══════════════════════════════════════════════════════════════════════════════
+# 长上下文激活记账（R34 老账 · 2026-10-26）
+#
+# 问题（实测，`dev-docs/INCIDENT_2026-10-26_XID31.md` §15.1/§18）：
+#   vLLM 只用 `MBT=8192` 的一批 profile_run 去测 `peak activation` ⇒ 本模型测得 **1.88 GiB**，
+#   而定容 `max_model_len=524288` 的服务在**长上下文 decode** 时的真实工作区远大于此。
+#   后果：KV 池按"只留 1.88 GiB 激活"定容 ⇒ 稳态把设备填到 97%，
+#   之后任何一次稍大的临时分配都会失败（r41 4 次 / mm16 10 次），
+#   而"空出来了也不归还"（93 个空闲样本实测 +6.4 GiB 常驻）⇒ **跑十几小时后变成 Xid 31**。
+#
+# 本改动 = 把这份"没被计入的激活"在**定 KV 之前**真实占住：
+#   `determine_available_memory` 的入口分配、`orig_dam()` 返回后释放
+#   ⇒ vLLM 的 `after_profile.free_memory` 据实少这么多 ⇒ **KV 自动让出这块** ✓
+#   ⇒ 饱和从"运行 14 小时后暴露"提前到"启动那 10 分钟就暴露"（R34 的要求）。
+#
+# ⚠️ 默认 **0.0 = 关闭**：这个数值必须**先量再定**，不能拍。
+#   标定配方见 `dev-docs/INCIDENT_2026-10-26_XID31.md` §22；
+#   粗略参考：268k 上下文实例的峰值比"启动后实测占用"高约 5.2 GiB（含 allocator 常驻，
+#   故是**上界**；真实"活激活"介于 vLLM 的 1.88 与 5.2 之间）。
+#   打开方式：`XIAOTU_GP_ACT_RESERVE_LC_GIB=3.0`（示例值，务必用标定结果替换）。
+# ⚠️ 打开后 KV 池会**等比变小**：代价是并发/上下文容量，收益是"不再静默贴顶"。
+#   这正是 R34 要的诚实账 —— 不够就在启动期说清楚，而不是运行中崩。
+# ══════════════════════════════════════════════════════════════════════════════
+
+def _lc_activation_gib() -> float:
+    """要额外计入的长上下文激活量（GiB）；0 或负数 = 关闭。"""
+    try:
+        return float(os.environ.get("XIAOTU_GP_ACT_RESERVE_LC_GIB", "0") or 0)
+    except (TypeError, ValueError):
+        return 0.0
+
+
+def _reserve_lc_activation():
+    """在 profile 测点之前占住长上下文激活；返回持有的张量（或 None）。"""
+    gib = _lc_activation_gib()
+    if gib <= 0:
+        return None
+    n = int(gib * 2**30)
+    try:
+        t = torch.empty(n, dtype=torch.uint8, device="cuda")
+        free_b, total_b = torch.cuda.mem_get_info()
+        print(f"[vllm-xtu-moe] ⭐ 长上下文激活记账: 在 KV 定容前占住 **{gib:.2f} GiB**"
+              f"(设备剩 {free_b / 2**30:.2f}/{total_b / 2**30:.2f} GiB)"
+              f" ⇒ 本次 KV 池会相应变小，账本据此诚实 ✓", flush=True)
+        return t
+    except Exception as _e:  # noqa: BLE001
+        # 出声，不静默：静默退化会让"以为开了"变成谎报（B512 的教训）
+        print(f"[vllm-xtu-moe] ⛔ 长上下文激活记账**失败**(不掩盖) ⇒ 本次 KV 仍会按"
+              f"『只留 vLLM 自测激活』定容，贴顶风险照旧:"
+              f" {type(_e).__name__}: {_e}", flush=True)
+        return None
+
+
+def _release_lc_activation(t) -> None:
+    """KV 已据实定容 ⇒ 释放占位（块留在 torch cache 里，正好给长上下文工作区复用）✓"""
+    if t is None:
+        return
+    del t
+    print("[vllm-xtu-moe] ⭐ 长上下文激活占位已释放(KV 已按含该占位的口径定容)"
+          " ⇒ 这块显存留给真正的长上下文工作区 ✓", flush=True)
+
+
 def install_profile_guard() -> list[str]:
     """把 `profile_run` 暴露给我们(用来**设 `_IN_PROFILE_RUN`**,禁止 profile 期跑预填内核)✓
     ⭐ 2026-10-15【B441】:占位**不再**挂在这里(会漏记)⇒ 见 `GPUWorker.determine_available_memory` ✓
@@ -1227,20 +1289,18 @@ def install_profile_guard() -> list[str]:
                     print("[vllm-xtu-moe] ⛔ profile 期 staging 记账失败(不掩盖)"
                           f" ⇒ 本次 KV 可能按『没有 staging』定容:"
                           f" {type(_e).__name__}: {_e}", flush=True)
-                # ⭐⭐ 2026-10-25 修根因（A71）：`release_staging_reserve()` 此前
-                #   **没有任何调用点** ⇒ 占位 1.76 GiB 被计入 total_consumed 却永不释放，
-                #   运行期真缓冲再分配 1.76 GiB ⇒ 总占用比记账多 1.76 GiB（超分来源之一）。
-                #   位置：orig_dam 已测完 after_profile 并算出 available，KV 的
-                #   initialize_kv_cache 在其之后 ⇒ 此刻释放刚好把显存让给 KV ✓
+                # 【MUSA A71】staging 占位必须在 KV 定容前释放（否则运行期多占 1.76 GiB）
+                # 【主线 R34】长上下文激活记账在 orig_dam 期间占住，让 KV 据实少算同样多
+                _lc_res = _reserve_lc_activation()
                 try:
-                    _ret = orig_dam(self, *a, **kw)
+                    return orig_dam(self, *a, **kw)
                 finally:
                     try:
                         release_staging_reserve()
                     except Exception as _e:  # noqa: BLE001
                         print("[vllm-xtu-moe] ⛔ 释放 staging 占位失败(不掩盖): "
                               f"{type(_e).__name__}: {_e}", flush=True)
-                return _ret
+                    _release_lc_activation(_lc_res)
 
             determine_available_memory._xtu_shim = True  # type: ignore[attr-defined]
             _gpf_worker.determine_available_memory = determine_available_memory

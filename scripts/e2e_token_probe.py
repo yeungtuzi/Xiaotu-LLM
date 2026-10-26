@@ -59,9 +59,13 @@ def _long_context_prompt(target_chars: int = 12000) -> str:
 
 
 def post(port: int, model: str, prompt: str, max_tokens: int) -> dict:
+    """⚠️ 必须走 **chat** 端点：ds41f 是 chat 模型，裸 `/v1/completions` 会**立刻 EOS**
+    （实测 `completion_tokens=1, finish_reason=stop, text=""`）—— 那不是模型问题，
+    是模板/端点用错（本文件 2026-10-27 首次运行时踩到）。
+    """
     payload = {
         "model": model,
-        "prompt": prompt,
+        "messages": [{"role": "user", "content": prompt}],
         "max_tokens": max_tokens,
         "temperature": 0.0,
         "top_p": 1.0,
@@ -69,7 +73,7 @@ def post(port: int, model: str, prompt: str, max_tokens: int) -> dict:
         "stream": False,
     }
     req = urllib.request.Request(
-        f"http://127.0.0.1:{port}/v1/completions",
+        f"http://127.0.0.1:{port}/v1/chat/completions",
         data=json.dumps(payload).encode(),
         headers={"Content-Type": "application/json"},
     )
@@ -101,7 +105,7 @@ def main() -> int:
             r = post(a.port, a.model, prompt + f"\n<!-- nonce {nonce} -->", mt)
             rec["cases"].append({
                 "name": name,
-                "text": r["choices"][0]["text"],
+                "text": (r["choices"][0].get("message") or {}).get("content", ""),
                 "prompt_tokens": r.get("usage", {}).get("prompt_tokens"),
                 "completion_tokens": r.get("usage", {}).get("completion_tokens"),
                 "finish_reason": r["choices"][0].get("finish_reason"),

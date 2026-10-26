@@ -40,7 +40,7 @@
 | 线 | 路径 | 分支 | 说明 |
 |---|---|---|---|
 | 主线(GLM/DeepSeek) | `/root/lvllm/repos/vllm-xiaotu-moe` | 见 `git worktree list` | 主开发树 |
-| musa | 同上或独立 worktree | `feature/musa-correctness` | 仅本地开发,不部署到 A100 |
+| musa（已合并） | 同上 | `archive/musa-merged-20261026` | 已并入 `dev/mainline`，仅归档 |
 | 主线基准 | `/root/lvllm/repos/vllm-mainline` | `dev/mainline` | 独立 worktree |
 
 **远端 A100 执行器只放主线、一个 env**（路径 / 环境 / 怎么推，一律以 `dev-docs/ENV_TWO_MACHINES.md` 为准）。

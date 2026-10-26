@@ -12,7 +12,7 @@
 - [正确性对拍协议](MUSA_CORRECTNESS_PROTOCOL.md)
 - [preflight 脚本](../../scripts/musa_preflight.sh)
 
-分支：`feature/musa-correctness`（验证通过后再合并到 `main`）。
+分支：`feature/musa-correctness`（**2026-10-26 已合并入 `dev/mainline`**；原分支归档为 `archive/musa-merged-20261026`）。
 
 版本：**vllm-musa `v0.32.0-dev` + 官方 Qwen3.8-Flash-Next FP8**；qwen4_exp 在 vLLM 0.32 才有。
 

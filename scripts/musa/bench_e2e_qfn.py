@@ -12,6 +12,8 @@
   XIAOTU_MOE_GPU_RESIDENT_LAYERS="15,9,11,16,31,3,39,25,7,23,24,13" \
   bash run_bench_cached.v17.sh
 """
+import hashlib
+import json
 import os
 import time
 
@@ -134,6 +136,12 @@ def main():
     # ⭐ 2026-10-26【质量探针】`QFN_PROBE=1` 时先做一道**看得见文本**的贪心问答。
     #   为什么必须有：NVFP4 接线的失败模式是"能跑但数全错"（例如组尺度被数值转换毁掉），
     #   只看 tok/s 分不出对错 ✗。默认关闭 ⇒ 现有 FP8 口径零影响 ✓
+    # ⭐ `QFN_DUMP=<path>`：落 **贪心 token id**，供"合并前后逐 token 对齐"用。
+    #   只记录、不改生成参数 ⇒ 未设置时零影响 ✓
+    _dump_path = os.environ.get("QFN_DUMP", "").strip()
+    _dump = {"model": model, "prompt_tokens": real, "out_tokens": out_tok,
+             "concs": concs, "resident": resident, "probes": [], "decode": []}
+
     if os.environ.get("QFN_PROBE", "0").strip() == "1":
         _qs = ["What is 2 + 2? Answer with a single number.",
                "Repeat exactly this sentence: the quick brown fox jumps over the lazy dog."]
@@ -141,6 +149,8 @@ def main():
             _o = llm.generate([_q], SamplingParams(temperature=0.0, max_tokens=48))
             _txt = _o[0].outputs[0].text.replace("\n", "\\n")
             print(f"[probe] Q={_q!r} -> {_txt!r}", flush=True)
+            _dump["probes"].append({"q": _q, "text": _o[0].outputs[0].text,
+                                    "token_ids": list(_o[0].outputs[0].token_ids)})
 
     rows = []
     for C in concs:
@@ -164,8 +174,13 @@ def main():
             _cc0 = dict(_COPY_STATS) if os.environ.get("XIAOTU_COPY_COUNT", "0") == "1" else None
             _c0 = time.process_time()
             t0 = time.perf_counter()
-            llm.generate(prompts, spN)
+            _res = llm.generate(prompts, spN)
             tot = time.perf_counter() - t0
+            if _dump_path and not _dump["decode"]:
+                _dump["decode"] = [
+                    {"C": C, "idx": _i, "text": _r.outputs[0].text,
+                     "token_ids": list(_r.outputs[0].token_ids)}
+                    for _i, _r in enumerate(_res)]
             _cpu = time.process_time() - _c0
             _dec = max(tot - best_ttft, 1e-9)
             best_dec = min(best_dec, _dec)
@@ -188,6 +203,12 @@ def main():
         print("[e2e] C=%d TTFT=%7.0f ms  prefill=%7.1f tok/s  decode=%6.1f tok/s  步长=%6.2f ms"
               % rows[-1], flush=True)
 
+    if _dump_path:
+        _blob = json.dumps(_dump, ensure_ascii=False).encode()
+        with open(_dump_path, "wb") as _fh:
+            _fh.write(_blob)
+        print(f"[e2e-dump] {_dump_path} sha256={hashlib.sha256(_blob).hexdigest()}",
+              flush=True)
     print("[e2e] ---- 汇总（口径：15K prompt / TP2 / MTP off / 常驻 %s 层 / GPU prefill on）----"
           % (len(resident.split(",")) if resident else 0), flush=True)
     print("[e2e] %3s %10s %12s %11s %10s" % ("C", "TTFT(ms)", "prefill(tok/s)", "decode(tok/s)", "步长(ms)"),

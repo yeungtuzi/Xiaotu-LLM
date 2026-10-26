@@ -2,6 +2,8 @@
 from __future__ import annotations
 import importlib.util
 import os
+import sys
+import types
 import unittest
 from pathlib import Path
 from unittest.mock import patch
@@ -58,6 +60,59 @@ class TestMusaCorrectness(unittest.TestCase):
         with patch.dict(os.environ, {"XTU_MUSA_CORRECTNESS": "1",
                                       "GPU_DEVICE": "CUDA"}, clear=True):
             self.assertTrue(mod.musa_path_active())
+
+    @staticmethod
+    def _fake_platform(is_musa: bool):
+        """Inject a stand-in ``vllm.platforms`` without importing vLLM."""
+        vllm = types.ModuleType("vllm")
+        platforms = types.ModuleType("vllm.platforms")
+
+        class _CP:
+            @staticmethod
+            def is_musa():
+                return is_musa
+
+        platforms.current_platform = _CP()
+        vllm.platforms = platforms
+        return patch.dict(sys.modules, {"vllm": vllm, "vllm.platforms": platforms})
+
+    def test_unset_is_cuda_even_on_musa_host(self):
+        """GPU_DEVICE unset must take the CUDA path regardless of hardware."""
+        mod = load()
+        with self._fake_platform(True), patch.dict(os.environ, {}, clear=True):
+            self.assertEqual(mod.requested_device(), "CUDA")
+            self.assertFalse(mod.musa_path_active())
+        mod = load()
+        with self._fake_platform(True), patch.dict(
+                os.environ, {"GPU_DEVICE": "CUDA"}, clear=True):
+            self.assertFalse(mod.musa_path_active())
+
+    def test_unknown_value_falls_back_to_autodetect(self):
+        mod = load()
+        with self._fake_platform(True), patch.dict(
+                os.environ, {"GPU_DEVICE": "FOO"}, clear=True):
+            self.assertTrue(mod.musa_path_active())
+        with self._fake_platform(False), patch.dict(
+                os.environ, {"GPU_DEVICE": "FOO"}, clear=True):
+            self.assertFalse(mod.musa_path_active())
+
+    def test_unknown_value_warns_once(self):
+        mod = load()
+        import contextlib
+        import io
+        buf = io.StringIO()
+        with self._fake_platform(True), patch.dict(
+                os.environ, {"GPU_DEVICE": "MUSA_"}, clear=True):
+            with contextlib.redirect_stderr(buf):
+                self.assertTrue(mod.musa_path_active())
+                self.assertTrue(mod.musa_path_active())
+        self.assertEqual(buf.getvalue().count("不是已知取值"), 1)
+
+    def test_alias_values_are_musa(self):
+        mod = load()
+        for value in ("MUSA", "musa", "MTGPU", "mtgpu", "S4000", "s4000"):
+            with patch.dict(os.environ, {"GPU_DEVICE": value}, clear=True):
+                self.assertTrue(mod.musa_path_active(), value)
 
     def test_explicit_experts_device_wins(self):
         mod = load()

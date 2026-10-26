@@ -400,7 +400,7 @@ XTU_ENV_FILE="${XIAOTU_ENV_FILE:-/tmp/xiaotu_env}"
   echo "XIAOTU_GPF_STAGE_TILE_E=$STAGE_TILE_E"
   # 【2026-10-27】MBT 给插件：profile 期 inter 定长缓冲 = MBT*K 行（预算记账用）
   echo "XIAOTU_MOE_MBT=$MBT"
-  # 【2026-10-27】热专家每层上限：池在 KV profiling 前分配 ⇒ 每砍 1 槽 ≈ +8.9 MiB KV
+  # 【2026-10-27】热专家每层上限：池在 KV profiling 前分配 ⇒ 每砍 1 槽 ≈ +9.1 MiB KV
   echo "XIAOTU_PIN_MAX_PER_LAYER=${PIN_MAX_PER_LAYER:-0}"
   # ⭐【2026-10-26】PyTorch 分配器：**expandable_segments**。三次崩溃的共同形态是
   #   "free 只剩 ~1.1 GiB，任何一次临时分配就死"(Xid / 512 MiB OOM / new_empty 失败)，

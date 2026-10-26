@@ -26,19 +26,35 @@ _ENV_MAXSWAP = "XIAOTU_PIN_MAXSWAP"   # 单次换入上限;<=0 ⇒ 取 max(1, ns
 _ENV_CAP = "XIAOTU_PIN_MAX_PER_LAYER"  # 每层常驻槽数上限;0/缺省 = 不限(旧行为)
 
 
-def _pin_cap_per_layer() -> int:
-    """读每层上限；非数字/负数/空 ⇒ 0（不限），并**打印一次**实际生效值。
+_CAP_WARNED = [False]
 
-    ⚠️ 审计 m1：静默把非法值当 0 会让人以为"设了没生效" ⇒ 这里出声。
+
+def _pin_cap_per_layer() -> int:
+    """读每层上限（`XIAOTU_PIN_MAX_PER_LAYER`；缺省/空/0 ⇒ 0 = 不限 = 旧行为）。
+
+    边界语义（审计 m2 逐条钉死）：
+      * 非数字、负数 ⇒ **0**，并**打印一次**告警（不刷屏，但一定出声）；
+      * `"09"` / `"+9"` ⇒ 9（`int()` 本来就接受），**不误报非法**；
+      * 合法非零值 ⇒ 打印一次"生效值"，便于现场核对（不会被静默忽略）。
     """
     raw = os.environ.get(_ENV_CAP, "")
+    txt = str(raw).strip()
+    ok = True
+    if txt == "":
+        return 0
     try:
-        v = int(str(raw).strip() or 0)
+        v = int(txt)
     except (TypeError, ValueError):
-        v = 0
-    if raw not in ("", None) and str(raw).strip() not in ("0", str(v)):
-        print(f"[xtu-pin] ⚠️ {_ENV_CAP}={raw!r} 非法 ⇒ 按 0(不限)处理", flush=True)
-    return max(0, int(v))
+        v, ok = 0, False
+    if ok and v < 0:
+        v, ok = 0, False
+    if not _CAP_WARNED[0]:
+        _CAP_WARNED[0] = True
+        if not ok:
+            print(f"[xtu-pin] ⚠️ {_ENV_CAP}={raw!r} 非法(需非负整数) ⇒ 按 0(不限)处理", flush=True)
+        elif v > 0:
+            print(f"[xtu-pin] {_ENV_CAP}={v} 生效（每层最多 {v} 个本地热专家槽）", flush=True)
+    return int(v)
 
 
 def plan_swap(resident, counts, nslots: int, *, hyst: float = 0.25,
@@ -126,8 +142,7 @@ class LayerPool:
     def __init__(self, engine, device: torch.device, hidden: int, inter: int,
                  group_k: int, n_local: int, pinned_local: list[int], layer_idx: int,
                  layout: str = "mxfp4", topk: int = 0,
-                 scale_dtype: str = "e8m0", tensor_scale: bool = False,
-                 cap_hot: bool = False):
+                 scale_dtype: str = "e8m0", tensor_scale: bool = False):
         """⭐ 2026-10-15:`layout` 让同一个池同时服务两条后端的**不同槽布局**
         (`mxfp4` = `gpu_prefill`;`fp8` = `gpu_prefill_fp8`)✓
 
@@ -153,16 +168,14 @@ class LayerPool:
         self.layout = str(layout)
         self.pinned = list(pinned_local)
         # ⭐⭐【2026-10-27 · 显存定容用】每层常驻槽数**上限**（0 = 不限，保持旧行为）。
-        #   来由：池在 KV profiling 之前分配 ⇒ 每砍 1 槽约省 8.9 MiB（实测 3.98 GiB/448 槽），
+        #   来由：池在 KV profiling 之前分配 ⇒ 每砍 1 槽约省 **9.1 MiB**（实测 3.98 GiB/448 槽），
         #   直接变成 KV 池。用户裁定「砍热专家到满足 2×512K」。
-        #   ⚠️ 截断**保留表序前 N**（XTUP 底表由离线真实流统计产出，按热度降序写入）。
-        #      该假设可被实测检验：`[xtu-pin][hit]` 的命中率若明显下降 ⇒ 说明被砍掉的是热的。
-        # ⚠️【审计 M4】截断**只允许**发生在"热专家池"上（`cap_hot=True`，由
-        #   `build_layer_pool` 在 sorted() **之前**按表序做完，这里不再二次截断）。
-        #   ⛔ "全专家 GPU 常驻"池(`_ensure_resident_fp8` 传 `list(range(E))`)**绝不能**截：
-        #      它把全专家号直接当槽序传给内核(无 slotmap 重映射) ⇒ 截短会让 id≥E 的
-        #      路由被丢进垃圾桶桶、静默算错（审计 M4 指出的地雷）。
-        self.pin_cap_hot = bool(cap_hot)
+        #   ⚠️ 上限（`XIAOTU_PIN_MAX_PER_LAYER`）**不在这里施加** —— 见 `build_layer_pool`
+        #      与本节下面的 M4 注释。
+        # 【审计 M4】本构造函数**不做任何截断**：上限只在 `build_layer_pool`（热专家池）
+        #   里施加。⛔ "全专家 GPU 常驻"池(`_ensure_resident_fp8` 传 `list(range(E))`)
+        #   绝不能截 —— 它把全专家号直接当槽序传给内核(无 slotmap 重映射)，截短会让
+        #   id≥E 的路由被丢进垃圾桶桶、**静默算错**。
         self.nslots = len(self.pinned)
         # ---- 【运行中自适应】状态(默认不激活;是否启用由 XIAOTU_PIN_WINDOW 决定)----
         self.expert_of: list[int] = [-1] * self.nslots   # 槽 → 专家(swap_out 必需的反向表)
@@ -424,6 +437,34 @@ class LayerPool:
         return n
 
 
+def select_local_topk(g_list, em_global_to_local, e_local: int, cap: int) -> list:
+    """按**表序(热度降序)**选出至多 `cap` 个**本 rank 本地专家号**（纯逻辑、可单测）。
+
+    ⛔ 两个已踩过的坑（审计 M3/M5）：
+      1. 不能先 `sorted()` 再截断 —— 排序会打乱热度序，砍掉的是"id 最大的 N 个"；
+      2. 不能在 `g_list`（**全局**条目）上截断 —— EP/TP>1 时前 cap 条里有一半属于
+         另一个 rank，映射成 -1 被过滤 ⇒ 每 rank 本地槽只剩 cap/2（过砍 2×），
+         且"top-cap 全属另一 rank"时该层池会整个消失。
+    `cap <= 0` ⇒ 不限（返回全部本地专家，去重后保持表序）。
+    """
+    e_local = int(e_local)
+    cap = int(cap)
+    if em_global_to_local is None:      # 无 EP(TP=1):全局号 == 本地号
+        seq = (int(g) for g in g_list)
+    else:
+        emt = em_global_to_local.to(torch.long)
+        n = int(emt.numel())
+        seq = (int(emt[g]) for g in g_list if 0 <= int(g) < n)
+    sel, seen = [], set()
+    for loc in seq:
+        if 0 <= loc < e_local and loc not in seen:
+            seen.add(loc)
+            sel.append(loc)
+            if cap > 0 and len(sel) >= cap:
+                break
+    return sel
+
+
 def build_layer_pool(engine, device, hidden: int, inter: int, group_k: int,
                      e_local: int, layer_idx: int, em_global_to_local, topk: int = 0,
                      layout: str = "mxfp4", table_path: str = None,
@@ -460,26 +501,23 @@ def build_layer_pool(engine, device, hidden: int, inter: int, group_k: int,
     g_list = table.get(layer_idx, [])
     if not g_list:
         return None
-    # ⭐⭐【2026-10-27 · 审计 M3 修正】每层上限必须在 **sorted() 之前**按**表序**截断：
-    #   `g_list` 是 XTUP 的表序（离线真实流统计、按热度降序写入），而下面的
-    #   `sorted()` 会把它改成"本地专家号升序" ⇒ 若截断发生在 LayerPool 里，
-    #   砍掉的就是 **id 最大的** N 个，不是最冷的 N 个 ✗（那是语义回归，审计独立查出）。
+    # ⭐⭐【2026-10-27 · 审计 M3+M5 定稿】上限的**单位必须是"本 rank 的本地槽"**，
+    #   且**按表序（热度降序）**选，最后才 `sorted()` 定槽序：
+    #   ⛔ M3 教训：`sorted()` 会把表序打乱 ⇒ 若在排序后截断，砍掉的是"id 最大的 N 个"✗
+    #   ⛔ M5 教训：若在 `g_list`（**全局**条目）上截断，EP/TP>1 时前 cap 条里常有一半
+    #      属于另一个 rank，映射成 -1 后被过滤 ⇒ 每 rank 本地槽 ≈ cap/2，过砍约 2×，
+    #      而且"top-cap 全属另一 rank"时该层池会整个消失（`return None` 悬崖）✗
     cap = _pin_cap_per_layer()
-    if cap > 0 and len(g_list) > cap:
-        _kept = list(g_list)[:cap]
-        print(f"[xtu-pin] 层{layer_idx} 限流 {len(g_list)} → {cap} 条"
-              f"（按表序保留前 {cap}，即最热的 {cap} 个）", flush=True)
-        g_list = _kept
-    if em_global_to_local is None:  # 无 EP(TP=1):全局==本地
-        pinned_local = sorted({int(g) for g in g_list if 0 <= int(g) < int(e_local)})
-    else:
-        em = em_global_to_local.to(torch.long)
-        pinned_local = sorted({int(em[g]) for g in g_list if 0 <= int(em[g]) < int(e_local)})
-    if not pinned_local:
+    sel = select_local_topk(g_list, em_global_to_local, int(e_local), cap)
+    if not sel:
         return None
+    pinned_local = sorted(sel)          # 选择已按热度序;排序只决定"槽序"
+    if cap > 0 and len(sel) >= cap:
+        print(f"[xtu-pin] 层{layer_idx} 限流 → {len(sel)} 个本地槽"
+              f"(表内 {len(g_list)} 条;cap={cap} 按热度序保留)", flush=True)
     return LayerPool(engine, device, int(hidden), int(inter), int(group_k),
                      int(e_local), pinned_local, layer_idx, layout=str(layout),
-                     topk=int(topk), cap_hot=False)
+                     topk=int(topk))
 
 
 build_layer_pool._table = None  # 进程级缓存(懒),键 = 表路径

@@ -1,0 +1,50 @@
+--- /home/user/lvllm/process_data/ref/repos/vllm-mainline/vllm/model_executor/layers/fused_moe/routed_experts.py.bak_qfn	2026-10-23 00:44:12.067354226 +0000
++++ /home/user/lvllm/tmp/re_trace.py	2026-10-23 01:01:35.754316931 +0000
+@@ -1294,9 +1294,10 @@
+ 
+         """
+         assert not self.quant_method.is_monolithic
+-
+-        # Modular kernels use pre-computed routing
+-        return self.quant_method.apply(
++        import os as _os
++        if _os.environ.get("QFN_TRACE") == "1":
++            print(f"[qfn-trace] modular name={getattr(self, 'layer_name', None)}", flush=True)
++        _r = self.quant_method.apply(
+             layer=self,
+             x=x,
+             topk_weights=topk_weights,
+@@ -1304,6 +1305,22 @@
+             shared_experts=shared_experts,
+             shared_experts_input=shared_experts_input,
+         )
++        try:
++            _tgt = int(_os.environ.get("QFN_A_DUMP", "-1"))
++        except Exception:
++            _tgt = -1
++        import re as _re
++        _m = _re.search(r"layers?\.(\d+)", str(getattr(self, "layer_name", "") or ""))
++        if (not torch.cuda.is_current_stream_capturing()
++                and _tgt >= 0 and _m and int(_m.group(1)) == _tgt):
++            _d = "/home/user/lvllm/tmp/qfn_dump"
++            _os.makedirs(_d, exist_ok=True)
++            torch.save({"x": x.detach().cpu(), "ids": topk_ids.detach().cpu(),
++                        "wts": topk_weights.detach().cpu(),
++                        "out": _r.detach().cpu() if isinstance(_r, torch.Tensor) else _r},
++                       f"{_d}/mod_io.pt")
++            print("[qfn-trace] io dumped", flush=True)
++        return _r
+ 
+     def forward_monolithic(
+         self,
+@@ -1328,7 +1345,9 @@
+ 
+         """
+         assert self.quant_method.is_monolithic
+-
++        import os as _os
++        if _os.environ.get("QFN_TRACE") == "1":
++            print(f"[qfn-trace] monolithic name={getattr(self, 'layer_name', None)}", flush=True)
+         # Monolithic kernels handle routing internally
+         return self.quant_method.apply_monolithic(
+             layer=self,

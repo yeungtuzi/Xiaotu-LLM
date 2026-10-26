@@ -321,7 +321,7 @@ Rank 0/1: RuntimeError: MCCL error in: .../MCCLUtils.cpp:73,
 
 ```
 MCCL INFO ENV/Plugin: Could not find: libmccl-env.so
-MCCL INFO Bootstrap: Using enp33s0f0np0:192.168.100.248
+MCCL INFO Bootstrap: Using enp33s0f0np0:<musa-host>
 MCCL INFO musaDriverVersion 50200
 MCCL WARN misc/musawrap.cc:126  Musa failure 101 'invalid device ordinal'
 ```
@@ -402,7 +402,7 @@ $ all_reduce_perf（单卡 8MB）→ 146 GB/s ✓
 
 ## 13. 【严重 · 阻塞特性】MUSA 构建下**引擎完全没有 H2D DMA 通道**（GPU 流式预填无法工作）
 
-> 记录时间：2026-10-24 08:55 · 复现机：192.168.100.248（2× MTT S4000 / mp_22）·
+> 记录时间：2026-10-24 08:55 · 复现机：<musa-host>（2× MTT S4000 / mp_22）·
 > 组件：本仓 `xiaotu_moe`（CPU 专家引擎）+ `vllm_xiaotu_moe`（vLLM 侧插件）
 
 ### 13.1 现象
@@ -486,7 +486,7 @@ bash scripts/build_engine_variants.sh
 
 ## 14. 【严重】一次 H2D DMA 失败导致 **GPU 固件 panic（CSW_TIMEOUT）**，而且显存**不回收**（`-r 0` 无效，只有 `-r 2` 能救）
 
-> 记录时间：2026-10-24 09:35 · 机器：192.168.100.248 · 2× MTT S4000（mp_22）·
+> 记录时间：2026-10-24 09:35 · 机器：<musa-host> · 2× MTT S4000（mp_22）·
 > 驱动/MUSA Toolkit 5.2.0 · 复现路径：`musaMemcpy2DAsync`（我们自己移植的 H2D 通道）
 
 ### 14.1 时间线（dmesg 实录）
@@ -552,7 +552,7 @@ dev1: free=45.8GiB used=2.1GiB
 
 ## 15. 【严重 · 已确认历史多次发生】GPU 固件 panic 的两类形态，且**厂商仓库无更新可用**
 
-> 记录时间：2026-10-24 09:55 · 机器：192.168.100.248 · S4000 ×2 · MUSA 5.2.0
+> 记录时间：2026-10-24 09:55 · 机器：<musa-host> · S4000 ×2 · MUSA 5.2.0
 
 ### 15.1 journald 全量统计（不是偶发）
 
@@ -703,7 +703,7 @@ mthreads-dkms | 5.1.0 | 同上
 
 ## 18. 【严重 · 性能致命】MUSA 的 Triton **`tl.dot` 不走张量核**（比 muDNN 慢 143 倍）
 
-> 记录时间：2026-10-24 12:56 · 机器 192.168.100.248 · S4000 ×2 · MUSA 5.2.0
+> 记录时间：2026-10-24 12:56 · 机器 <musa-host> · S4000 ×2 · MUSA 5.2.0
 
 ### 18.1 实测（同形状、同 bf16、同卡）
 
@@ -1097,3 +1097,347 @@ decoding 步长随并发单调变长：C=1 568.69 ms / C=2 658.66 ms / C=4 1398.
    还是小批量多次传输的固定开销？有推荐的批量/异步写法吗？
 2. ⚠️ 附注：均值口径只有 2.9 GB/s（`dma` 中位 105.7 ms 但均值 258 ms、p90 736 ms）⇒
    **分布重尾**，预填块（大块）明显更慢 ⇒ 这更值得查
+
+### 23.8 🔴 NVFP4 加载探针结果：**在引擎初始化阶段崩溃（与 NVFP4 无关）**
+
+**判据输出（我加的诊断起了作用）**
+```
+[nvfp4-load] VRAM LLM 之前:    #0 used=34MiB  | #1 used=0MiB
+[nvfp4-load] VRAM LLM 失败之后: #0 used=34MiB  | #1 used=0MiB     ← ⭐ 一个字节都没上卡
+[nvfp4-load] ❌ 构造 LLM 失败
+```
+
+**根因（栈底）**
+```
+RuntimeError: MUSA error: an illegal memory access was encountered
+  File vllm/v1/worker/gpu/buffer_utils.py  StagedWriteTensor.__init__
+      self.gpu = torch.zeros(size, dtype=dtype, device=device)      ← 崩在这一行
+  File vllm/v1/worker/gpu/states.py:55     RequestState.total_len
+  ... gpu_worker.py:625  GPUModelRunnerV2(...)                      ← 引擎初始化
+```
+⚠️ MUSA 自己提示："kernel errors might be asynchronously reported at some other API call"
+⇒ **`torch.zeros` 那一行很可能只是"被异步上报"的落点，真凶在更早的某个 kernel** ✗
+
+⭐ **进一步坐实（查了源码）**：`StagedWriteTensor(self.max_num_reqs, dtype=torch.int32, device=device)`
+⇒ 分配的只是 **`max_num_reqs` 个 int32**（几百个元素、**几 KB**）✗
+⇒ **一个几 KB 的 `torch.zeros` 报"非法访存"，只可能是上下文已被破坏** ✓
+⇒ ⛔ 因此可以**彻底排除**："分配太大"、"OOM"、"PLE 48 GB 上卡" 这三类解释 ✓
+
+📌 **顺带解释一处旧噪声**：日志里反复出现的 `frame #0: c10::Error` dump 并非本次故障，
+而是导入期 **`_C::top_k_per_row_decode` 重复注册**（`Tried to register an operator … already exists`）
+⇒ 我在部署检查时把它判为"良性"是对的，但当时不知道原因；现在有了 ✓
+
+**这条结果能/不能说明什么（必须分清）**
+| 结论 | 成立？ |
+|---|---|
+| "vLLM 在 MUSA 上**无法加载 NVFP4**" | ⛔ **不能这么说** —— 崩溃点在 NVFP4 之前，**根本没走到权重加载** |
+| "PLE 48 GB 上卡导致 OOM" | ⛔ 也不是 —— VRAM 全程 34 MiB，无 OOM |
+| "MUSA 的 **V1 `GPUModelRunnerV2` 初始化**在此配置下非法访存" | ✅ **这是实际观察到的** |
+| "我们的 FP8 路径**没有**这个问题" | ✅ 同期 `e2e8`/`e2e15` 均正常起引擎（但走的是我们插件的路径）|
+
+**下一步（已排）**
+1. `MUSA_LAUNCH_BLOCKING=1` 复跑 ⇒ 让真正的第一个出错 kernel **当场**报出来（不再异步漂移）
+2. 若仍指向 `StagedWriteTensor` ⇒ 查 `size` 的计算来源（是否依赖 `max_num_seqs`/spec 配置）
+3. 备选：把探针改为**开启我们的插件**（走已知能起引擎的路径），再单独验证 NVFP4 权重能否被读取
+   —— 但这会引入 FP8 几何假设的混淆，需谨慎 ✓
+
+📌 **诚实边界**：本探针**没有回答**"NVFP4 在 MUSA 能否跑"，只回答了
+**"plain-vLLM V1 路径在当前 MUSA 栈上连引擎都起不来"** ✓
+
+### 23.9 ⛔ **已撤回**：~~"决定性差异：`GPUModelRunnerV2` 在 MUSA 上崩，V1 正常"~~
+
+> ⛔ **撤回（2026-10-26 05:08 实测）**：我用 `VLLM_USE_V2_MODEL_RUNNER=0` 强制 V1 重跑，
+> **V1 也崩了**，只是**崩在不同位置**：
+> | runner | 失败点 |
+> |---|---|
+> | V2 | `states.py:55` `StagedWriteTensor` → `torch.zeros(max_num_reqs, int32)` |
+> | **V1** | `builtin.py:185` → **`torch.tensor(...)`**（`neg_inf_tensor`）|
+>
+> ⇒ ⭐ **共同点是"init_device 之后第一次在设备上分配张量"** ⇒
+> **不是 V2 特有**，我先前"V1 正常"的比较**是错的**（我把"我们的 FP8 臂能跑"误当成"V1 能跑"，
+> 而两者的差异不止 runner —— 我们的臂还**启用了我们的插件**）✗
+>
+> 📌 **教训**：两个运行有**多处**配置差异时，不能只挑一个差异就下结论；
+> 我挑的是 runner，而真正的差异可能是**插件是否启用** ✓（与 §4.1.5 同类错误）
+
+### 23.10 ⭐⭐⭐ **决定性结论：崩溃与模型无关 —— plain `LLM()` 路径在 MUSA 上起不来**
+
+**对照实验（只改模型一个变量）**
+| 模型 | 体积 | 结果 | 崩溃点 |
+|---|---|---|---|
+| **NVFP4** | 121 GB | ⛔ `MUSA error: illegal memory access` | `buffer_utils.py:175 torch.zeros` |
+| **FP8（我们 bench 里已跑完全程的同一模型）** | 173 GB | ⛔ **同一行、同一错误** | 同上 |
+
+⇒ ⭐ **所以这既不是 NVFP4 的问题，也不是模型配置的问题**，
+而是 **vLLM 离线 `LLM()` API 在这套 MUSA 栈上的初始设备分配失败** ✓
+
+**已被实验排除的（6 组）**
+| 变量 | 试过 | 结论 |
+|---|---|---|
+| NVFP4 权重/量化格式 | 用 FP8 对照 | ⛔ **无关** |
+| PLE 48 GB / OOM | VRAM 全程 34–150 MiB | ⛔ 无关 |
+| `GPUModelRunnerV2` | `VLLM_USE_V2_MODEL_RUNNER=0` | ⛔ V1 也崩 |
+| 我们的插件 | `NVFP4_ALLOW_PLUGIN=1` | ⛔ 无关 |
+| `MCCL_P2P_DISABLE=1` | 加上 | ⛔ 无关 |
+| `MUSA_LAUNCH_BLOCKING=1` | 加上 | ⛔ 报错位置不变 |
+
+**给我们自己的结论**
+* ✅ 我们的 bench 路径（`scripts/run_bench_cached.v18.sh` → `bench_e2e_qfn.py`）**可以正常跑** ⇒
+  **生产/基准不受此影响** ✓
+* ⛔ 但**不能用 `LLM()` 离线 API 做探针/小脚本验证** —— 这条路在当前栈上不通 ✓
+* 📌 因此"NVFP4 能否在 MUSA 加载"**仍未回答**（一次都没走到权重加载），
+  而**要回答它，得改用我们自己的 bench 路径**加载 NVFP4 模型 ✓
+
+**给厂商的问题**
+1. 为什么 MUSA 上 `LLM()` 离线 API 在 `init_device` 之后**第一个设备张量分配**
+   （`torch.zeros` 几 KB）就报 illegal memory access，且 `LAUNCH_BLOCKING=1` 不改变位置？
+2. 是否已知 `torchada` 的 patch 层（`_patch.py:1135 wrapped_fn`）与 vLLM V1 worker 初始化有冲突？
+
+### 23.9-orig（原稿存档，勿引用）：曾认为 V2 runner 是决定性差异
+
+| 运行 | runner | 结果 |
+|---|---|---|
+| 我们的 FP8 臂（`e2e15` 等，**能正常跑完基准**）| **`GPUModelRunner`（V1）** | ✅ 引擎正常起 |
+| NVFP4 探针（默认配置）| **`GPUModelRunnerV2`** | ⛔ 崩在 `StagedWriteTensor` 的 `torch.zeros` |
+
+**机制（读源码得出）**
+* `RequestState.__init__`（`vllm/v1/worker/gpu/states.py:52-57`）先建两个
+  **`UvaBackedTensor`**（`prompt_len` / `prefill_len`），再建 `StagedWriteTensor`（`total_len`）
+* `UvaBackedTensor` → `UvaBufferPool(...)` + `copy_to_uva(...)` ⇒ **依赖 UVA 映射**
+* 随后那个 `torch.zeros(max_num_reqs, int32)` 只占**几 KB**，却报
+  `MUSA error: an illegal memory access` ⇒ **上下文已被先前的操作破坏**（MUSA 也提示"可能异步上报"）
+* `MUSA_LAUNCH_BLOCKING=1` **不改变**栈位置 ⇒ 该错误不是普通异步漂移
+
+**⇒ 给厂商的问题（比"NVFP4 支不支持"更基础）**
+1. MUSA 是否完整支持 vLLM V1 的 **UVA-backed 缓冲**（`UvaBufferPool` / `copy_to_uva`）？
+2. `GPUModelRunnerV2` 在 MUSA 上是否**被支持**？若不是，请明确"vLLM 需以 V1 runner 运行"的前提。
+3. 为什么 `MUSA_LAUNCH_BLOCKING=1` 仍把错误报在 `torch.zeros`（几 KB）上，而不是真正的出错 kernel？
+
+**开关（我们已找到并用它规避）**
+```
+VLLM_USE_V2_MODEL_RUNNER=0     # vllm/config/vllm.py:725 → envs.VLLM_USE_V2_MODEL_RUNNER
+```
+⚠️ 这只是**规避**，不是修复：V2 路径在 MUSA 上仍不可用 ✓
+
+### 23.11 NVFP4 在 MUSA 上的**真实能力边界**（逐条带出处，可复算）
+
+**① vLLM 官方 NVFP4 MoE 后端：全部拒绝 MUSA（预期内，非缺陷）**
+用 `XIAOTU_NVFP4_MOE_FALLBACK=1` 前，我们把 `_return_or_raise` 的**拒绝理由**打了出来
+（原文用 `logger.debug_once` 打，默认看不到 ⇒ 已改为 warning）。结果：
+```
+FLASHINFER_TRTLLM / CUTEDSL / CUTEDSL_BATCHED / CUTLASS / MARLIN / HUMMING / VLLM_CUTLASS
+    ⇒ "kernel does not support current device musa"
+EMULATION
+    ⇒ "kernel does not support quantization scheme
+        QuantKey(u8, scale(f8e4m3fn,static,group(row=1,col=16)), scale2(f32,static,per_tensor), symmetric) x None"
+```
+⭐ **关键解读**：前 7 个是**平台门槛**（合理，CUDA 专用内核）；
+但 **EMULATION 是 Triton 实现**，设备门槛我们已允许 MUSA
+（`triton_moe.py:118-124` 有 `or current_platform.is_musa()`），它拒绝的真实原因是
+**量化方案不匹配**：本模型是 **W4A16**（激活不量化 ⇒ `activation_key=None`），
+而 EMULATION 只接受 `(kNvfp4Static, kNvfp4Dynamic)`（动态激活量化）✗
+
+⇒ **结论**：vLLM 在这套栈上**没有能跑 NVFP4-W4A16 的 MoE 后端**。
+这不是 MUSA 的缺陷，是**上游后端覆盖面的问题** ✓
+⇒ 我们的做法：**不用** vLLM 的 NVFP4 MoE 后端，改用 xiaotu 引擎（W4A16 内核本来就是我们自己的领域）✓
+
+**② 官方离线 `LLM()` API 在 MUSA 上不可用（与 NVFP4 无关）**
+崩在 `init_device` 之后**第一个设备张量分配**（`buffer_utils.py:175 torch.zeros`，几 KB）；
+**FP8 对照模型同样崩** ⇒ 不是 NVFP4 引起 ✓（详见 §23.10）
+⚠️ 对我们**不影响**：基准/服务走 `scripts/run_bench_cached.v18.sh` 这条路，正常 ✓
+
+**③ 我们引擎的 NVFP4 接口是现成的**
+* 扩展导出 `MOE_NVFP4` / `MOE_NVFP4_FP16`（`/root/lvllm/xiaotu_moe/__init__.py:35-36`）
+* 构造签名 `MOE(cfg, w13, w2, w13_g, w2_g, w13_global, w2_global)`，后两个 `const float*`（全局尺度）
+  出处 `csrc/python_binding/binding.cpp:584`
+* 内核取全局尺度：`const float gs = w13_gs ? w13_gs[eid] : 1.0f;`
+  出处 `csrc/moe/moe_v2_packed4.hpp:671` ⇒ **每专家一个**尺度
+* ⚠️ 因此 gate/up 两个 `weight_scale_2`（实测抽样 400 组有 395 组不同）**无法同时精确表达**
+  ⇒ 当前用"折进组尺度"近似；精确解需内核按 half 取 `gs[2*eid+half]`
+
+## 24. 【严重 · 正确性+可捕获性】fp8→float 的**设备侧转换**在 mp_22 上回退到主机；并因此让 **CUDA 图捕获必然失败**（2026-10-26，A78-17）
+
+### 现象
+两层，第二层是致命的：
+
+1. **数值层**（与 §1 同源）：`t.to(torch.float32)`（t 为 `float8_e4m3fn` 设备张量）
+   在某些尺寸/对齐下**静默返回错误数据**（厂商注释记的实际观测值：1.49e32，而 e4m3 上限 448）。
+2. **执行层**：该转换在内部**走主机回退** ⇒ 在 **CUDA 图捕获**期间直接抛
+   `RuntimeError: MUSA error: operation not permitted when stream is capturing`。
+   表现极具误导性：栈最后一行往往只是**兜底路径**里的 `embeddings.cpu()`，
+   真凶是它上面那条"设备转换"抛的异常 ✗
+
+### 最小复现（Wenshan 侧可这样看）
+```python
+x = torch.randn(1, 2560, device="musa").to(torch.float8_e4m3fn)
+g = torch.cuda.CUDAGraph()
+with torch.cuda.graph(g):                      # 捕获期
+    y = x.to(torch.float32)                    # ⇒ operation not permitted when stream is capturing
+```
+
+### 影响
+* **任何**在 forward 里对 fp8 张量做 `cast / view+算术` 的模型，都无法进入 CUDA 图
+  ⇒ 只能 eager ⇒ 每步上千次 Python 发射（实测：同权重同内核，prefill 51 ms/token，
+  decode **578 ms**/token）
+* PLE（每层嵌入）路径正是这种写法，于是整模型无法上 graph
+
+### 我们的规避（`vllm_xiaotu_moe/compat_patches.py` 补丁 7，v4）
+**完全绕开 fp8 dtype：字节 + 256 项 LUT**
+```python
+idx = x.view(torch.uint8).to(torch.int64)          # 把 fp8 当字节，不触发 fp8 运算
+out = LUT_256.index_select(0, idx.reshape(-1)).reshape(x.shape)   # LUT 用纯 float 生成（精确）
+out = out.mul(scale_on_device)                     # 尺度只在**第一次**搬到设备并缓存
+```
+* LUT 按 e4m3 位模式手算：次正规 `man * 2^-9`；`exp=15, man=7` ⇒ NaN；其余 `(1+man/8)*2^(exp-7)`
+* 全程设备算子（`view` / 索引 / `mul`）⇒ **可捕获** ✓
+* 尺度必须缓存：若每次 `.to(device)` 就是一次 H2D，捕获期同样非法，而且每步都有流量 ✗
+
+### 建议（给厂商）
+1. `float8_e4m3fn → float32/bf16` 的设备转换请保证：**不落主机**、**捕获期合法**、**数值正确**
+2. 若暂时无法修，请在 `torch_musa` 里让该转换在捕获期**显式报错并指明算子名**
+   （现在只给 `operation not permitted when stream is capturing`，定位成本极高）
+
+---
+
+## 25. 【严重】MUSA Triton 的几处**能力缺口**（2026-10-26 实测，写 NVFP4 内核时逐个撞上）
+
+| # | 缺口 | 报错原文 | 我们的规避 |
+|---|---|---|---|
+| 25-1 | `tl.trans` 只接受 2-D | `permute dims must have the same length as input shape` | 用 `tl.permute(x, (0, 2, 1))`（A78-9）。注意：原写法在 3-D 上**语义也是错的**，不只是报错 |
+| 25-2 | `atomic_add` **不支持 bf16** | `atomic_add does not support bf16` | 输出改 `float32` 累加，kernel 外再 `to(bf16)`（A78-10） |
+| 25-3 | `fp8e4nv` **不能 cast 到 int32** | `cannot cast fp8e4nv[...] to int32` | 尺度张量**先按字节 view**（`uint8`）再进 kernel，并用显式 `scale_kind`（`e4m3`/`e8m0`）说明语义 —— 且**必须在 view 之前 sniff dtype**，否则拿到全 0（A78-11，实测 `inter≈1e-20, out=0`） |
+| 25-4 | `pin_memory()` 对 musa 张量直接失败 | `cannot pin 'musaByteType' only dense CPU tensors can be pinned` | 需要锁页时**只用主机张量**建缓冲，设备副本单独持有 |
+| 25-5 | `deep_ep_cpp...so` 在 MUSA 未初始化时**符号解析失败** | `undefined symbol: mcclAllToAllv` | 先让 MUSA 初始化（任一设备 API）**再** `import vllm`；不要把 `import vllm` 放在最前面 |
+| 25-6 | `torch.cuda.current_device()` 在平台未初始化时报错 | `module 'torch._C' has no attribute '_cuda_getDevice'` | 不要在 `import vllm` 之前调 `torch.cuda.*`；或直接用 `torch.device("cuda")` |
+| 25-7 | **设备 ISA 变体是能力差异**：CPU 无 avx512 时引擎只能选 `_avx2`，而该构建带 `XIAOTU_MOE_NO_CUDA` | 运行时 `'MOE_NVFP4' object has no attribute 'cpu_decode'` | 引擎侧补同步兜底（D2H→`cpu_prefill`→H2D + 每层 all-reduce）；代价 decode 1.4→1.7 tok/s 量级（A78-11b/12）。**根治要重编带 CUDA 的 avx2 变体** |
+
+**共同教训**：这些都不是"配置问题"，而是**能力缺口**——写内核/上线前必须先探测能力（能否 cast、能否原子加、能否捕获），
+探测结果落进本文件，别每次重新撞一遍 ✓
+
+## 26. `top_k_per_row_decode` 在 MUSA 上落到**纯 Python 逐行循环**（既慢又不可捕获）
+
+**位置**：`vllm_musa/topk_registration.py::_impl_decode`
+
+**原实现**（要点）：
+```python
+table = seq_lens.tolist()          # ⛔ 每层每步一次 D2H
+for r in range(numRows):           # ⛔ Python 循环
+    eff = int(table[b]) - n + j + 1
+    _, idx = torch.topk(logits[r, :eff].float(), k)   # ⛔ 每行一个 kernel
+    out[r, :k] = idx.to(out.dtype)
+```
+**后果**（我们实测到的两件事）：
+1. **图捕获必然失败**：`ids_cpu = ...tolist()` 是设备→主机同步 ⇒
+   `operation not permitted when stream is capturing`
+2. **每层每步都慢**：D2H + Python 循环 + 每行一个 topk kernel
+   ⇒ 这是 decode 步长里 **510 ms 固定开销**的重要来源之一
+
+**我们的等价替换**（全设备、可捕获、一次 topk）：
+```python
+rows = torch.arange(numRows, device=dev)
+eff  = seq_lens.to(torch.int64)[rows // n] - n + rows % n + 1     # 2-D 时直接 reshape 取
+eff  = eff.clamp(0, n_cols)
+valid  = torch.arange(n_cols, device=dev)[None, :] < eff[:, None]
+masked = logits.float().masked_fill(~valid, float("-inf"))
+_, idx = torch.topk(masked, k, dim=1)
+res = torch.where((slot < eff[:, None]) & (eff[:, None] > 0), idx, -1)
+out[:] = res.to(out.dtype)
+```
+语义与 `csrc/sampler.cu` 对齐：eff 之外置 -inf、超出 eff 的 k 位填 -1、eff=0 整行 -1。
+
+⚠️ **给厂商的建议**：这一层要么提供 device 端的 `top_k_per_row_prefill/decode` 实数实现，
+要么把兜底实现改成上面的向量化版本 —— 否则"MUSA 上跑 vLLM 的 QSA/稀疏注意力"会同时
+损失**速度**和**图捕获能力**。
+
+## 27. ⛔ Triton kernel 与 CUDA 图捕获**不能共存在同一捕获会话**（mtts4000 / mp_22）
+
+**最小复现（我们的实测路径）**
+```python
+g = torch.cuda.CUDAGraph()
+with torch.cuda.graph(g):
+    triton_kernel[(grid,)](...)      # ① 捕获区内 launch
+# ⇒ ② 整段**挂死**（进程 R 状态自旋、~380 线程、无报错）
+
+# 变体：breakable 断点（vLLM 的 eager break）里 launch
+capture.add_eager(lambda: triton_kernel[(grid,)](...))
+# ⇒ ③ 捕获收尾 cudaStreamEndCapture 返回 **invalid argument**
+
+# 变体：在**另一条非捕获流**上 launch，然后 wait_stream join 回来
+# ⇒ ④ 同样 invalid argument
+```
+**对照**：同一捕获会话里**完全不执行** Triton kernel ⇒ 图捕获 100% 成功、两 rank 均正常回放。
+
+**影响**：任何"MoE/稀疏算子用 Triton 实现 + 想用 CUDA 图加速 decode"的 vLLM 场景，
+在 MUSA 上要么放弃图（每步固定开销 ~510 ms 消不掉），要么放弃 Triton。
+
+**建议**：让 `cuStreamEndCapture` 在"会话期间曾执行过 Triton kernel"时**给出明确错误**
+（现在是一侧 rank 的 `invalid argument`，极难定位），或在 Triton 的 launcher 里
+检测捕获状态并显式报错；根治则是让 Triton kernel 能在捕获会话内正常入队。
+
+## 28. 图捕获收尾 `invalid argument` 与**内核几何**相关（同一内核、只改 tile）
+
+**现象**（mtts4000 / mp_22，vLLM PIECEWISE 捕获，TP=2）：
+| MoE 内核 tile（BM/BN/BK/BH）| 捕获结果 |
+|---|---|
+| 64/64/64/64（我们的默认值）| `PIECEWISE 100%` 后**一侧 rank** 收尾 `MUSA error: invalid argument` |
+| 16/16/32/16 | ✅ 两 rank 都成功，可正常回放 |
+
+**已排除**：segmentation 的 torch 算子（biselect 对照通过）、每层 all-reduce（`SKIP_AR`）、
+捕获期 event record、`torchada` 图轮换、捕获期内存分配（零分配 segmentation 仍失败）。
+**独立复现**：单进程 `MUSAGraph` 里用**同一内核**、`64/64/64` 也能正常捕获回放
+（smem 仅 16 KiB）⇒ 说明是**引擎上下文（48 层 + 持久缓冲视图 + vLLM 捕获流/pool）与几何的组合**。
+
+**给厂商的建议**：`cudaStreamEndCapture`/`muStreamEndCapture` 返回 `invalid argument` 时，
+请提供"捕获期间哪个 op/kernel 使会话失效"的信息（现在只有收尾一个错误码，
+且只在多 rank 场景的一侧出现），否则定位成本极高（我们花了 6 轮共约 6 小时）。
+
+**顺带发现（实施细节）**：`triton/backends/mtgpu/driver.c` 里
+`muFuncSetAttribute(MAX_DYNAMIC_SHARED_SIZE_BYTES, …)` 的整段是**注释掉**的
+（注释写 "supported based on QY2, PH1 is ok here"）⇒ 需要 > 默认上限的 dynamic smem 的 kernel
+在 MUSA 上没有 opt-in 路径，建议确认这是有意为之并在文档里写明上限。
+
+## 29. 图捕获"没显存"的根因之一：vLLM 在 MUSA 上**跳过了图内存预估**
+
+`vllm/v1/worker/gpu_worker.py:748` 只在 `platform.is_cuda_alike() or is_xpu()` 时调用
+`profile_cudagraph_memory()`；而 `Platform.is_cuda_alike()`（`vllm/platforms/interface.py:227`）
+只认 **CUDA / ROCM** ⇒ **MUSA 为 False**。
+
+后果：CUDA/ROCm 会"先试捕一次量出图占用、再从 KV 里扣掉"；MUSA 上这一步**不存在**，
+`gpu_memory_utilization` 会把显存几乎全部给 KV，图池只能去抢残余，表现为
+`MUSA out of memory. Tried to allocate 2.00 MiB ... XXX MiB is free`。
+
+**实测数字（我们的模型，48 层全驻留）**：
+| 项 | 值 |
+|---|---|
+| PIECEWISE 每张图 | **≈1251 MiB** |
+| FULL 模式每张图 | ≈1 MiB（几乎不占）|
+| 捕获开始时剩余显存 | ≈2200 MiB |
+⇒ 只能容下 **2 张** PIECEWISE 图（即 `MBT=2`）；`MBT≥4` 必 OOM。
+（`PYTORCH_MUSA_ALLOC_CONF=expandable_segments:True` 无效，不是碎片问题。）
+
+**给厂商/上游的建议**：让 MUSA 也走进 `profile_cudagraph_memory()` 分支
+（前置条件：那个"试捕一次"在 MUSA 上必须能成功——我们这边**默认 tile 会 `invalid argument`**，
+见 §28，所以还得先解决 §28 才能启用）。
+
+## 30. MCCL：**无 P2P，只能 host relay**；且 mp22 / mp31 的构建**互不兼容**
+
+**用户（2026-10-26）明确指出的两条**：
+1. **MCCL 不支持 P2P**（GPU 之间没有 direct peer copy），但**可以走 host relay** 完成集合通信；
+   我们 TP=2 的全流程（含每层 all-reduce）**已经跑通** ⇒ 说明 host relay 路径可用。
+2. **`torch_musa` 有 mp22 与 mp31 两套构建，不能混用** —— 版本选错时的典型表现是
+   MCCL 初始化/首次集合通信报 **`MCCL error … unhandled musa error`** 或 `invalid usage`。
+
+**我们的实测（补充）**：在**独立脚本**里用 `torch.distributed.init_process_group("mccl")`
+（两进程、两卡、`MUSA_VISIBLE_DEVICES=0,1` + `set_device(rank)`）反复失败：
+```
+RuntimeError: MCCL error in: .../MCCLUtils.cpp:73, unhandled musa error, MCCL version 2.11.4
+```
+⇒ **同一份 MCCL 在 vLLM 引擎里可用、在我们裸脚本里不可用** ⇒ 差异在**初始化上下文**
+（引擎走 vLLM 的 `init_distributed_environment`，会设置 `MASTER_ADDR/PORT`、`RANK/WORLD_SIZE`、
+device 绑定与通信组配置；裸脚本缺这些隐含前提）。
+
+**给厂商的建议**：MCCL 的错误信息应区分"**初始化参数错**"与"**传输通道不可用**"，
+并明确打印**当前是否在使用 host relay**（我们只能从"能跑通"反推）。
+
+**给我们的纪律**：⭐ **量 all-reduce 成本不要另写裸脚本**（大概率栽在初始化上），
+直接用引擎里的 **`XIAOTU_SKIP_AR=1` A/B** 来量 —— 那条路是**已验证可用**的。

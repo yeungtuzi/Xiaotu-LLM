@@ -1,0 +1,55 @@
+--- /home/user/lvllm/process_data/ref/repos/vllm-mainline/vllm/model_executor/layers/quantization/modelopt.py.bak_qfn	2026-10-23 00:25:24.052158980 +0000
++++ /home/user/lvllm/tmp/mo_dump.py	2026-10-23 01:01:35.750317064 +0000
+@@ -817,6 +817,44 @@
+         )
+ 
+ 
++
++_QFN_DUMP_DIR = "/home/user/lvllm/tmp/qfn_dump"
++
++
++def _qfn_dump_layer():
++    import os
++    v = os.environ.get("QFN_A_DUMP")
++    try:
++        return int(v) if v is not None else -1
++    except Exception:
++        return -1
++
++
++def _qfn_layer_index(layer):
++    import re
++    for attr in ("layer_name", "prefix", "name"):
++        m = re.search(r"layers?\.(\d+)", str(getattr(layer, attr, "") or ""))
++        if m:
++            return int(m.group(1))
++    return -1
++
++
++def _qfn_dump_weights(layer):
++    import os
++    tgt = _qfn_dump_layer()
++    if tgt < 0 or _qfn_layer_index(layer) != tgt:
++        return
++    os.makedirs(_QFN_DUMP_DIR, exist_ok=True)
++    dev = torch.cuda.current_device()
++    d = {}
++    for n in ("w13_weight", "w13_weight_scale", "w2_weight", "w2_weight_scale"):
++        t = getattr(layer, n, None)
++        if t is not None:
++            d[n] = t.detach().cpu()
++    torch.save(d, f"{_QFN_DUMP_DIR}/rank{dev}_layer{tgt}_w.pt")
++    print(f"[qfn-dump] weights layer={tgt} dev={dev} keys={list(d)}", flush=True)
++
++
+ class ModelOptNvFp4FusedMoE(FusedMoEMethodBase):
+     """MoE Method for FP4 Quantization.
+ 
+@@ -973,6 +1011,7 @@
+ 
+     def process_weights_after_loading(self, layer: RoutedExperts) -> None:
+         """Convert NVFP4 MoE weights into kernel format and setup the kernel."""
++        _qfn_dump_weights(layer)
+         if is_weights_pre_processed():
+             if self.nvfp4_backend != NvFp4MoeBackend.FLASHINFER_TRTLLM:
+                 raise RuntimeError(

@@ -9,6 +9,9 @@ and is not a performance mode.
 from __future__ import annotations
 
 import os
+import sys
+
+_WARNED_UNKNOWN = False
 
 
 def requested_device() -> str:
@@ -46,6 +49,15 @@ def musa_path_active() -> bool:
         return True
     if mode == "CUDA":
         return False
+    # An unknown non-empty value is a configuration mistake, not a platform
+    # backend: say so loudly and fall back to platform detection.  Warning only
+    # once, because this helper is consulted at every MoE layer.
+    global _WARNED_UNKNOWN
+    if not _WARNED_UNKNOWN:
+        _WARNED_UNKNOWN = True
+        print(f"[vllm-xtu-moe/musa] GPU_DEVICE={mode!r} 不是已知取值 "
+              "(CUDA/MUSA/MTGPU/S4000) ⇒ 回退平台自动探测；"
+              "若非本意请显式设置", file=sys.stderr, flush=True)
     try:
         from vllm.platforms import current_platform
 

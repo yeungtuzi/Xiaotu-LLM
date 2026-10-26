@@ -96,6 +96,18 @@ class TestMusaCorrectness(unittest.TestCase):
                 os.environ, {"GPU_DEVICE": "FOO"}, clear=True):
             self.assertFalse(mod.musa_path_active())
 
+    def test_unknown_value_warns_once(self):
+        mod = load()
+        import contextlib
+        import io
+        buf = io.StringIO()
+        with self._fake_platform(True), patch.dict(
+                os.environ, {"GPU_DEVICE": "MUSA_"}, clear=True):
+            with contextlib.redirect_stderr(buf):
+                self.assertTrue(mod.musa_path_active())
+                self.assertTrue(mod.musa_path_active())
+        self.assertEqual(buf.getvalue().count("不是已知取值"), 1)
+
     def test_alias_values_are_musa(self):
         mod = load()
         for value in ("MUSA", "musa", "MTGPU", "mtgpu", "S4000", "s4000"):

@@ -536,6 +536,7 @@ def vram_report(tag: str = "") -> dict:
         "seg(_SEG_BUF)": _SEG_BUF,
         "dma(_BUF_CACHE)": _BUF_CACHE,
         "tile_ring(_TILE_RINGS)": _TILE_RINGS,
+        "landing(_LANDING_BUF)": _LANDING_BUF,
         "slots(_SLOTS)": _SLOTS,
     }
     total = 0
@@ -1369,15 +1370,17 @@ def install_profile_guard() -> list[str]:
                     print("[vllm-xtu-moe] ⛔ activation 占位失败(不掩盖): "
                           f"{type(_e).__name__}: {_e}", flush=True)
                 try:
-                    vram_report("startup-before-kv")
-                except Exception as _e:  # noqa: BLE001
-                    print(f"[xtu-vram] 基线报告失败(不掩盖): {type(_e).__name__}: {_e}", flush=True)
-                try:
                     _reserve_staging_from_model(getattr(self, "model_runner", None))
                 except Exception as _e:  # noqa: BLE001
                     print("[vllm-xtu-moe] ⛔ profile 期 staging 记账失败(不掩盖)"
                           f" ⇒ 本次 KV 可能按『没有 staging』定容:"
                           f" {type(_e).__name__}: {_e}", flush=True)
+                # ⭐【2026-10-27 修正】预算基线的正确位置 = **预分配之后、KV 定容之前**
+                #   （上一版打在预分配前 ⇒ 恒为 0.000 GiB，等于没有判据 ✗）
+                try:
+                    vram_report("startup-before-kv")
+                except Exception as _e:  # noqa: BLE001
+                    print(f"[xtu-vram] 基线报告失败(不掩盖): {type(_e).__name__}: {_e}", flush=True)
                 # 【MUSA A71】staging 占位必须在 KV 定容前释放（否则运行期多占 1.76 GiB）
                 # 【主线 R34】长上下文激活记账在 orig_dam 期间占住，让 KV 据实少算同样多
                 _lc_res = _reserve_lc_activation()
@@ -2646,6 +2649,7 @@ def gpu_moe_layer_tiled(x, topk_ids, topk_weights, w13, s13, w2, s2,
 
 _TILE_RINGS: dict = {}
 _LANDING: dict = {}
+_LANDING_BUF: dict = {}
 
 
 def prealloc_tile_ring(device, E, H, I, group_k=32, nslots: int = 2) -> int:
@@ -2663,16 +2667,35 @@ def prealloc_tile_ring(device, E, H, I, group_k=32, nslots: int = 2) -> int:
     rb13, rb2 = int(H) // 2, int(I) // 2
     shapes = ((tile, rb13, 2 * int(I)), (tile, int(H) // gk, 2 * int(I)),
               (tile, rb2, int(H)), (tile, int(I) // gk, int(H)))
-    # ⭐⭐【2026-10-27】多分配**一块**专作 H2D raw 落点（它的大小恰等于一个槽：
-    #   一个 node 分片 = E/ns 个专家，tile=E/ns 时两者字节数完全相同）。
-    #   ⇒ 再也不需要按张量命名的 dma 缓存，运行期零分配。
-    ring = _tile_ring(device, shapes, max(2, int(nslots)) + 1)
-    land = ring[-1]
-    # which 顺序与 `_dma_hostbuf` 调用点一致：0=w13, 1=w2, 2=w13_scale, 3=w2_scale
-    _idx = {0: 0, 1: 2, 2: 1, 3: 3}
-    for _w, _i in _idx.items():
-        _LANDING[(str(device), _w)] = land[_i].view(torch.uint8).view(-1)
-    return sum(int(t.numel()) * int(t.element_size()) for slot in ring for t in slot)
+    # ⚠️【2026-10-27 修正 · 实测教训】落点**不能**塞进同一个 `_tile_ring` 调用里！
+    #   我上一版 `nslots+1=3` 去分配，而运行时用的是 `XIAOTU_GPF_STAGE_NSLOTS`(默认 **2**)
+    #   ⇒ 两者的缓存键不同 ⇒ 运行期**又分配了一整环**：实测 `tile_ring=2.101 GiB/20 块`
+    #   （期望 1.26/12），凭空多出 0.84 GiB 账外增长 ✗。
+    #   现在：环按**运行时的 nslots** 预分配（键必须逐字一致），落点单独一块。
+    if nslots is None:
+        try:
+            nslots = int(os.environ.get("XIAOTU_GPF_STAGE_NSLOTS", "2") or 2)
+        except (TypeError, ValueError):
+            nslots = 2
+    ring = _tile_ring(device, shapes, max(2, int(nslots)))
+    # 落点：大小 = 一个槽的字节数；`which` 顺序与 `_dma_hostbuf` 调用点一致
+    # (0=w13, 1=w2, 2=w13_scale, 3=w2_scale)；node 分片比槽大时 `_dma_hostbuf` 自动回退。
+    _lk = (str(device), "landing", shapes)
+    land = _LANDING_BUF.get(_lk)
+    if land is None:
+        _n = sum(int(t.numel()) for t in ring[0])
+        land = torch.empty(_n, dtype=torch.uint8, device=device)
+        _LANDING_BUF[_lk] = land
+    _off = 0
+    _views = {}
+    for _i in range(4):
+        _n2 = int(ring[0][_i].numel())
+        _views[_i] = land[_off:_off + _n2]
+        _off += _n2
+    for _w, _i in {0: 0, 1: 2, 2: 1, 3: 3}.items():
+        _LANDING[(str(device), _w)] = _views[_i]
+    return (sum(int(t.numel()) * int(t.element_size()) for slot in ring for t in slot)
+            + int(land.numel()))
 
 
 def _tile_ring(device, shapes, nslots):

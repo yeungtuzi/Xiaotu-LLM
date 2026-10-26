@@ -396,8 +396,10 @@ XTU_ENV_FILE="${XIAOTU_ENV_FILE:-/tmp/xiaotu_env}"
   #   "free 只剩 ~1.1 GiB，任何一次临时分配就死"(Xid / 512 MiB OOM / new_empty 失败)，
   #   而 free 很小并不代表总量不够：非 expandable 分配器会把大块切成不可复用的段 ⇒
   #   碎片化下即使 free=1.1 GiB 也拿不出连续块。expandable_segments 让段可增长/合并。
-  #   默认开启；要回退显式设 PYTORCH_CUDA_ALLOC_CONF=expandable_segments:False。
-  echo "PYTORCH_CUDA_ALLOC_CONF=${PYTORCH_CUDA_ALLOC_CONF:-expandable_segments:True}"
+  #   ⛔ **2026-10-26 实测：默认开 = 起不来**（worker 在 KV 初始化阶段挂死，被 executor
+  #      SIGTERM+SIGKILL，日志 "workers still running after grace period"）⇒ 默认改回 False。
+  #      开关保留，便于将来在别处验证后再试。
+  echo "PYTORCH_CUDA_ALLOC_CONF=${PYTORCH_CUDA_ALLOC_CONF:-expandable_segments:False}"
   # 【§504 的结论,§519 更正】**多 rank 同机时"分片单位"与"核切分单位"必须一致**:
   #   * §504 遇到的问题是真的:NPS1(2 node)+TP=2 时按 node 分片会退化成 nshard_=1 ⇒
   #     分片路径失效、退回"每 socket 一份副本"⇒ **权重存 2 份**;
@@ -488,7 +490,7 @@ fi
   XIAOTU_MOE_ASYNC="${XIAOTU_MOE_ASYNC:-0}" \
   XIAOTU_MOE_SPIN_IDLE_US="${XIAOTU_MOE_SPIN_IDLE_US:-$SPIN_DEFAULT}" \
   XIAOTU_GPF_STAGE_TILE_E="$STAGE_TILE_E" \
-  PYTORCH_CUDA_ALLOC_CONF="${PYTORCH_CUDA_ALLOC_CONF:-expandable_segments:True}" \
+  PYTORCH_CUDA_ALLOC_CONF="${PYTORCH_CUDA_ALLOC_CONF:-expandable_segments:False}" \
   ${XIAOTU_MOE_RANK_SPLIT:+XIAOTU_MOE_RANK_SPLIT=$XIAOTU_MOE_RANK_SPLIT} \
   OMP_NUM_THREADS=1 \
   $JIT_ENV \

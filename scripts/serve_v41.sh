@@ -392,6 +392,8 @@ XTU_ENV_FILE="${XIAOTU_ENV_FILE:-/tmp/xiaotu_env}"
   echo "XIAOTU_ENGRAM_LAST=${XIAOTU_ENGRAM_LAST:-1}"
   # 【2026-10-26】tile ring 尺寸进白名单（否则 EngineCore 静默丢弃 ⇒ 仍是 128，且无报错）
   echo "XIAOTU_GPF_STAGE_TILE_E=$STAGE_TILE_E"
+  # 【2026-10-27】MBT 给插件：profile 期 inter 定长缓冲 = MBT*K 行（预算记账用）
+  echo "XIAOTU_MOE_MBT=$MBT"
   # ⭐【2026-10-26】PyTorch 分配器：**expandable_segments**。三次崩溃的共同形态是
   #   "free 只剩 ~1.1 GiB，任何一次临时分配就死"(Xid / 512 MiB OOM / new_empty 失败)，
   #   而 free 很小并不代表总量不够：非 expandable 分配器会把大块切成不可复用的段 ⇒
@@ -490,6 +492,7 @@ fi
   XIAOTU_MOE_ASYNC="${XIAOTU_MOE_ASYNC:-0}" \
   XIAOTU_MOE_SPIN_IDLE_US="${XIAOTU_MOE_SPIN_IDLE_US:-$SPIN_DEFAULT}" \
   XIAOTU_GPF_STAGE_TILE_E="$STAGE_TILE_E" \
+  XIAOTU_MOE_MBT="$MBT" \
   PYTORCH_CUDA_ALLOC_CONF="${PYTORCH_CUDA_ALLOC_CONF:-expandable_segments:False}" \
   ${XIAOTU_MOE_RANK_SPLIT:+XIAOTU_MOE_RANK_SPLIT=$XIAOTU_MOE_RANK_SPLIT} \
   OMP_NUM_THREADS=1 \

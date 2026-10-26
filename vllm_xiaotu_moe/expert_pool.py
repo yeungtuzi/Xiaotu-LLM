@@ -135,6 +135,22 @@ class LayerPool:
         self.n_local, self.layer_idx = int(n_local), int(layer_idx)
         self.layout = str(layout)
         self.pinned = list(pinned_local)
+        # ⭐⭐【2026-10-27 · 显存定容用】每层常驻槽数**上限**（0 = 不限，保持旧行为）。
+        #   来由：池在 KV profiling 之前分配 ⇒ 每砍 1 槽约省 8.9 MiB（实测 3.98 GiB/448 槽），
+        #   直接变成 KV 池。用户裁定「砍热专家到满足 2×512K」。
+        #   ⚠️ 截断**保留表序前 N**（XTUP 底表由离线真实流统计产出，按热度降序写入）。
+        #      该假设可被实测检验：`[xtu-pin][hit]` 的命中率若明显下降 ⇒ 说明被砍掉的是热的。
+        self.pin_capped_from = 0
+        try:
+            _cap = int(os.environ.get("XIAOTU_PIN_MAX_PER_LAYER", "0") or 0)
+        except (TypeError, ValueError):
+            _cap = 0
+        if _cap > 0 and len(self.pinned) > _cap:
+            self.pin_capped_from = len(self.pinned)
+            self.pinned = self.pinned[:_cap]
+            print(f"[xtu-pin] 层{layer_idx} 限流 {self.pin_capped_from} → {_cap} 槽"
+                  f"（保留表序前 {_cap}；省 ≈{(self.pin_capped_from - _cap) * 8.9:.0f} MiB）",
+                  flush=True)
         self.nslots = len(self.pinned)
         # ---- 【运行中自适应】状态(默认不激活;是否启用由 XIAOTU_PIN_WINDOW 决定)----
         self.expert_of: list[int] = [-1] * self.nslots   # 槽 → 专家(swap_out 必需的反向表)

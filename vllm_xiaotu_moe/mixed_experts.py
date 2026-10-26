@@ -269,9 +269,12 @@ _RELEASE_MISSES = 0   # 见 _release_source_weights:静默失败的可观测性
 
 # ⭐ 2026-10-22 用户定案:「XIAOTU_RELEASE_SOURCE 这个开关毫无意义,调试完成后
 #    应该【总是释放】」⇒ 开关**已删除**,不再有 env / 文件两种门控。
-#    释放时机只有一条规则:**谁用完谁立刻释放**:
-#      · 普通层:NUMA 分片建好的那一刻;· 常驻层:H2D 装载完成的那一刻。
-#    安全守卫仍然保留,但它们是**顺序**约束、不是借口(NOTES §418 / §487)。
+#    释放时机只有一条规则:**谁用完谁立刻释放**(见 _maybe_release_source):
+#      · 普通层:引擎建好的那一刻(源张量再没有消费者);
+#      · 常驻层:权重 H2D 到 GPU 之后(见 _ensure_resident / _ensure_resident_fp8)。
+#    安全守卫仍然保留,但它们是**顺序**约束、不是借口:
+#      · 引擎尚未建立 ⇒ 还没拷过,下一次机会立刻释放(NOTES §487);
+#      · 常驻层在拷完之前不释放,拷完立刻释放(NOTES §418)。
 
 
 # GPU-prefill backends: engine class -> module exposing
@@ -714,7 +717,8 @@ class _XiaotuExpertsMixin:
         # 【2026-09-15 cellC】但**也不能无条件在这里提前建**:那样会 SIGSEGV,见
         # `_eager_build_ok` 的文档。先验证,不满足就退回惰性路径并打印原因。
         if self._is_resident_layer(layer):
-            # 常驻层:不建 CPU 引擎;源权重在 **H2D 完成之后**释放(见 _ensure_resident*)。
+            # 常驻层:不建 CPU 引擎;源权重在**H2D 完成之后**释放(见 _ensure_resident*),
+            # 这里不做任何"永久保留"的标记。
             return
         if self._xiaotu_engine is None:
             ok, why = self._eager_build_ok(layer)
@@ -801,7 +805,7 @@ class _XiaotuExpertsMixin:
         # ⚠️ **常驻层绝不能释放**:它的权重还要被一次性搬到 GPU 常驻(NOTES §418)。
         # 实测踩过:装载期的 eager 路径不知道常驻层的存在,把 layers.38/39 的源张量
         # 换成了 1 字节 `empty_strided` 空壳 ⇒ 常驻槽位拿到垃圾/直接报错。
-        # 常驻层例外**已取消**:H2D 完成后同样立刻释放,见 _ensure_resident*。
+        # 常驻层例外**已取消**:它在 H2D 完成后同样立刻释放,见 _ensure_resident*。
         # ⚠️⚠️ 【NOTES §487 根因】**引擎还没建就绝不能释放**。
         # `__init__` 里那条 eager 路径是:
         #     ok, why = self._eager_build_ok(layer)
@@ -817,7 +821,7 @@ class _XiaotuExpertsMixin:
         # 惰性路径(`apply()`)里 `_ensure_engine` 在 `_maybe_release_source` **之前**,
         # 所以这条守卫不会削弱既有的"切一层释一层"。
         if self._xiaotu_engine is None and not self._is_resident_layer(layer):
-            # 引擎还没建 ⇒ 还没拷过;**不设标记**,下一次机会立刻释放。
+            # 引擎还没建 ⇒ 还没拷过任何东西;**不设标记**,下一次机会立刻释放。
             return 0
         layer._xiaotu_src_released = True
         return self._release_source_weights(layer)
@@ -1225,7 +1229,7 @@ class _XiaotuExpertsMixin:
         slot.busy = None
         self._resident_slot = slot
         self._slot_device = dev
-        # ⭐ 2026-10-22:拷完立刻释放 —— 不再保活主机 pinned 源。
+        # ⭐ 2026-10-22:拷完立刻释放 —— 不再保活主机 pinned 源,也不再保留 checkpoint 源张量。
         src = None
         self._resident_keep = None
         self._resident_I = int(w13.shape[1]) // 2
@@ -1283,7 +1287,7 @@ class _XiaotuExpertsMixin:
             flush=True,
         )
         self._resident_fp8_pool = pool
-        # ⭐ 2026-10-22:H2D 装载完成 ⇒ 主机源权重立刻释放。
+        # ⭐ 2026-10-22:H2D 装载完成 ⇒ 主机源权重立刻释放(不再"常驻层永不释放")。
         self._maybe_release_source(layer)
         return pool
 
@@ -1931,7 +1935,9 @@ class _XiaotuExpertsMixin:
         engine = None if _resident else self._ensure_engine(layer)
         if not _resident:
             # 惰性建引擎的这一刻,主机源张量已经没有任何消费者了 —— 立即释放。
-            # 这是 V4.1(模块化路径)上唯一真正会执行的释放点,见 NOTES §378。
+            # ⭐ 2026-10-22:原来这里还有 `and not _gp_on`(GPU prefill 开着就永不释放),
+            # 那是 §459 之前"GPU 流式直接读源张量"留下的;现在 GPU 流式读的是
+            # **引擎自有分片**,所以不再需要保留源 ⇒ 一律释放。
             self._maybe_release_source(layer)
         # Use the tensor the ENGINE was built from: for formats whose checkpoint
         # layout differs (INT4/WNA16), the `w2` argument is the raw packed tensor
@@ -2700,6 +2706,57 @@ class _XiaotuExpertsMixin:
             #   ⇒ `XIAOTU_PIN_MIN_QLEN`(默认 0=不限制)以下直接走 CPU 路径,
             #      不做 partial、也不触发自适应 ⇒ 小并发零代价 ✓
             #   ⚠️ 池本身仍在 profile 期建好(图捕获前),这里只控制"用不用" ✓
+            # ---- XTU_SIDECAR=gpu0：本层 GPU0 池（只建一次；非捕获）----
+            if (not torch.cuda.is_current_stream_capturing()
+                    and not getattr(self, "_side_inited", False)):
+                self._side_inited = True
+                self._side_layer_idx = -1
+                try:
+                    from vllm_xiaotu_moe import sidecar as _sc
+                    if _sc.sidecar_device() is not None:
+                        import re as _re2
+                        _m2 = _re2.search(r"layers\.(\d+)", getattr(layer, "layer_name", ""))
+                        _tab = os.environ.get("XTU_SIDECAR_TABLE", "")
+                        if _m2 and _tab and os.path.exists(_tab) and expert_map is None:
+                            from vllm_xiaotu_moe import expert_pool as _xp2
+                            from vllm_xiaotu_moe.sidecar_gpu0 import get_sidecar_runtime
+                            _li = int(_m2.group(1))
+                            _rt = get_sidecar_runtime(
+                                engine, hidden_size, int(self._I_eng),
+                                int(self.moe_config.experts_per_token), _tab,
+                                n_layers=0, n_experts=int(self._E_eng),
+                                use_fp8=(getattr(self, "_engine_attr", "") == "MOE_FP8"),
+                                swiglu_limit=float(getattr(self, "swiglu_limit", 0.0) or 0.0),
+                            )
+                            if _rt is not None:
+                                # loader 内部用 current device；必须切到挎斗卡再建池
+                                _prev_dev = torch.cuda.current_device()
+                                torch.cuda.set_device(_sc.sidecar_device())
+                                try:
+                                    _pool2 = _xp2.build_layer_pool(
+                                        engine, torch.device(f"cuda:{_sc.sidecar_device()}"),
+                                    hidden_size, int(self._I_eng), int(self._group_k),
+                                    int(self._E_eng), _li, expert_map,
+                                    topk=int(self.moe_config.experts_per_token),
+                                    layout=("fp8" if getattr(self, "_engine_attr", "") == "MOE_FP8" else "mxfp4"),
+                                        table_path=_tab, require_pin=False)
+                                finally:
+                                    torch.cuda.set_device(_prev_dev)
+                                if _pool2 is not None:
+                                    _rt.add_pool(_li, _pool2)
+                                    self._side_pool = _pool2
+                                    self._side_layer_idx = _li
+                                    _pinp = None   # 挎斗与 GPU1/2 PIN 互斥，避免重复计算
+                        elif _m2 and _tab and expert_map is not None:
+                            if not getattr(self, "_side_tp_warned", False):
+                                self._side_tp_warned = True
+                                print("[xtu-sidecar] TP>1 暂不支持 per-rank 半专家"
+                                      "（需 full-expert 表或引擎 EP 集成）⇒ 本层走标准路径",
+                                      flush=True)
+                except Exception as _se:  # noqa: BLE001
+                    print(f"[xtu-sidecar] 本层初始化失败（走标准路径）: "
+                          f"{type(_se).__name__}: {_se}", flush=True)
+
             _minq = int(os.environ.get("XIAOTU_PIN_MIN_QLEN", "0") or 0)
             if _pinp and _minq > 1 and qlen < _minq:
                 _pinp = None
@@ -2919,6 +2976,7 @@ class _XiaotuExpertsMixin:
                         self.moe_config.experts_per_token,
                         h_bf16.data_ptr(), cpu_ids.data_ptr(), cpu_w.data_ptr(),
                         out.data_ptr(),
+                        layer=getattr(self, "_side_layer_idx", -1),
                     )
                 torch.cuda.current_stream().wait_event(_ev_done)
                 out.add_(_partial.to(out.dtype))
@@ -2932,6 +2990,7 @@ class _XiaotuExpertsMixin:
                         stream.cuda_stream, qlen, self.moe_config.experts_per_token,
                         h_bf16.data_ptr(), ids_i32.data_ptr(), wts_f32.data_ptr(),
                         out.data_ptr(),
+                        layer=getattr(self, "_side_layer_idx", -1),
                     )
         _lt_t2 = time.perf_counter() if _LT_ON else 0.0
         if _sync == "post":

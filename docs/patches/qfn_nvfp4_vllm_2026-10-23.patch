@@ -1,0 +1,63 @@
+--- /home/user/lvllm/process_data/ref/repos/vllm-mainline/vllm/model_executor/parameter.py.bak_qfn	2026-10-22 21:05:29.535362436 +0000
++++ /home/user/lvllm/process_data/ref/repos/vllm-mainline/vllm/model_executor/parameter.py	2026-10-22 21:14:42.582575712 +0000
+@@ -29,6 +29,13 @@
+ logger = init_logger(__name__)
+ 
+ 
++def _qfn_2d_to_4d(param_data, loaded_weight):
++    """modelopt 2D block scale -> vLLM 4D packed [n,1,k,1]."""
++    if loaded_weight.dim() == 2 and param_data.dim() == 4:
++        return loaded_weight.reshape(loaded_weight.shape[0], 1, loaded_weight.shape[1], 1)
++    return loaded_weight
++
++
+ class BasevLLMParameter(Parameter):
+     """Base parameter for vLLM linear layers. Extends the torch.nn.parameter
+     by taking in a linear weight loader. Will copy the loaded weight
+@@ -151,6 +158,7 @@
+         self.data.copy_(loaded_weight)
+ 
+     def load_merged_column_weight(self, loaded_weight: torch.Tensor, **kwargs):
++        loaded_weight = _qfn_2d_to_4d(self.data, loaded_weight)
+         shard_offset: int = kwargs["shard_offset"]
+         shard_size: int = kwargs["shard_size"]
+ 
+@@ -173,6 +181,7 @@
+         param_data.copy_(loaded_weight)
+ 
+     def load_qkv_weight(self, loaded_weight: torch.Tensor, **kwargs):
++        loaded_weight = _qfn_2d_to_4d(self.data, loaded_weight)
+         shard_offset: int = kwargs["shard_offset"]
+         shard_size: int = kwargs["shard_size"]
+         shard_id: str = kwargs["shard_id"]
+@@ -214,6 +223,7 @@
+         return self._input_dim
+ 
+     def load_row_parallel_weight(self, loaded_weight: torch.Tensor):
++        loaded_weight = _qfn_2d_to_4d(self.data, loaded_weight)
+         shard_size = self.data.shape[self.input_dim]
+         loaded_weight = loaded_weight.narrow(
+             self.input_dim, self.tp_rank * shard_size, shard_size
+--- /home/user/lvllm/process_data/ref/repos/vllm-mainline/vllm/model_executor/layers/quantization/utils/marlin_utils_fp8.py.bak_qfn	2026-10-22 21:17:59.105199884 +0000
++++ /home/user/lvllm/process_data/ref/repos/vllm-mainline/vllm/model_executor/layers/quantization/utils/marlin_utils_fp8.py	2026-10-22 21:18:01.933177630 +0000
+@@ -143,9 +143,9 @@
+     # WEIGHT SCALES
+     # Permute scales
+     if "weight_scale" in dir(layer):
+-        scales = layer.weight_scale.to(layer.orig_dtype)
++        scales = layer.weight_scale.to(getattr(layer, "orig_dtype", torch.bfloat16))
+     elif "weight_scale_inv" in dir(layer):
+-        scales = layer.weight_scale_inv.to(layer.orig_dtype)
++        scales = layer.weight_scale_inv.to(getattr(layer, "orig_dtype", torch.bfloat16))
+ 
+     # marlin kernel only support channel-wise and group-wise quantization
+     # we need to convert the scales
+@@ -280,7 +280,7 @@
+     # WEIGHT SCALES
+     # Permute scales (convert at the original size, then pad to the tile).
+     def permute_scales(scales: torch.Tensor, name: str) -> torch.Tensor:
+-        scales = scales.to(layer.orig_dtype)
++        scales = scales.to(getattr(layer, "orig_dtype", torch.bfloat16))
+         tensor_list = []
+         if "w13" in name:
+             size_n, size_k = w13_n, k

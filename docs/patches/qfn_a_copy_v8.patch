@@ -1,0 +1,60 @@
+--- /home/user/lvllm/process_data/ref/repos/vllm-mainline/vllm/model_executor/layers/quantization/modelopt.py.bak_qfn	2026-10-23 00:25:24.052158980 +0000
++++ /home/user/lvllm/tmp/mo_a.py	2026-10-23 05:51:16.028831837 +0000
+@@ -817,6 +817,49 @@
+         )
+ 
+ 
++
++def _qfn_a_layer():
++    import os
++    v = os.environ.get("QFN_A_LAYER")
++    try:
++        return int(v) if v is not None else -1
++    except Exception:
++        return -1
++
++
++def _qfn_layer_index(layer):
++    import re
++    for attr in ("layer_name", "prefix", "name"):
++        m = re.search(r"layers?\.(\d+)", str(getattr(layer, attr, "") or ""))
++        if m:
++            return int(m.group(1))
++    return -1
++
++
++def _qfn_copy_gpu0(layer):
++    tgt = _qfn_a_layer()
++    if tgt < 0 or _qfn_layer_index(layer) != tgt:
++        return
++    import time
++    import torch
++    if torch.cuda.device_count() < 2:
++        print(f"[qfn-a] sidecar not visible (devices={torch.cuda.device_count()})", flush=True)
++        return
++    dev = torch.device("cuda", torch.cuda.device_count() - 1)
++    names = ("w13_weight", "w13_weight_scale", "w13_weight_scale_2",
++             "w2_weight", "w2_weight_scale", "w2_weight_scale_2")
++    d = {}
++    t0 = time.perf_counter()
++    for n in names:
++        t = getattr(layer, n, None)
++        if t is not None:
++            d[n] = t.detach().to(dev).contiguous()
++    layer._qfn_gpu0 = d
++    gb = sum(x.numel() * x.element_size() for x in d.values()) / 1e9
++    print(f"[qfn-a] layer={tgt} copied {gb:.3f} GB to cuda:2 in "
++          f"{time.perf_counter() - t0:.3f}s keys={list(d)}", flush=True)
++
++
+ class ModelOptNvFp4FusedMoE(FusedMoEMethodBase):
+     """MoE Method for FP4 Quantization.
+ 
+@@ -973,6 +1016,7 @@
+ 
+     def process_weights_after_loading(self, layer: RoutedExperts) -> None:
+         """Convert NVFP4 MoE weights into kernel format and setup the kernel."""
++        _qfn_copy_gpu0(layer)
+         if is_weights_pre_processed():
+             if self.nvfp4_backend != NvFp4MoeBackend.FLASHINFER_TRTLLM:
+                 raise RuntimeError(

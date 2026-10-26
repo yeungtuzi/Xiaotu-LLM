@@ -45,6 +45,8 @@ PORT="${PORT:-8140}"        # ⚠️ 不能是 8070(生产)
 #      ⇒ 默认改 **0**;并显式拒绝踩生产的 1/2(除非当次显式 ALLOW_PROD_GPU=1)✗
 GPUS="${GPUS:-0}"           # 【纪律】调试只用 GPU0(生产占 GPU1+GPU2)
 TP="${TP:-1}"               # 【纪律】TP=1
+PP="${PP:-1}"               # PP:管线并行(qfn 3 卡全驻留用 PP=3)
+CPU_OFFLOAD_GB="${CPU_OFFLOAD_GB:-0}"  # qfn 全驻留差 ~1GB 时，把少量权重放 CPU
 MAXLEN="${MAXLEN:-262144}"  # ⭐ 0.2.9 实测最优:256K 上下文(KV 足够大)
 MBT="${MBT:-8192}"   # ⭐ 0.2.9 实测最优
 SEQS="${SEQS:-4}"     # ⭐ 0.2.9 实测最优(ds/glm 同为 4)
@@ -121,6 +123,9 @@ NCTL=(); [ -n "$NUMA_CMD" ] && NCTL=($NUMA_CMD)
   # ⭐ 2026-10-19:第一步=静态驻留(启动期装载,decode 期零传输)⇒ 该开关必须能被透传
   if [ -n "${XIAOTU_PIN_STATIC:-}" ]; then echo "XIAOTU_PIN_STATIC=$XIAOTU_PIN_STATIC"; fi
   if [ -n "${XIAOTU_MOE_GPU_RESIDENT_LAYERS:-}" ]; then echo "XIAOTU_MOE_GPU_RESIDENT_LAYERS=$XIAOTU_MOE_GPU_RESIDENT_LAYERS"; fi
+  # qfn NVFP4：必须经 env 桥，否则 worker 子进程看不到
+  if [ -n "${XTU_NVFP4_GPU:-}" ]; then echo "XTU_NVFP4_GPU=$XTU_NVFP4_GPU"; fi
+  if [ -n "${VLLM_EXPERTS_LOAD_DEVICE:-}" ]; then echo "VLLM_EXPERTS_LOAD_DEVICE=$VLLM_EXPERTS_LOAD_DEVICE"; fi
   # ⭐ 2026-10-19:逐层 CPU 计时(选常驻层要用)与池的逐层集中度统计
   if [ -n "${XIAOTU_CD_TIMING:-}" ]; then echo "XIAOTU_CD_TIMING=$XIAOTU_CD_TIMING"; fi
   if [ -n "${XIAOTU_CD_TIMING_EVERY:-}" ]; then echo "XIAOTU_CD_TIMING_EVERY=$XIAOTU_CD_TIMING_EVERY"; fi
@@ -132,7 +137,9 @@ ARGS=(
   --model "$CKPT"
   --served-model-name Qwen3.8-Flash-Next
   --host 127.0.0.1 --port "$PORT"
-  --tensor-parallel-size "$TP"
+  --tensor-parallel-size "$TP" \
+  --pipeline-parallel-size "$PP" \
+  --cpu-offload-gb "$CPU_OFFLOAD_GB"
   --dtype bfloat16
   --max-model-len "$MAXLEN"
   --max-num-batched-tokens "$MBT"

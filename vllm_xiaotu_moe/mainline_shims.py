@@ -118,6 +118,11 @@ def _install_device_loading_shim() -> list[str]:
 
     @contextlib.contextmanager
     def device_loading_context(module, target_device):
+        # qfn NVFP4 全驻留：不做 CPU 往返（否则 pwal 后又被搬回 CPU）
+        if __import__("os").environ.get("XTU_NVFP4_GPU") == "1":
+            with orig(module, target_device) as m:
+                yield m
+            return
         if not mixed_mode_enabled() or target_device.type == "cpu":
             with orig(module, target_device) as m:
                 yield m
@@ -634,6 +639,49 @@ def _already_notifies(func) -> bool:
 
 
 def _patch_quant_method_cls(cls) -> list[str]:
+    # qfn NVFP4 全驻留：native pwal（GPU Marlin repack），之后把仍留在 CPU 的权重搬上 GPU
+    if "NvFp4" in cls.__name__ and __import__("os").environ.get("XTU_NVFP4_GPU") == "1":
+        pwal0 = cls.__dict__.get("process_weights_after_loading")
+        if pwal0 is not None and getattr(pwal0, "_xtu_shim", False):
+            # 已被通用 CPU 包装过：取回原始 pwal，避免 _ensure_engine 把权重搬 CPU
+            pwal0 = getattr(pwal0, "__wrapped__", pwal0)
+        if pwal0 is not None and not getattr(pwal0, "_xtu_gpu_fix", False):
+            @functools.wraps(pwal0)
+            def pwal_gpu(self, layer, *a, **kw):
+                r = pwal0(self, layer, *a, **kw)
+                dev = torch.cuda.current_device()
+                _names = ("w13_weight", "w2_weight", "w13_weight_scale", "w2_weight_scale",
+                          "w13_weight_scale_2", "w2_weight_scale_2",
+                          "w13_input_scale", "w2_input_scale")
+                _before = {n: getattr(getattr(layer, n, None), "device", None) for n in _names}
+                for _n in _names:
+                    _t = getattr(layer, _n, None)
+                    if isinstance(_t, torch.Tensor) and _t.device.type != "cuda":
+                        setattr(layer, _n, _t.to(dev))
+                for _n, _p in list(layer.named_parameters(recurse=False)):
+                    if _p.device.type != "cuda":
+                        _p.data = _p.data.to(dev)
+                for _n, _b in list(layer.named_buffers(recurse=False)):
+                    if _b.device.type != "cuda":
+                        _b.data = _b.data.to(dev)
+                # 权重搬上卡后重建 kernel，避免 experts 缓存住 CPU 张量
+                try:
+                    if hasattr(self, "_build_moe_kernel"):
+                        self._build_moe_kernel(layer)
+                except Exception as _e:  # noqa: BLE001
+                    print(f"[xtu-nvfp4] rebuild failed: {_e}", flush=True)
+                if not getattr(type(self), "_pwal_seen", False):
+                    type(self)._pwal_seen = True
+                    print(f"[qfn-w1] pwal layer_id={id(layer)} w13_id={id(layer.w13_weight)} "
+                          f"dev={layer.w13_weight.device}", flush=True)
+                if getattr(layer, "_xtu_nvdbg", 0) < 1:
+                    layer._xtu_nvdbg = 1
+                    _after = {n: getattr(getattr(layer, n, None), "device", None) for n in _names}
+                    print(f"[xtu-nvfp4] before={_before} after={_after}", flush=True)
+                return r
+            pwal_gpu._xtu_gpu_fix = True
+            cls.process_weights_after_loading = pwal_gpu
+        return ["ModelOptNvFp4FusedMoE.gpu_fix"]
     out: list[str] = []
     cw = cls.__dict__.get("create_weights")
     if cw is not None and not getattr(cw, "_xtu_shim", False):
@@ -1991,6 +2039,121 @@ def _install_ds_mla_prefill_stride_guard() -> list[str]:
     return [f"gather_dequant_fp8ds_nope[page->row stride guard: {','.join(patched)}]"]
 
 
+def _install_qfn_apply_watch() -> list[str]:
+    """qfn NVFP4 全驻留：监视 Module._apply，找出谁把 w13_weight 搬到 CPU。"""
+    if os.environ.get("XTU_NVFP4_GPU") != "1":
+        return []
+    orig = torch.nn.Module._apply
+    if getattr(orig, "_qfn_watch", False):
+        return []
+
+    def _apply(self, fn, *a, **k):
+        before = getattr(self, "w13_weight", None)
+        bd = before.device if isinstance(before, torch.Tensor) else None
+        r = orig(self, fn, *a, **k)
+        after = getattr(self, "w13_weight", None)
+        ad = after.device if isinstance(after, torch.Tensor) else None
+        if (bd is not None and ad is not None and bd != ad
+                and not getattr(self, "_qfn_apply_logged", False)):
+            self._qfn_apply_logged = True
+            import traceback
+            print(f"[qfn-apply] {type(self).__name__} {bd}->{ad}", flush=True)
+            traceback.print_stack(limit=8)
+        return r
+
+    _apply._qfn_watch = True
+    torch.nn.Module._apply = _apply
+    return ["Module._apply watch"]
+
+
+def _install_qfn_experts_gpu_shim() -> list[str]:
+    """qfn NVFP4 全驻留：模型加载完成后把仍留在 CPU 的 NVFP4 专家权重搬到 GPU。
+
+    为什么需要：native create_weights 用 `torch.empty(...)`(CPU) 建专家，
+    loader 的 device_loading_context 在加载结束后又把它们搬回 CPU；
+    native Marlin 只接受 GPU 权重 ⇒ 在 load_model 返回后统一搬一次。
+    """
+    if os.environ.get("XTU_NVFP4_GPU") != "1":
+        return []
+    try:
+        from vllm.model_executor.model_loader import base_loader as _bl
+    except Exception as exc:  # noqa: BLE001
+        _log(f"skip qfn experts-gpu shim: {type(exc).__name__}: {exc}")
+        return []
+    orig = getattr(_bl, "load_model", None)
+    if orig is None or getattr(orig, "_qfn_gpu_shim", False):
+        return []
+
+    def _qfn_move(model):
+        dev = torch.device("cuda", torch.cuda.current_device())
+        names = ("w13_weight", "w2_weight", "w13_weight_scale", "w2_weight_scale",
+                 "w13_weight_scale_2", "w2_weight_scale_2",
+                 "w13_input_scale", "w2_input_scale")
+        moved = 0
+        for m in model.modules():
+            for nm in names:
+                p = getattr(m, nm, None)
+                if not isinstance(p, torch.Tensor) or p.device.type != "cpu":
+                    continue
+                p.data = p.data.to(dev)
+                moved += 1
+        if moved:
+            torch.cuda.synchronize()
+            print(f"[qfn-gpu] moved {moved} expert tensors to {dev}", flush=True)
+        return moved
+
+    def load_model(*a, **k):
+        model = orig(*a, **k)
+        try:
+            _qfn_move(model)
+        except Exception as exc:  # noqa: BLE001
+            print(f"[qfn-gpu] move failed: {type(exc).__name__}: {exc}", flush=True)
+        return model
+    load_model._qfn_move = _qfn_move
+
+    load_model._qfn_gpu_shim = True
+    _bl.load_model = load_model
+    # 其他模块可能已经 `from ... import load_model`，逐个替换同一引用
+    import sys as _sys
+    for _m in list(_sys.modules.values()):
+        try:
+            if getattr(_m, "load_model", None) is orig:
+                setattr(_m, "load_model", load_model)
+        except Exception:  # noqa: BLE001
+            pass
+    # Worker.load_model：模型/pwal 全部结束后再搬（更可靠的落点）
+    applied = ["base_loader.load_model(qfn experts->gpu)"]
+    try:
+        from vllm.v1.worker import gpu_worker as _gw
+    except Exception:  # noqa: BLE001
+        _gw = None
+    if _gw is not None:
+        for _cn in ("Worker", "GPUWorker"):
+            _cls = getattr(_gw, _cn, None)
+            if _cls is None:
+                continue
+            _orig_w = _cls.__dict__.get("load_model")
+            if _orig_w is None or getattr(_orig_w, "_qfn_gpu_shim", False):
+                continue
+
+            @functools.wraps(_orig_w)
+            def _worker_load(self, *a, **k):
+                r = _orig_w(self, *a, **k)
+                try:
+                    mr = getattr(self, "model_runner", None)
+                    model = getattr(mr, "model", None)
+                    if model is not None:
+                        load_model._qfn_move(model)
+                except Exception as exc:  # noqa: BLE001
+                    print(f"[qfn-gpu] worker move failed: {type(exc).__name__}: {exc}", flush=True)
+                return r
+
+            _worker_load._qfn_gpu_shim = True
+            setattr(_cls, "load_model", _worker_load)
+            applied.append(f"{_cn}.load_model(qfn experts->gpu)")
+    return applied
+
+
 def apply_mainline_shims() -> list[str]:
     """Idempotently install all shims; returns the list of things applied."""
     if not mixed_mode_enabled():
@@ -2024,6 +2187,8 @@ def apply_mainline_shims() -> list[str]:
         _install_gpu_prefill_profile_guard,
         _install_lvllm_engine_substitution,
         _install_ds_mla_prefill_stride_guard,
+        _install_qfn_apply_watch,
+        _install_qfn_experts_gpu_shim,
     ):
         try:
             applied += step()

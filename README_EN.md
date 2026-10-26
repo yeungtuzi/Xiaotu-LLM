@@ -31,7 +31,7 @@
 
 [中文](README.md) · English (default)
 
-> **📌 Current release: v0.2.9** (2026-10-19) — Expert-layer residency for Qwen3.8-Flash-Next; CUDA Graph capture crash fixed
+> **📌 Current release: v0.2.9** (2026-10-22)
 > [Release notes](RELEASE_NOTES_v0.2.9.md) · [Benchmark protocol](docs/BENCH_PROTOCOL.md)
 
 ---
@@ -54,7 +54,7 @@ Every performance number below was taken on this machine:
 | CPU | 2× AMD EPYC 9654 (192 physical cores / 384 threads, 8 NUMA nodes) |
 | RAM | 1538 GiB DDR5 |
 | GPU | 3× NVIDIA A100-PCIE-40GB |
-| OS | Ubuntu 22.04 · conda env `lvllm` |
+| OS | Ubuntu 22.04 · conda env `vllm-xiaotu-moe` |
 
 ---
 

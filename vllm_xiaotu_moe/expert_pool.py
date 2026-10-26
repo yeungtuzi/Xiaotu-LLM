@@ -398,15 +398,16 @@ class LayerPool:
 
 def build_layer_pool(engine, device, hidden: int, inter: int, group_k: int,
                      e_local: int, layer_idx: int, em_global_to_local, topk: int = 0,
-                     layout: str = "mxfp4"):
+                     layout: str = "mxfp4", table_path: str = None,
+                     require_pin: bool = True):
     """env 门 + 表命中才建;返回 LayerPool 或 None。
 
     ⭐ `layout`:见 `LayerPool.__init__` —— `"mxfp4"`(gpu_prefill)/`"fp8"`
     (gpu_prefill_fp8)。默认 `"mxfp4"` ⇒ 对既有 ds41f 路径**逐字不变** ✓
     """
-    if not pin_enabled():
+    if require_pin and not pin_enabled():
         return None
-    path = os.environ.get(_ENV_TABLE, "")
+    path = table_path or os.environ.get(_ENV_TABLE, "")
     if not path or not os.path.exists(path):
         # ⛔ 2026-10-16 修:这一行原先**每层每次建池都打** ⇒ 实测在
         #    `logs/glm68_p1_pin1.log:588-1814` 一次性刷出 **1088 行**同样的话 ⇒

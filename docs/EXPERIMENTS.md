@@ -5877,7 +5877,7 @@ Resolved LMCache MP geometry: group_tokens_per_block=[2176, 2176, 2176, 2176, 21
 
 ### B203 ⭐⭐⭐ **重复性检查(补做)⇒ 我们的 LMCache 修法与上游 **#5268** 重复 ⇒ **不提 PR**,改为贡献证据**
 
-> 感谢用户提醒:**代理是 `http://192.168.195.21:8080`**(在 `~/.bashrc` 里,非交互 shell 读不到 ✗)——
+> 感谢用户提醒:**代理是 `http://<proxy-host>:<port>`**（真实值已按敏感信息纪律移除；该代理已作废）(在 `~/.bashrc` 里,非交互 shell 读不到 ✗)——
 > 加上代理后 `gh api` 可用 ✓,`gh search` 仍空 ✗,改用 **REST 搜索 API**(`gh api search/issues`)成功 ✓✓
 
 **检查结果(LMCache 仓库)** ✓:
@@ -34180,3 +34180,221 @@ python -c 'import json,urllib.request as u; ...'   # 打印 choices[0].message �
 3. ⭐ **"不可能有这么大的问题"是有效先验** —— 一个已发布模型 + 主流推理框架,
    出现"整段思考丢失"这种量级的 bug 概率极低 ⇒ 先怀疑自己的测量口径 ✓
 4. 结论写进台账前,必须有**原始证据**(JSON/日志),不能只有探针的派生值 ✓
+
+### B1069（2026-10-26）⛔ NVFP4-W4A16 接入：一晚上挖出 **8 个坑**，其中 3 个是"能跑但数全错"
+
+**背景**：把 `Qwen3.8-Flash-Next-NVFP4-attnBF16` 接到 `CpuXiaotuMoE`（自研 CPU/GPU MoE 引擎）。
+交接文档（`dev-docs/HANDOFF_NVFP4_2026-10-26.md`）声称"已改、未验证"的改动经实测有
+**4 处与代码不符**，另有 4 个此前未发现的 bug。
+
+| # | bug | 性质 | 判据 |
+|---|---|---|---|
+| A78-1 | ckpt 的 `weight_scale` 是 **fp8** 参数是 **uint8**，`copy_` 做**数值转换**（[0.5,0.75,1.5,6]→[0,0,1,6]） | 静默错数 | 位拷贝后 dtype 告警消失 |
+| A78-2 | 尺度视图复用了 weight 的 `wid` ⇒ 形状不匹配 | 立即失败 | — |
+| A78-3 | 内核 `NVFP4WeightTraits` 的 `E8M0=false` ⇒ 组尺度是 **fp32**（`moe_v2_packed4_base.inc:1320`） | 静默错数 | 尺度字节数 ×4 |
+| A78-3b | EP 分片下 AutoWeightsLoader 把 512 个专家键喂给每 rank | 立即失败 | 无 `experts.256` |
+| A78-4 | GPU/Triton 路径的 `GKS`/`SC_E4M3`/`TS` 三个 NVFP4 constexpr **从未被传**（默认 e8m0+32） | 静默错数 | `grep SC_E4M3=` 零命中 |
+| A78-6 | 文档说 `gpu_moe_layer` 加了 `group_k`，**实际签名里没有** | TypeError | AST 打印签名 |
+| A78-7 | 整块替换丢掉 `shared_expert_gate` 的 **sigmoid 门**（qwen3_next 语义） | 静默错数 | 探针文本连贯性 |
+| **A78-8** | **`Qwen4ExpForCausalLM` 没有 `finalize_mega_moe_weights` 钩子 ⇒ 引擎从未构造 ⇒ `forward` 静默 `return hidden_states`（整层 MoE 被跳过）** | **静默错数（最坑）** | 探针输出词沙拉，`引擎=` 0 条 |
+
+**A78-8 的原始证据**（run 4，`bench_nvfp4cpu.log.prev4_garbage`）：
+```
+[probe] Q='What is 2 + 2? Answer with a single number.' -> 'ibliBegScaler horizontalynosperform二元 AREAverbpeak上一层 intensiveann rhyth…'
+Processed prompts: 100%|1/1 [00:16<00:00, 16.68s/it, est. speed input: 0.…
+```
+⭐ 加载 100%、graph 捕获成功、bench 出数、512 预填 16.7 s —— **一切都"正常"，但数值全错**。
+这正是本项目最贵的失败模式，也是"只看 tok/s"必然误判的原因。
+
+**交手文档里被实测推翻的数字**（详见 HANDOFF §13/§14）：
+1. 「gate/up 的 `scale_2` 通常不同（395/400）」⇒ 实测 **0/9 不同**
+2. 「折叠代价 ~6%，只有 0.06% 低于次正规」⇒ 实测**中位 9.09%、p99 29.7%、max 82%**
+3. 「内核每专家取全局尺度，不缺引擎能力」⇒ 内核要 **fp32 组尺度**，不是单字节 e8m0
+4. 「`gpu_moe_layer(..., group_k=...)` 必须显式传（已这么干）」⇒ 该参数**不存在**
+
+**修法**（都在插件侧，`vllm_xiaotu_moe/{hybrid_model,gpu_prefill,compat_patches}.py`）：
+fp32 折叠（CPU 引擎）+ 每专家 `ts_ptr` 二级尺度（Triton，零额外显存，48 层仍 34.0 GiB/卡）+
+本块自解析 `load_weights`（EP 跳过非本地 id、共享专家走子模块自己的 weight_loader）+
+`patch_model_post_load_hook()` 补后置加载钩子。
+
+**泛化教训**
+1. ⛔ **"已改/已验证"是最危险的一类陈述** —— 见"已改"先跑一条能反证它的命令
+   （AST 看签名 / grep 看开关 / 读内核看 dtype / 真实张量算误差）；
+2. ⭐ **数字型论据必须自己重算**（"395/400"、"0.06%" 这种精确数字最有说服力，也最容易编）；
+3. ⛔ **`return hidden_states` 这种"优雅降级"在数值路径上等于静默错数** ⇒ 降级分支必须**吵**，
+   且可被机械判据检索（`MoE 被跳过`）；
+4. ⭐ 验收必须三条同时成立：`引擎=MOE_NVFP4` = 2×层数、无跳过标记、文本探针正确
+   （`scripts/musa/check_nvfp4_bench.py` 已把这套判据写成代码）。
+
+## B1070 · 2026-10-26 · NVFP4-W4A16 上 MUSA：**数值先离线钉死，再 e2e**（CPU 引擎 1.5e-3 / GPU 内核 4.9e-3）
+
+**背景**：Qwen3.8-Flash-Next-NVFP4（attnBF16 派生目录）走 `CpuXiaotuMoE` 引擎路径。
+每轮 e2e 要 ~10 min（24 GiB 权重 + 96 个引擎），而 NVFP4 的接线错误**不报错、只出垃圾数**
+（前一轮就出现过：日志全绿 + 输出乱码）。
+
+**做法**：先写两个**离线单测**（小形状，几秒），把"数学对不对"与"管道通不通"彻底分开：
+
+| 工具 | 覆盖 | 结果 |
+|---|---|---|
+| `scripts/musa/preflight_nvfp4_cpu_engine.py` | CPU 引擎 `MOE_NVFP4` + `cpu_prefill`：**fp32 组尺度**、`weight_scale_2` 折叠、布局 `[E,N,K/2]`/`[E,N,K/16]` | **相对误差 1.50e-3** ✅（bf16 量级） |
+| `scripts/musa/preflight_nvfp4_kernels.py` | Triton GPU 路径：`SC_E4M3=1`、`GKS=16`、`ts_ptr(HAS_TS=1)`；T=8 与 T=256 两种规模 | **4.91e-3 / 4.05e-3** ✅（base 与 split 两个变体都对） |
+
+**代价对比**：两个单测合计 < 1 分钟；若靠 e2e 试错，每个 bug 都是一轮 10 分钟，
+且**错了也没有报错信号**（只有文本探针能看出来）。
+
+**单测抓到的 5 个 bug（A78-9…13）**：`tl.trans` 用于 3 维张量（编不过）、bf16 `atomic_add`
+不被 MUSA Triton 支持、fp8 尺度无法按字节解码（且 dtype 判 kind 必须在视图转换**之前**）、
+ISA 变体是 **NO_CUDA** 构建所以没有 `cpu_decode`、`cpu_prefill` 传 torch 张量 ⇒ **SIGSEGV**
+（binding 的 `as_ptr()` 只认 `data_ptr()` 整数）。
+
+**泛化判据**：
+1. 任何"接线错了也不报错"的路径（量化尺度、布局、二级尺度）**必须先有离线数值单测**，
+   再谈 e2e；单测的输出要打印**参考均值 + 相对误差 + NaN 计数**，不能只 print OK。
+2. 单测必须能**单独切换**可疑维度（`--variant`、`--trivial`、`--T`），
+   否则一个 NaN 要来回猜十几轮。
+3. `xiaotu_moe` 的 C++ 接口**一律传 `data_ptr()` 整数**；传 torch 张量 = 传 nullptr = SIGSEGV。
+4. ISA 变体能力要**运行时探测**（`hasattr(engine, "cpu_decode")`），不能假设"编好了就有"。
+
+## B1071 · 2026-10-26 · NVFP4-W4A16 上 MUSA **跑通**：乱码根因不在 MoE，在派生 ckpt 的 attention 量化口径
+
+**结果**：`引擎=MOE_NVFP4` × 96、`scale_2 已装载` × 96、文本探针 `2+2 → '4'`、重复句子探针正确复述
+（`scripts/musa/check_nvfp4_bench.py` 退出码 0）。**这是本任务第一次拿到"数值正确"的 NVFP4 端到端**。
+
+**关键教训（按重要性）**
+
+1. ⭐ **"引擎算得对"不等于"端到端对"**。我先用两个离线单测把引擎钉死
+   （CPU 引擎 1.5e-3 / Triton 内核 4.9e-3，含**真实 ckpt 字节**与**真实几何**），
+   再在**进程内**用模型自己的参数复核（1.6e-3）—— 结果端到端仍然乱码 ✗。
+   ⇒ 必须有第三层：**逐层统计 + 对照实验**（跳过 MoE / 关 PLE / 换 checkpoint）。
+2. ⭐⭐ **派生 ckpt 的"反量化"必须做完，否则比不做更糟**。上一轮把 attention 反量化成 BF16 写进
+   `attn_bf16.safetensors`，但原 FP8 张量仍通过**软链分片**可读 ⇒ 加载器按**文件**读，
+   两份同名张量都进加载器，最后一笔把 FP8 **直接 cast** 成 BF16（**不乘 `weight_scale_inv`**）
+   ⇒ attention 放大数百倍；而每层 RMSNorm 会把量级归一化回去 ⇒ **残差 std 全程正常(0.37–0.69) 但语义全毁**。
+   判据：`float8_e4m3fn into parameter bfloat16` 告警 **96 条** ⇒ 一出现就说明"同一张量有两份、其中一份是量化过的"。
+3. ⭐ **量化框架的"排除"不是 fnmatch**：`ModelOpt.get_quant_method()` 对**不在 `exclude_modules` 的 LinearBase
+   一律套用量化方法**；而 `is_layer_skipped()` 只做 exact/substring/suffix 匹配，
+   `*.linear_attn*` 这种通配符**匹配不上**（实测加了 6 条通配符后告警仍 96）⇒ 只能靠**数据侧一致**解决。
+4. ⭐ **MUSA 的 ISA 变体是能力差异，不是性能差异**：本机 CPU 无 avx512 ⇒ loader 只能选 `_avx2`，
+   而该构建带 `XIAOTU_MOE_NO_CUDA`（`cpu_decode`/`prepare_decode_buffers` 都在 `#ifndef` 里）
+   ⇒ 只有 `cpu_prefill` 可用 ⇒ 我们加了**同步兜底**（D2H→cpu_prefill→H2D + EP all-reduce），
+   decode 1.5 tok/s（步长 689 ms）。**这不是 CPU 数学慢，是每层两次同步拷贝 + 一次 all-reduce**。
+5. ⭐ **显存账要按"每层 707 MB"算，且与常驻无关**：常驻进 slot、流式进 per-layer device 缓存，
+   两条路都要占 ⇒ 48 层 = 34 GiB + attention 4.6 + 图缓冲(MBT 相关) ⇒ 2×48 GiB 上
+   **不可能**同时做到"全层 GPU + 15K×C 的 KV"（三次 OOM 实测，见 HANDOFF §40）。
+
+**未解决 / 下一步**：真正快的路径需要**重编一个带 CUDA 的 avx2 变体**（`cpu_decode` 可用 ⇒ 异步、图安全），
+那样 decode 会回到 CPU 数学的真实速度（同机型 FP8 曾到 ~40 tok/s 量级），而不是 1.5 tok/s。
+
+## B1072 · MUSA mtts4000 全驻留 NVFP4 迷你基准 C=1/2/4/8（2026-10-26）
+
+**配置**：Qwen3.8-Flash-Next NVFP4-W4A16（attnBF16 派生）· TP=2 · MTP off · 48 层全部驻留
+· PLE 在（23.8 GiB 在 `/dev/shm`）· `LEN=128 OUT=32 MBT=128 KV=384MiB MAXSEQS=8` · eager（图捕获未通过）
+
+| C | TTFT(ms) | prefill(tok/s) | decode(tok/s) | 步长(ms) | cpu_ms/步 | H2D | D2H |
+|---|---|---|---|---|---|---|---|
+| 1 | 6741 | 19.0 | 1.4 | 719.66 | 0.76 | 0 | 0 |
+| 2 | 13311 | 19.2 | 1.8 | 1083.96 | 1.08 | 0 | 0 |
+| 4 | 26660 | 19.2 | 2.6 | 1535.60 | 1.38 | 0 | 0 |
+| 8 | 53229 | 19.2 | 2.8 | 2880.22 | 2.58 | 0 | 0 |
+
+**数值**：`2 + 2 → 4` ✓
+
+**结论**：
+1. **CPU 只占 0.001 的墙钟**（0.76–2.58 ms/步）⇒ "纯 GPU"的 CPU 侧目标达成 ✓
+2. **H2D/D2H 全程 0 次**（含 PLE 路径）⇒ 主机搬运目标达成 ✓
+3. 步长 = **510 ms 固定开销 + 210–290 ms/token 计算**
+   ⇒ 图回放最多消掉固定开销（C=1 上限 ~3.3 tok/s）；MoE 内核本身是 210 ms/token 的大头
+4. 图捕获仍未通过：MUSA Triton 内核在捕获期挂死（预编译无效）+ vLLM PLE 在捕获区做 `.to("cpu")`
+   ⇒ 详见 `dev-docs/HANDOFF_NVFP4_2026-10-26.md` §59–§62 与 `docs/musa/MUSA_VENDOR_ISSUES.md` §24
+
+## B1073 · MUSA 上整模型 CUDA 图捕获/回放（qfn NVFP4-W4A16, TP=2, 48 层全驻留）
+
+**日期**：2026-10-26　**机器**：mtts4000 ×2（mp_22）
+**结论**：整模型 PIECEWISE 图**可以捕获也可以回放**，但受两条硬约束限制：
+① MoE 内核几何必须用 `BM/BN/BK/BH = 16/16/32/16`（默认 64×64 那套会让一侧 rank 收尾 `invalid argument`）；
+② 显存只够捕获**一个** token 尺寸（`MBT=1`），因此只有 C=1 的 decode 步进图。
+
+| 模式 | C | TTFT(ms) | prefill(tok/s) | decode(tok/s) | 步长(ms) | cpu_ms/步 | 2+2 探针 |
+|---|---|---|---|---|---|---|---|
+| eager（默认 tile）| 1 | 6741 | 19.0 | 1.4 | 719.66 | 0.76 | ✅ |
+| eager | 2 | 13311 | 19.2 | 1.8 | 1083.96 | 1.08 | |
+| eager | 4 | 26660 | 19.2 | 2.6 | 1535.60 | 1.38 | |
+| eager | 8 | 53229 | 19.2 | 2.8 | 2880.22 | 2.58 | |
+| **图模式**（tile16, MBT=1）| 1 | 17193 | 1.9 | **2.7** | **366.96** | 1.72 | ✅ |
+
+**复现命令要点**（`run_bench_cached.v18.sh`）：
+```bash
+XIAOTU_PLE_DISABLE=1 XIAOTU_MOE_SEG_REUSE=1 \
+XIAOTU_GPU_PREFILL_BM=16 XIAOTU_GPU_PREFILL_BN=16 XIAOTU_GPU_PREFILL_BK=32 XIAOTU_GPU_PREFILL_BH=16 \
+XIAOTU_GP_ACT_RESERVE_GIB=0 QFN_EAGER=0 QFN_MBT=1 QFN_MAXLEN=256 QFN_KV_BYTES=134217728 QFN_GPU_UTIL=0.85 \
+QFN_MAXSEQS=1 QFN_LEN=32 QFN_OUT=8 XIAOTU_MOE_GPU_RESIDENT_LAYERS=0-47 QFN_PROBE=1 XIAOTU_STEP_CPU=1
+```
+**注意**：`XIAOTU_COPY_COUNT=1` 会改到 vLLM 输出路径导致卡住，**验收跑不要开**（HANDOFF §88）。
+
+## B1074 · qfn NVFP4-W4A16(MUSA, TP=2, 48 层全驻留) 迷你基准：eager vs 图模式
+
+**日期**：2026-10-26　**同一构建**（HANDOFF §90）
+
+### eager 全模型（默认 tile，`QFN_EAGER=1`，MBT=64，MAXSEQS=4，KV=128 MiB，LEN=128/OUT=32）
+| C | TTFT(ms) | prefill(tok/s) | decode(tok/s) | 步长(ms) | cpu_ms/步 | 2+2 |
+|---|---|---|---|---|---|---|
+| 1 | 12895 | 9.9 | 2.0 | 502.79 | 0.82 | ✅ `4` |
+| 2 | 18242 | 14.0 | 2.1 | 950.77 | 1.10 | |
+| 4 | 36222 | 14.1 | 2.1 | 1898.10 | 1.97 | |
+| 8 | 72540 | 14.1 | 2.1 | 3781.82 | 4.15 | |
+
+* **步长 ∝ C**（每翻倍 ≈ ×2）⇒ eager 路径无批处理收益，decode 吞吐恒定 ~2.1 tok/s
+* 每步 CPU 0.82 → 4.15 ms（`cpu/wall=0.001`）
+
+### 图模式（tile 16/16/32/16，MBT=1，MAXLEN=256，KV=128 MiB）
+| C | TTFT(ms) | prefill(tok/s) | decode(tok/s) | 步长(ms) | cpu_ms/步 | 2+2 |
+|---|---|---|---|---|---|---|
+| 1 | 17193 | 1.9 | **2.7** | **366.96** | 1.72 | ✅ `4` |
+
+⇒ 同构建下 **图回放比 eager 快 27%**（C=1）；prefill 慢是因为 MBT=1 时 32-token 预填走 eager + tiny tile。
+⇒ C≥2 未进图：**每多捕获 1 个 token 尺寸约多占 ~7 GiB**，48 层全驻留后只剩 ~7.6 GiB（详见 HANDOFF §89）。
+
+## B1075 · ⭐ 干净基线（含拷贝计数）：C=1 有**快路径**，C≥2 慢 27 倍；**图模式是净负收益**
+
+**日期**：2026-10-26 12:11–12:21（远端无残留进程，`ps` 已确认 0 个 VLLM 进程）
+**口径**：eager、默认 tile、48 层全驻留、`MAXSEQS=4 KV=128MiB UTIL=0.92 MBT=64 LEN=32 OUT=8`、
+`XIAOTU_COPY_COUNT=1`、`QFN_EAGER=1`
+
+| C | TTFT(ms) | prefill(tok/s) | decode(tok/s) | **步长(ms)** | cpu_ms/步 | H2D | D2H | 2+2 |
+|---|---|---|---|---|---|---|---|---|
+| 1 | 7654 | 4.2 | **31.0** | **32.21** | 1.50 | **0** | **0** | ✅ `4` |
+| 2 | 7043 | 9.1 | 2.3 | **860.23** | 1.89 | 0 | 0 | |
+| 4 | 10691 | 12.0 | 1.7 | 2293.94 | — | 0 | 0 | |
+| 8 | 18128 | 14.1 | 1.7 | 4845.87 | — | 0 | 0 | |
+
+### 两个颠覆性结论
+1. **T=1（C=1）有快路径**：32.21 ms/步 = **31 tok/s**；而 **C=2 直接掉到 860 ms（27×）**
+   ⇒ MoE/attention 在 `T=1` 走的是专门路径，`T≥2` 走的是很慢的通用路径。
+2. **图模式（tile 16/16/32/16）C=1 = 366.96 / 482.89 ms**，比 eager 快路径的 **32.21 ms 慢 11–15 倍**
+   ⇒ 目前**图模式是净负收益**：进图被迫用小 tile，小 tile 的内核成本远超省下的发射开销。
+
+### ⚠️ 上一版 B1074 的 eager 数字**作废**（污染）
+B1074 那次（11:10–11:25）同时有一个残留 worker 占着 GPU1 的 46 GiB
+（11:10 的 `mthreads-gmi` 记录）⇒ 那批 502.79/950.77/1898.10/3781.82 ms **不可信**，以本表为准。
+
+### 下一步（按价值排序）
+1. **查清 T≥2 为什么慢**（C=2 就 860 ms）：这是当前最大瓶颈，比图重要得多
+2. 找**既快又能捕获**的 tile（现在能捕获的都慢）
+3. 若 1 修好，再评估图是否值得
+
+## B1076 · qfn 两模式对比（FP8 混合 vs NVFP4 全驻留）：全驻留 decode 反而慢 29–58×
+
+**日期**：2026-10-26 | **详见** `dev-docs/REPORT_qfn_mixed_vs_full_2026-10-26.md`
+
+| 指标 | FP8 混合（12 层常驻 + CPU 引擎）| NVFP4 全驻留（48 层 GPU）|
+|---|---|---|
+| decode C=1 / C=4 | **46.3 / 127.3 tok/s** | 1.6 / 2.2 tok/s |
+| 步长 C=1 / C=2 / C=4 | 21.6 / 21.5 / 31.4 ms | 618 / 924 / 1,779 ms |
+| prefill（不可直接比：15K vs 32 token）| 1,517 tok/s | 9.1 tok/s |
+| 每步 CPU | 数十 ms | **1.06 ms** |
+| H2D/D2H | 0（常驻层）/ 有（流式层）| **0 / 0** |
+| 最大上下文 | **262,144** | 256 |
+
+**首要假设**：NVFP4 每层末尾一次 `tensor_model_parallel_all_reduce` ⇒ 48 次/步 × ~12.9 ms ≈ 618 ms。
+混合模式在 CPU 上按专家并行、**无这 48 次 AR** ⇒ 可解释"CPU 算反而更快"。
+**下一步**：`XIAOTU_SKIP_AR=1` 同配置验证（若步长掉到 ~50 ms ⇒ 假设成立）。

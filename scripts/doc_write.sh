@@ -76,8 +76,13 @@ mx = max([int(m) for m in re.findall(r'^#{2,3} #(\d+)', src, re.M)] or [0])
 #    实测:两次追加都打印 "本条 -"(即 ids 为空、检查根本没跑)⇒ 已真的撞出 #255/#256 各两条 ✗
 #    ⇒ 统一按 '^(#{2,3}) #NN' 匹配,并【保留调用方的井号个数】✓
 if auto:
-    body2 = re.sub(r'^(#{2,3}) #\d+', lambda m: f"{m.group(1)} #{mx+1}", body, count=1, flags=re.M)
-    if body2 == body:
+    # ⭐ 2026-10-24 修正(实测踩到):原判据是 `body2 == body` ⇒ 当调用方自己写的编号
+    #    恰好等于 mx+1 时,替换结果与原文字节相同 ⇒ 被误判为"首行没有编号"而 exit 4 ✗
+    #    (实测:`#298` 存在时写 `## #299` 的条目连续两次被拒;脚本报的是"没有编号可分配",
+    #     而真实原因是"分配的编号与你写的一样"。)
+    #    ⇒ 改为用 subn 的**替换次数**判据:count==0 才是"没有编号"✓
+    body2, n_sub = re.subn(r'^(#{2,3}) #\d+', lambda m: f"{m.group(1)} #{mx+1}", body, count=1, flags=re.M)
+    if n_sub == 0:
         print("⛔ --append-auto: 首行没有 '## #NN' / '### #NN' 可分配 ⇒ 未写", file=sys.stderr)
         sys.exit(4)
     body, tag = body2, f"#{mx+1}"

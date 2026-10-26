@@ -39,20 +39,15 @@
 
 | 线 | 路径 | 分支 | 说明 |
 |---|---|---|---|
-| 主线(GL M/DeepSeek) | `/root/lvllm/repos/vllm-xiaotu-moe` | 见 `git worktree list` | ⚠️ 2026-10-22 状态见下行 |
+| 主线(GLM/DeepSeek) | `/root/lvllm/repos/vllm-xiaotu-moe` | 见 `git worktree list` | 主开发树 |
 | musa | 同上或独立 worktree | `feature/musa-correctness` | 仅本地开发,不部署到 A100 |
-| 主线 | `/root/lvllm/repos/vllm-mainline` | `dev/mainline` | 2026-10-22 由 `git worktree add` 建立 |
+| 主线基准 | `/root/lvllm/repos/vllm-mainline` | `dev/mainline` | 独立 worktree |
 
-**远端(A100)`/home/user/lvllm/vllm-xiaotu-moe`:只放主线,一个 env。**
+**远端 A100 执行器只放主线、一个 env**（路径 / 环境 / 怎么推，一律以 `dev-docs/ENV_TWO_MACHINES.md` 为准）。
 
-- env 只有 **`vllm-xiaotu-moe`**(python 3.12.14),editable 安装指向**唯一目录**
-  `/home/user/lvllm/vllm-xiaotu-moe` ⇒ **不要为第二条线复制 env**(A100 不跑 musa)✓
-- ⚠️ **该远端机器连不上 GitHub**(`git fetch` 130 s 后超时)⇒ **同步只能 scp / `git bundle`**,
-  不要指望在远端 `git pull` ✗
-- ⚠️ 远端是**编译调试环境**,代码由本地 scp 覆盖 ⇒ 它的 `git status` 经常显示大量"已修改",
-  **那是部署差异,不是远端有更新**。判断"远端是否落后"要看 **HEAD**,不看 status ✓
-  (2026-10-22 曾出现「旧 HEAD + musa 版 `gpu_prefill.py`/`expert_pool.py`」的混合态,
-  已 reset 回 `b6a30b9`,md5 与 `origin/main` 逐一对齐)
+- ⛔ 开发服务器是**纯编译 / 执行 / 测试环境**：真源只有本地仓库，代码**只从 harness 单向推过去**；
+  远端不改代码、不需要外网 git（⛔ 不要在远端 `git pull`）。
+- ⚠️ 判断远端新旧看 **HEAD**，不看 `git status`（那里的“已修改”= 部署差异）。
 
 **部署纪律(硬):**
 1. ⛔ **musa 的代码永远不部署到 A100** —— 否则主线基准实际跑的是 musa 路径,数据全不可信 ✗

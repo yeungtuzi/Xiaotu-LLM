@@ -63,6 +63,10 @@
   `scripts/research_preflight.sh`、`scripts/serve_qwen38.sh`、
   `vllm_xiaotu_moe/{expert_pool,mainline_shims,mixed_experts}.py`、
   `xiaotu_moe/csrc/python_binding/binding.cpp`（旧的“5 个文件”表述已过期 ✗）
+- ⭐ **合并后的终态（用户 2026-10-26 定）：一份代码，同时支持 CUDA 与 MUSA，用 `GPU_DEVICE` 门控**
+  ⇒ 合并完即删除 `feature/musa-correctness`，**不再保留长命 MUSA 分支**；
+  ⛔ 禁止平台专用实现副本 / 平台专用依赖；平台判定只允许在 `musa_correctness.py` 读 `GPU_DEVICE`
+  （细则与验收矩阵见 `dev-docs/MERGE_MUSA_TO_MAINLINE_PLAN.md` §9）
 
 ## ⛔⛔⛔ 【环境事实 · 2026-10-15】这是**两台机器**,别搞混 ⇒ 先读 `dev-docs/ENV_TWO_MACHINES.md`
 

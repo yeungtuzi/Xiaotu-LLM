@@ -2308,14 +2308,29 @@ def register():
         #   **根本没被使用**（实测日志出现 `fused_moe.py:1213 Using default MoE config`
         #   之后 muDNN 报 NOT_SUPPORTED ⇒ 挂起）。
         #   该块与 `CpuXiaotuMoE` **同签名** `(vllm_config, prefix=...)` ⇒ 直接替换 ✓
-        try:
-            import vllm.models.qwen4_exp.nvidia.model as _q4
-            if hasattr(_q4, "Qwen4ExpSparseMoeBlock"):
-                _q4.Qwen4ExpSparseMoeBlock = CpuXiaotuMoE
-                print("[vllm-xtu-moe] registered OOT override of "
-                      "Qwen4ExpSparseMoeBlock -> CpuXiaotuMoE", flush=True)
-        except Exception as _e:  # noqa: BLE001
-            print(f"[vllm-xtu-moe] qwen4_exp override skipped: {_e}", flush=True)
+        #
+        # ⛔ 2026-10-27【只对 4-bit 权重开】：`CpuMegaExpertsParams` 按**4-bit 打包**
+        #   分配 `[E, 2I, H//2]`（MXFP4/NVFP4 两值一字节）。FP8 权重是**一字节一值**，
+        #   套这份布局会在加载期直接失败：
+        #   `expert weight shape mismatch w13_weight: param (640, 1280) vs ckpt (640, 2560)`。
+        #   实测（MP22，`Qwen3.8-Flash-Next-FP8`，`GPU_DEVICE=MUSA`）：覆盖开启 ⇒ 两个 rank
+        #   都在 load_weights 阶段报错、引擎起不来；关掉覆盖 ⇒ 走主线的
+        #   `RoutedExperts` + 本项目 CPU 后端，与 2026-10-25 那次 FP8 混合跑通的是同一条路。
+        #   ⇒ 该覆盖只在 `XIAOTU_NVFP4=1` 时生效；FP8 默认路径保持与合并前一致 ✓
+        if os.environ.get("XIAOTU_NVFP4", "0").strip() == "1":
+            try:
+                import vllm.models.qwen4_exp.nvidia.model as _q4
+                if hasattr(_q4, "Qwen4ExpSparseMoeBlock"):
+                    _q4.Qwen4ExpSparseMoeBlock = CpuXiaotuMoE
+                    print("[vllm-xtu-moe] registered OOT override of "
+                          "Qwen4ExpSparseMoeBlock -> CpuXiaotuMoE "
+                          "(XIAOTU_NVFP4=1)", flush=True)
+            except Exception as _e:  # noqa: BLE001
+                print(f"[vllm-xtu-moe] qwen4_exp override skipped: {_e}", flush=True)
+        else:
+            print("[vllm-xtu-moe] qwen4_exp OOT override skipped "
+                  "(XIAOTU_NVFP4!=1 ⇒ FP8 走主线 RoutedExperts + 本项目 CPU 后端)",
+                  flush=True)
         dv4_nvidia._xiaotu_patched = True  # 幂等
 
     ModelRegistry.register_model(

@@ -1587,11 +1587,14 @@ def activation_reserve_bytes() -> int:
         #   运行期不涨 = `_BUF_MOE`/`_BUF_CACHE` 已按 2 的幂定长（见 `_reuse_moe`/`_reuse`）。
         #   ⇒ 默认 0：不再用固定常数猜，也不再重复扣 vLLM 已单独扣除的 activation 峰。
         #   仍可用 env 覆盖（例如把长上下文实测激活峰再加回来）。
-        # 默认 **0.25 GiB**（不是 3.0）：inter + tile 环已在 profile 期真分配并进账，
+        # 默认 **0**（用户 2026-10-27 裁定）：inter + tile 环(含 raw 落点) 全部在
+        # profile 期真分配并进账 ⇒ 运行期**不该再有新分配**；真涨了就是 bug，让它立刻崩出来。
+        # 旧的 0.25 只是"落点未并入环"时的保险，现在不需要了。
+        # 原文：默认 0.25 GiB（不是 3.0）：inter + tile 环已在 profile 期真分配并进账，
         # 这 0.25 只覆盖"DMA 暂存首次分配 + 碎片抖动"——它是一次性、有界的
         # （每 (which,slot) 一块，2 的幂定长）。首次真实流量后可用 `[xtu-vram]` 复核，
         # 若实测 DMA 总量已能并入 profile 预分配，则可降到 0。
-        gib = float(os.environ.get("XIAOTU_GP_ACT_RESERVE_GIB", "0.25"))
+        gib = float(os.environ.get("XIAOTU_GP_ACT_RESERVE_GIB", "0.0"))
     except (TypeError, ValueError):
         gib = 3.0
     return int(max(0.0, gib) * 2**30)
@@ -1669,7 +1672,12 @@ def _dma_hostbuf(engine, which: int, node: int, nbytes: int, device) -> torch.Te
     # 【§600】暂存缓冲**每张量一份**(不再每 node 一份)。同一条 stream 上
     # "DMA n → copy n → DMA n+1" 是严格有序的 ⇒ 复用安全;而每 node 一份会让
     # ns 份暂存同时常驻(TP=2 共 3.59 GiB),把真正的 staging 峰值从 ~11 GiB 抬到 ~14 GiB。
-    t = _reuse(("dma", int(which)), (int(nbytes),), device)
+    t = _LANDING.get((str(device), int(which)))
+    if t is None or int(t.numel()) < int(nbytes):
+        # 没预分配(未走 tile 环路径) ⇒ 回退到定长缓存（仍是 2 的幂、一次性）
+        t = _reuse(("dma", int(which)), (int(nbytes),), device)
+    else:
+        t = t[: int(nbytes)]
     stream = torch.cuda.current_stream(device).cuda_stream
     got = engine.copy_hostbuf_to_device(int(which), int(node), t.data_ptr(), stream)
     if int(got) != int(nbytes):
@@ -2637,6 +2645,7 @@ def gpu_moe_layer_tiled(x, topk_ids, topk_weights, w13, s13, w2, s2,
 
 
 _TILE_RINGS: dict = {}
+_LANDING: dict = {}
 
 
 def prealloc_tile_ring(device, E, H, I, group_k=32, nslots: int = 2) -> int:
@@ -2654,7 +2663,15 @@ def prealloc_tile_ring(device, E, H, I, group_k=32, nslots: int = 2) -> int:
     rb13, rb2 = int(H) // 2, int(I) // 2
     shapes = ((tile, rb13, 2 * int(I)), (tile, int(H) // gk, 2 * int(I)),
               (tile, rb2, int(H)), (tile, int(I) // gk, int(H)))
-    ring = _tile_ring(device, shapes, max(2, int(nslots)))
+    # ⭐⭐【2026-10-27】多分配**一块**专作 H2D raw 落点（它的大小恰等于一个槽：
+    #   一个 node 分片 = E/ns 个专家，tile=E/ns 时两者字节数完全相同）。
+    #   ⇒ 再也不需要按张量命名的 dma 缓存，运行期零分配。
+    ring = _tile_ring(device, shapes, max(2, int(nslots)) + 1)
+    land = ring[-1]
+    # which 顺序与 `_dma_hostbuf` 调用点一致：0=w13, 1=w2, 2=w13_scale, 3=w2_scale
+    _idx = {0: 0, 1: 2, 2: 1, 3: 3}
+    for _w, _i in _idx.items():
+        _LANDING[(str(device), _w)] = land[_i].view(torch.uint8).view(-1)
     return sum(int(t.numel()) * int(t.element_size()) for slot in ring for t in slot)
 
 

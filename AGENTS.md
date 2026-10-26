@@ -54,10 +54,15 @@
 2. 部署前先确认**当前在哪个 worktree/分支**(`git worktree list` + `git rev-parse --abbrev-ref HEAD`)
 3. 主线基准必须在**主线工作区**发起部署
 
-**合并策略:**
-- musa 是 `origin/main` 的直系后代 ⇒ **让 musa 定期 `git merge origin/main`**,冲突小步解决
+**合并策略(2026-10-26 实测更正):**
+- ⚠️ musa **已不是** `origin/main` 的直系后代：merge-base 退回 `b6a30b9`，落后 **115 个提交**（其中非合并 96 个）
+  ⇒ 合并前先按 `dev-docs/MERGE_MUSA_TO_MAINLINE_PLAN.md` 做一次**回基**（merge 或 rebase `origin/main`），
+  之后保持小步；**不要**在落后 115 个提交的状态下直接合并
 - ⛔ 不要 squash musa 的提交(含 Revert,有语义)
-- 必然冲突的 5 个文件:`gpu_prefill.py`、`mixed_experts.py`、`moe_v2.hpp`、`moe_v2_fp8.hpp`、`binding.cpp`
+- 实测冲突面（`b6a30b9` 起两侧都改过的文件）：`AGENTS.md`、`scripts/diagnose_hang.sh`、
+  `scripts/research_preflight.sh`、`scripts/serve_qwen38.sh`、
+  `vllm_xiaotu_moe/{expert_pool,mainline_shims,mixed_experts}.py`、
+  `xiaotu_moe/csrc/python_binding/binding.cpp`（旧的“5 个文件”表述已过期 ✗）
 
 ## ⛔⛔⛔ 【环境事实 · 2026-10-15】这是**两台机器**,别搞混 ⇒ 先读 `dev-docs/ENV_TWO_MACHINES.md`
 

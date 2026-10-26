@@ -7,8 +7,9 @@
 
 | 项 | 值 |
 |---|---|
-| 唯一代码线 | **`dev/mainline`** @ **`da53c16`** |
+| 唯一主线 | **`main`** @ **`5cb0d63`**（tag `cuda和musa线初次合并`） |
 | 原 MUSA 分支 | 已归档为 **`archive/musa-merged-20261026`**（同一提交，不再作为开发线） |
+| `dev/mainline` | **已删除**（本地与远端）；历史已全部包含在 `main` |
 | 回基 | `a76f6ce`（merge `origin/main`，补齐 115 个提交） |
 | 吸收主线 | `7183162`（merge 阶段收尾 4 个提交） |
 | 单代码守卫 | `da53c16`（`scripts/check_single_code.sh`） |
@@ -32,9 +33,10 @@
 
 ## 分支 / 工作树
 
-- 主开发树：`/root/lvllm/repos/vllm-xiaotu-moe`（当前在 `archive/musa-merged-20261026`，与主分支同提交）
-- 主线基准 worktree：`/root/lvllm/repos/vllm-mainline`（`dev/mainline`）
-- **后续开发只从 `dev/mainline` 开短命 topic 分支**；不要再恢复 `feature/musa-correctness`。
+- 主开发树：`/root/lvllm/repos/vllm-xiaotu-moe`（`main`）
+- 基准 / 编译树：`/root/lvllm/repos/vllm-mainline`（**detached @ `main`**，只读/基准，不提交）
+- ⭐ **纪律：主线 = `main`，没有 `mainline`**。开发从 `main` 开短命 `topic/*`，验收后合并回 `main` 并删除；
+  不要再恢复 `dev/mainline` / `feature/musa-correctness`。
 
 ## 未决 / 下一步
 

@@ -30,18 +30,26 @@
 > **2026-10-25 精简**:810 → 467 行。删掉的是**已作废/已关闭**的内容(8070 时代资源纪律、已永久关闭的“静默”条款、qfn 第三方历史、重复的文档三节),现行约束**一条未减**。
 > 需要旧版原文:本文件 git 历史(2026-10-25 之前),或 `/tmp/AGENTS.md.bak-20261025-*`。
 
-## ⭐⭐ 【双开发线纪律 · 2026-10-22】musa 线与主线并行,不许互相污染
+## ⛔⛔⛔ 【主线定义 · 2026-10-26 用户明令】**主线 = `main`，没有 `mainline`**
 
-> 用户 2026-10-22 定:**A100 那台只跑主线,musa 只在本地开发**(musa 目标硬件是 mtts4000,
-> A100 上**无法验证**,所以永远不在 A100 上验证 musa)。
+> **用户原话**：「我心目中没有什么mainline就是main」「都切换回main，并记录纪律“主线=main，没有mainline”」
 
-**本地两个工作区(一套 `.git`,用 worktree,不切分支、不 stash):**
+- ⛔ **不再存在 `dev/mainline` / `feature/musa-correctness` 这类长命线名**；远端 `dev/mainline` 已删除。
+- ✅ 唯一主线 = **`main`**；开发从 `main` 切短命 `topic/*`，验收后合并回 `main` 并删除。
+- ✅ CUDA 与 MUSA 是**同一份代码的两条运行时路径**（`GPU_DEVICE` 门控），不是两条分支。
+- ⚠️ 两棵 worktree 不能同时 checkout `main`：主树在 `main`，基准树 **detach 在 `main` 同一提交**。
 
-| 线 | 路径 | 分支 | 说明 |
+### 当前工作区（一套 `.git`，不切分支、不 stash）
+
+| 用途 | 路径 | 分支 | 说明 |
 |---|---|---|---|
-| 主线(GLM/DeepSeek) | `/root/lvllm/repos/vllm-xiaotu-moe` | 见 `git worktree list` | 主开发树 |
-| musa（已合并） | 同上 | `archive/musa-merged-20261026` | 已并入 `dev/mainline`，仅归档 |
-| 主线基准 | `/root/lvllm/repos/vllm-mainline` | `dev/mainline` | 独立 worktree |
+| 主开发树 | `/root/lvllm/repos/vllm-xiaotu-moe` | `main` | 唯一主线 |
+| 基准 / 编译树 | `/root/lvllm/repos/vllm-mainline` | detached @ `main` | 只读 / 基准；不提交 |
+| MUSA 归档 | 主树 | `archive/musa-merged-20261026` | 仅历史锚点，不再开发 |
+
+### 历史：双开发线（2026-10-22 ~ 2026-10-26，已结束）
+
+> 当时 A100 只跑主线、MUSA 只在本地开发；该阶段已随“一份代码 + `GPU_DEVICE`”合并结束。
 
 **远端 A100 执行器只放主线、一个 env**（路径 / 环境 / 怎么推，一律以 `dev-docs/ENV_TWO_MACHINES.md` 为准）。
 
@@ -50,7 +58,7 @@
 - ⚠️ 判断远端新旧看 **HEAD**，不看 `git status`（那里的“已修改”= 部署差异）。
 
 **部署纪律(硬):**
-1. ⛔ **musa 的代码永远不部署到 A100** —— 否则主线基准实际跑的是 musa 路径,数据全不可信 ✗
+1. ⛔ **A100 部署必须保证 `GPU_DEVICE` 未设或为 `CUDA`** —— 否则基准跑的是 MUSA 路径,数据全不可信 ✗
 2. 部署前先确认**当前在哪个 worktree/分支**(`git worktree list` + `git rev-parse --abbrev-ref HEAD`)
 3. 主线基准必须在**主线工作区**发起部署
 
@@ -64,7 +72,7 @@
   `vllm_xiaotu_moe/{expert_pool,mainline_shims,mixed_experts}.py`、
   `xiaotu_moe/csrc/python_binding/binding.cpp`（旧的“5 个文件”表述已过期 ✗）
 - ⭐ **合并后的终态（用户 2026-10-26 定）：一份代码，同时支持 CUDA 与 MUSA，用 `GPU_DEVICE` 门控**
-  ⇒ **已完成（2026-10-26）**：`dev/mainline` 为唯一代码线，原 `feature/musa-correctness`
+  ⇒ **已完成（2026-10-26）**：`main` 为唯一主线，原 `feature/musa-correctness`
   归档为 `archive/musa-merged-20261026`；**不再保留长命 MUSA 分支**；
   ⛔ 禁止平台专用实现副本 / 平台专用依赖；平台判定只允许在 `musa_correctness.py` 读 `GPU_DEVICE`
   （细则与验收矩阵见 `dev-docs/MERGE_MUSA_TO_MAINLINE_PLAN.md` §9）

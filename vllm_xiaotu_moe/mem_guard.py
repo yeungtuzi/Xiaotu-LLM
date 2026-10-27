@@ -44,6 +44,19 @@ def _reserved_gib(dev: torch.device) -> float:
 
 def _hard_exit(gp, dev: torch.device, reserved: float, hard: float) -> None:
     """硬上限：先把能拿到的现场全部落盘，再退出。"""
+    # ⛔【2026-10-27 实测更正】硬限**默认不再退出**：实测（r88）单侧 `os._exit(13)`
+    #   只是把对端留在 collective 上挂满 900 s 再 cancelled ⇒ 故障形态更差、诊断更少
+    #   （对端日志只有 "cancelled"，没有真正死因）。让 CUDA/vLLM 自己报 OOM 更有信息量。
+    #   需要旧行为时显式 `XIAOTU_MEM_HARD_EXIT=1`。
+    if os.environ.get("XIAOTU_MEM_HARD_EXIT", "0") != "1":
+        print(f"[xtu-guard] ⚠️ 硬上限**仅告警不退出**: free {free:.3f} < hard {hard:.3f} GiB "
+              f"(reserved={reserved:.3f}) ⇒ 继续运行，让真实 OOM 自己报错"
+              f"（`XIAOTU_MEM_HARD_EXIT=1` 可恢复旧行为）", flush=True)
+        try:
+            gp.vram_report("guard-hard-warn")
+        except Exception:                             # noqa: BLE001
+            pass
+        return
     print(f"[xtu-guard] ⛔ 硬上限触发: free 低于 {hard:.3f} GiB (reserved={reserved:.3f} GiB)",
           flush=True)
     try:

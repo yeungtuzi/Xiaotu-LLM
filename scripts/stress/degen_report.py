@@ -19,7 +19,8 @@ from collections import Counter
 THRESH = 0.6
 
 
-def load(path):
+def load(path, since=None):
+    """since: 'YYYY-MM-DD HH:MM:SS'（UTC 或与日志同格式），只统计该时刻之后的应答。"""
     recs = []
     with open(path, encoding="utf-8", errors="replace") as f:
         for line in f:
@@ -30,8 +31,11 @@ def load(path):
                 d = json.loads(line)
             except json.JSONDecodeError:
                 continue
-            if "repeat_ratio" in d:
-                recs.append(d)
+            if "repeat_ratio" not in d:
+                continue
+            if since and str(d.get("ts") or "") < since:
+                continue
+            recs.append(d)
     return recs
 
 
@@ -52,17 +56,29 @@ def main():
     src = sys.argv[1] if len(sys.argv) > 1 and not sys.argv[1].startswith("-") else os.path.expanduser(
         "~/lvllm/stress-run4/replay.jsonl")
     out = os.path.expanduser("~/lvllm/stress-run4/degeneration.md")
+    since = None
+    if "--since" in sys.argv:
+        since = sys.argv[sys.argv.index("--since") + 1]
+        print(f"（只统计 ts >= {since}）")
     if "-o" in sys.argv:
         out = sys.argv[sys.argv.index("-o") + 1]
 
-    recs = load(src)
+    recs = load(src, since)
     degens = [d for d in recs if is_degen(d)]
 
     lines = []
     lines.append("# 长上下文退化故障点汇总\n")
     lines.append(f"- 来源: `{src}`")
-    lines.append(f"- 有效应答: **{len(recs)}** 条；退化点: **{len(degens)}** 条"
-                 f"（{100.0 * len(degens) / len(recs):.1f}%）" if recs else "- 无数据")
+    if since:
+        lines.append(f"- 统计起点: `{since}`（用于只算某个版本的基线）")
+    if recs:
+        # 撞长度上限的一律算截断，不计入真退化（含 repeat 高但被 length 截断的情况）
+        trunc = sum(1 for d in degens if d.get("finish_reason") == "length")
+        real = len(degens) - trunc
+        lines.append(f"- 有效应答: **{len(recs)}** 条")
+        lines.append(f"- **真退化: {real} 条**（乱码 / 高重复且有正文）")
+        lines.append(f"- 截断（不算退化）: {trunc} 条（只有思考、撞 max_tokens）")
+        lines.append(f"- 真退化率: **{100.0 * real / len(recs):.2f}%**")
     lines.append("")
 
     # 形态分布

@@ -734,6 +734,7 @@ def _reuse_moe(key, shape, dtype, device):
         k = (str(device), key, tuple(int(v) for v in shape), dtype)
         t = _BUF_MOE.get(k)
         if t is None or tuple(t.shape) != tuple(int(v) for v in shape):
+            _retire(t)
             t = torch.empty(tuple(int(v) for v in shape), dtype=dtype, device=device)
             _BUF_MOE[k] = t
         return t
@@ -744,6 +745,7 @@ def _reuse_moe(key, shape, dtype, device):
     if t is None or int(t.shape[0]) < rows:
         cap = max(rows, int(t.shape[0]) if t is not None else 0)
         cap = 1 << max(0, (cap - 1).bit_length())   # 2 的幂
+        _retire(t)
         t = torch.empty((cap,) + tail, dtype=dtype, device=device)
         _BUF_MOE[k] = t
         if not _BOUND_BUF_LOGGED.get(k):
@@ -752,6 +754,25 @@ def _reuse_moe(key, shape, dtype, device):
                   f"({t.numel() * t.element_size() / 2**20:.0f} MiB, 按 2 的幂上行、只增到上限)",
                   flush=True)
     return t[:rows]
+
+
+# ⛔ 扩容时**绝不 free 旧缓冲**：CUDA graph 可能仍烘焙着旧指针，
+# 提前释放 ⇒ 图重放时 cudaErrorIllegalAddress（2026-10-28 r93 死因嫌疑）。
+# 与 pinned 缓冲同理：进退休区，交给 GC 在进程结束时统一回收。
+_RETIRED_BUF = []
+
+
+def _retire(t):
+    """把即将被替换的缓冲放进退休区（保留最近 16 代），并记录当前流。"""
+    if t is None:
+        return
+    try:
+        t.record_stream(torch.cuda.current_stream(t.device))
+    except Exception:
+        pass
+    _RETIRED_BUF.append(t)
+    while len(_RETIRED_BUF) > 16:
+        _RETIRED_BUF.pop(0)
 
 
 _SEG_BUF = {}
@@ -1822,6 +1843,7 @@ def _reuse(key, shape, device):
         k = (str(device), int(shape[0]) if len(shape) == 1 else -1, tuple(shape))
         t = _BUF_CACHE.get(k)
         if t is None or t.shape != tuple(shape) or t.device != torch.device(device):
+            _retire(t)
             t = torch.empty(tuple(shape), dtype=torch.uint8, device=device)
             _BUF_CACHE[k] = t
         return t
@@ -1830,6 +1852,7 @@ def _reuse(key, shape, device):
     t = _BUF_CACHE.get(k)
     if t is None or int(t.numel()) < n:
         cap = 1 << max(0, (max(n, int(t.numel()) if t is not None else 0) - 1).bit_length())
+        _retire(t)
         t = torch.empty((cap,), dtype=torch.uint8, device=device)
         _BUF_CACHE[k] = t
         if not _BOUND_BUF_LOGGED.get(k):

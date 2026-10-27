@@ -121,6 +121,26 @@ setsid nohup python3 -u scripts/stress/intel_probe.py --port <port> --interval 6
 | `multihop` | 埋入事实 + 结构相似的干扰事实 | 期望实体是否出现在正文 |
 | `consistency` | 温度 0 重复同一 prompt | 与首次输出的相似度 |
 
+## 7.1 并发（C=2）验证
+
+`conc_c2.py` 补的是长稳压测覆盖不到的一层：驱动是**单请求串行**，只走到 `max-num-seqs=1` 的路径；
+C=2 才会真正触发批处理、KV 块分配/回收与调度。
+
+判分重点不是吞吐，而是**串话检测**：每轮同时发两条 prompt，各自埋一个不同的
+「代号 → 负责人」事实，然后检查
+
+| 结果 | 含义 |
+|---|---|
+| 两个都对 | 并发路径正确 |
+| 互相串了（A 的答案出现在 B） | KV/批处理正确性缺陷，比吞吐下降严重得多 |
+| 都答不出 | 能力或调度问题 |
+
+```bash
+python3 scripts/stress/conc_c2.py --port <port> --rounds 20 --ctx-tokens 8000
+```
+
+建议节奏：**24 小时长稳达成后**先跑 20 轮 8k，再用 `--ctx-tokens 32000` 跑 5 轮做大 KV 压力。
+
 ## 8. 智力体检题库
 
 `intel_probe.py` 内置 10 题循环，覆盖：多步算术、速率、百分比、序关系传递、三段论、

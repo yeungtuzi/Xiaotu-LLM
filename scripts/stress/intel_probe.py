@@ -67,7 +67,18 @@ def _corpus_roots():
     if env:
         return [p for p in env.split(":") if p]
     root = os.path.dirname(os.path.dirname(os.path.dirname(os.path.abspath(__file__))))
-    return [os.path.join(root, d) for d in ("docs", "vllm_xiaotu_moe", "dev-docs")]
+    cand = [os.path.join(root, d) for d in ("docs", "vllm_xiaotu_moe", "dev-docs")]
+    if any(os.path.isdir(c) for c in cand):
+        return cand
+    # 部署在执行机上时仓库不在脚本旁边：退回“最新的 prod_* 部署目录”
+    import glob
+    host = os.path.expanduser("~")
+    prods = sorted(glob.glob(os.path.join(host, "lvllm", "prod_*")))
+    for base in reversed(prods):
+        got = [os.path.join(base, d) for d in ("docs", "vllm_xiaotu_moe", "dev-docs")]
+        if any(os.path.isdir(g) for g in got):
+            return got
+    return cand
 
 
 def build_needle_context(target_tokens=8000):
@@ -95,10 +106,14 @@ def build_needle_context(target_tokens=8000):
                 break
     if not chunks:
         return NEEDLE_FACT + "\n\n" + NEEDLE_Q
-    mid = len(chunks) // 2
-    body = chunks[:mid] + [NEEDLE_FACT] + chunks[mid:]
-    text = "\n\n".join(body)
-    return text[:target_tokens * 4] + "\n\n" + NEEDLE_Q
+    # ⛔【2026-10-27 修】先截断再埋针：原实现把事实插在“拼接后正文”的中点、随后又截到
+    #   target_tokens*4 字符，事实正好落在截断边界上被切掉 ⇒ 探针误报“模型找不到”。
+    limit = target_tokens * 4
+    text = "\n\n".join(chunks)[:limit]
+    pos = len(text) // 2
+    text = text[:pos] + "\n\n" + NEEDLE_FACT + "\n\n" + text[pos:]
+    assert NEEDLE_FACT in text, "needle 事实未被植入"
+    return text + "\n\n" + NEEDLE_Q
 
 
 def normalize(s):
@@ -146,6 +161,12 @@ def main():
         print(line, flush=True)
 
     log(f"INTEL_PROBE_START port={args.port} interval={args.interval}s pool={len(POOL)} start_idx={idx}")
+    # ⛔【2026-10-27 修】启动即自检端口：端口给错时以前要等 10 分钟才打出 SKIP，
+    #   表现为“探针在跑但什么也不做”。现在直接失败退出，不留哑进程。
+    _c, _ = rd.http_code(api_root + "/health", timeout=5.0)
+    if _c != 200:
+        log(f"⛔ 启动失败：{api_root}/health 返回 {_c}，请确认 --port（当前 {args.port}）")
+        return 2
 
     while True:
         pid, prompt, patterns, note = POOL[idx % len(POOL)]

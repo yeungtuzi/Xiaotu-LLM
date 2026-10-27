@@ -1534,7 +1534,44 @@ class _XiaotuExpertsMixin:
             return False
         _pf = getattr(gp, "prealloc_fp8_buffers", None)
         if _pf is None:
-            return False                  # 该后端没有真分配接口(非 FP8)⇒ 让调用方回落替身
+            # ⭐⭐【2026-10-27 · 显存预算"零预留"的关键】MXFP4 没有整层装配接口，
+            #   但它**唯一按 token 定长**的缓冲是 `inter`(A=T*K 行)。在 KV 定容**之前**
+            #   把它一次分配到位 ⇒ ① 进入 vLLM 的 `total_consumed`(预算据实，不靠猜)；
+            #   ② 运行期缓存命中、不再分配 ⇒ 不再有"账外增长"。
+            #   ⇒ 于是 `XIAOTU_GP_ACT_RESERVE_GIB` 可以名正言顺地取 **0**。
+            try:
+                _info = dict(getattr(self, "_prof_info", None) or {})
+                if not (_info.get("E") and _info.get("H") and _info.get("I")):
+                    self.staging_need_bytes()
+                    _info = dict(getattr(self, "_prof_info", None) or {})
+                _E2, _H2, _I2 = int(_info["E"]), int(_info["H"]), int(_info["I"])
+                _K2 = int(getattr(getattr(self, "moe_config", None),
+                                  "experts_per_token", 0) or 0)
+                _mbt2 = int(os.environ.get("XIAOTU_MOE_MBT", "8192") or 8192)
+                if _K2 <= 0 or _I2 <= 0 or _mbt2 <= 0:
+                    raise ValueError(f"几何不全 K={_K2} I={_I2} MBT={_mbt2}")
+                _dv = torch.device("cuda", torch.cuda.current_device())
+                _rows = _mbt2 * _K2
+                gp._reuse_moe("inter", (_rows, 2 * _I2), torch.bfloat16, _dv)
+                _mib = _rows * 2 * _I2 * 2 / 2**20
+                # tile 环也必须在这里分配：它原本"首个真实预填才建" ⇒ 0.84 GiB 在账外。
+                _ring_b = 0
+                try:
+                    _ring_b = gp.prealloc_tile_ring(
+                        _dv, _E2, _H2, _I2,
+                        int(getattr(self, "_group_k", 32) or 32))
+                except Exception as _e3:  # noqa: BLE001  失败要出声,但 inter 已就位
+                    print(f"[vllm-xtu-moe] ⛔ profile 期 tile 环分配失败(不掩盖): "
+                          f"{type(_e3).__name__}: {_e3}", flush=True)
+                print(f"[vllm-xtu-moe] ⭐ profile 期定长缓冲(计入 consumed): "
+                      f"inter rows={_rows}(MBT {_mbt2} x K {_K2}) cols={2 * _I2} "
+                      f"= {_mib:.0f} MiB; tile 环 = {_ring_b / 2**20:.0f} MiB "
+                      f"⇒ KV 据实定容 ✓", flush=True)
+                return True
+            except Exception as _e2:  # noqa: BLE001  失败必须出声
+                print(f"[vllm-xtu-moe] ⛔ profile 期 inter 定长分配失败(不掩盖): "
+                      f"{type(_e2).__name__}: {_e2}", flush=True)
+                return False
         _info = dict(getattr(self, "_prof_info", None) or {})
         if not (_info.get("E") and _info.get("H") and _info.get("I")):
             # `_prof_info` 未填(调用方没先问过)⇒ 走与 `staging_need_bytes` **同一条**路径求几何 ✓
@@ -1926,6 +1963,14 @@ class _XiaotuExpertsMixin:
                 and not in_profile_run()
                 and not torch.cuda.is_current_stream_capturing()
             )
+            # ⭐【2026-10-27 · 显存"不涨"的机械判据】每 60 s 打一次持久缓冲总账；
+            #   与启动时 `startup-before-kv` 那条的 total_bytes 相等 ⇒ 不涨。
+            if not in_profile_run():
+                try:
+                    from vllm_xiaotu_moe.gpu_prefill import maybe_report as _mr
+                    _mr()
+                except Exception:  # noqa: BLE001  报告绝不能影响主流程
+                    pass
             # ⭐【2026-10-27 · XTU 诊断】真实流量(非 profile 期)才打印，最多 24 条：
             #   目的=定位"长预填仍在 CPU 跑"的确切原因(见 INCIDENT §29)。
             _dbg = globals().setdefault("_GPF_DBG", {"n": 0})
@@ -2951,6 +2996,24 @@ class _XiaotuExpertsMixin:
                                     int(_pinp.planes[0].shape[0]), int(_E), int(qlen)), flush=True)
                     cpu_ids = torch.where(_res | _bad, _zids, ids_i32)
                     cpu_w = torch.where(_res, _zw, wts_f32)
+                    # ⛔【2026-10-27 · 用户裁定「宁可浪费电，不要乱 free」】
+                    #   这两块在 `_side` 上创建，却以**裸指针**交给 `engine.cpu_decode` 在
+                    #   **主流**上异步读。少两件事就会 UAF：① allocator 不知道主流还在读 ⇒
+                    #   块回到 `_side` 池后可能被提前复用；② Python 引用一丢，块就可能被判空闲。
+                    #   故：补 `record_stream(主流)` + 进 keepalive（保留最近 8 代，代价 KB 级）。
+                    _cdk = getattr(self, "_cd_keepalive", None)
+                    if _cdk is None:
+                        _cdk = []
+                        self._cd_keepalive = _cdk
+                    _cdk.append((cpu_ids, cpu_w))
+                    if len(_cdk) > 8:
+                        del _cdk[:len(_cdk) - 8]
+                    _main_s = torch.cuda.current_stream()
+                    for _t in (cpu_ids, cpu_w):
+                        try:
+                            _t.record_stream(_main_s)
+                        except Exception:      # noqa: BLE001
+                            pass
                     _ev_mask = getattr(self, "_pin_ev_mask", None)
                     if _ev_mask is None:
                         _ev_mask = torch.cuda.Event()

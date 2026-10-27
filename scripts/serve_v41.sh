@@ -22,6 +22,8 @@
 #   LOAD=auto bash scripts/serve_v41.sh       # real weights (~long load)
 #
 # Env: TAG PORT GPUS TP MAXLEN LOAD GPU_UTIL EXTRA_ENV MAXSEQS
+#      PIN_MAX_PER_LAYER(默认 0=不限;也可写 XIAOTU_PIN_MAX_PER_LAYER):热专家每层常驻上限，
+#        池在 KV profiling 前分配 ⇒ 每砍 1 槽 ≈ +9.1 MiB KV（用途：给 2×512K 腾地方）
 #      TOOL_PARSER / REASONING_PARSER(默认 deepseek_v41;置空关闭):DSH 工具调用与思考强度所需
 #      HF_OVERRIDES (JSON,默认空):透传 --hf-overrides(例:改 YaRN factor)。
 #      ⚠️ dict 形式的 hf_overrides **不会传播到投机草稿**(vLLM 已知问题 #37435/#58080)⇒ 改 RoPE 前必须验证接受率
@@ -354,6 +356,10 @@ SPIN_DEFAULT="${SPIN_DEFAULT:-300}"
 #   ⚠️ 只 export 不够：必须同时进下面的 env 文件桥**白名单** + `nohup env` 清单，
 #      否则 EngineCore 会**静默丢弃**它且无任何报错（本文件 :337-344 的 B600 记录）✗
 STAGE_TILE_E="${XIAOTU_GPF_STAGE_TILE_E:-48}"
+# 【2026-10-27】热专家每层上限。⭐ 默认 **0 = 不限 = 旧行为**（审计 M1：不许默认放行）。
+#   要用就显式设 `PIN_MAX_PER_LAYER=9` 或 `XIAOTU_PIN_MAX_PER_LAYER=9`（两个名字都认，
+#   审计 M2：旧写法只认前者 ⇒ 外层 env 设插件名会被静默覆盖）。
+PIN_MAX_PER_LAYER="${PIN_MAX_PER_LAYER:-${XIAOTU_PIN_MAX_PER_LAYER:-0}}"
 XTU_ENV_FILE="${XIAOTU_ENV_FILE:-/tmp/xiaotu_env}"
 {
   echo "XIAOTU_MOE_THREADS=${XIAOTU_MOE_THREADS:-$THREADS_DEFAULT}"
@@ -392,6 +398,10 @@ XTU_ENV_FILE="${XIAOTU_ENV_FILE:-/tmp/xiaotu_env}"
   echo "XIAOTU_ENGRAM_LAST=${XIAOTU_ENGRAM_LAST:-1}"
   # 【2026-10-26】tile ring 尺寸进白名单（否则 EngineCore 静默丢弃 ⇒ 仍是 128，且无报错）
   echo "XIAOTU_GPF_STAGE_TILE_E=$STAGE_TILE_E"
+  # 【2026-10-27】MBT 给插件：profile 期 inter 定长缓冲 = MBT*K 行（预算记账用）
+  echo "XIAOTU_MOE_MBT=$MBT"
+  # 【2026-10-27】热专家每层上限：池在 KV profiling 前分配 ⇒ 每砍 1 槽 ≈ +9.1 MiB KV
+  echo "XIAOTU_PIN_MAX_PER_LAYER=${PIN_MAX_PER_LAYER:-0}"
   # ⭐【2026-10-26】PyTorch 分配器：**expandable_segments**。三次崩溃的共同形态是
   #   "free 只剩 ~1.1 GiB，任何一次临时分配就死"(Xid / 512 MiB OOM / new_empty 失败)，
   #   而 free 很小并不代表总量不够：非 expandable 分配器会把大块切成不可复用的段 ⇒
@@ -490,6 +500,8 @@ fi
   XIAOTU_MOE_ASYNC="${XIAOTU_MOE_ASYNC:-0}" \
   XIAOTU_MOE_SPIN_IDLE_US="${XIAOTU_MOE_SPIN_IDLE_US:-$SPIN_DEFAULT}" \
   XIAOTU_GPF_STAGE_TILE_E="$STAGE_TILE_E" \
+  XIAOTU_MOE_MBT="$MBT" \
+  XIAOTU_PIN_MAX_PER_LAYER="${PIN_MAX_PER_LAYER:-0}" \
   PYTORCH_CUDA_ALLOC_CONF="${PYTORCH_CUDA_ALLOC_CONF:-expandable_segments:False}" \
   ${XIAOTU_MOE_RANK_SPLIT:+XIAOTU_MOE_RANK_SPLIT=$XIAOTU_MOE_RANK_SPLIT} \
   OMP_NUM_THREADS=1 \

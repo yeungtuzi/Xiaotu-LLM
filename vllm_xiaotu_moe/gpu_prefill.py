@@ -29,6 +29,7 @@ in VRAM per layer.
 """
 
 import os
+import sys
 import threading
 import time
 
@@ -488,15 +489,269 @@ def _down_kernel_split(
 # 逐层上涨 ~0.42 GiB,40 层就是 ~17 GiB —— 直接把 free 压到预填充阈值之下。
 # `inter` 是 `torch.empty` 语义(只读被写过的段)⇒ 复用完全等价。
 _BUF_MOE: dict = {}
+_BOUND_BUF_LOGGED: dict = {}
+
+
+_LAST_REPORT = [0.0]
+_LAST_EMPTY_CACHE = [0.0]   # 【2026-10-27】`XIAOTU_EMPTY_CACHE_EVERY_S` 的限频游标
+
+# ⭐【2026-10-27 · 软/硬上限的配套】按"最近使用步号"做**选择性**淘汰。
+# 与 empty_cache 的区别：只丢**空闲 >= max_idle_steps 步**的条目，正在用的一个不动。
+_STEP = [0]
+_LAST_USE: dict = {}
+
+
+def bump_step() -> None:
+    """每个模型步进一次（由 GPU MoE 入口调用）。"""
+    _STEP[0] += 1
+
+
+def _touch(key) -> None:
+    _LAST_USE[key] = _STEP[0]
+
+
+def evict_idle(max_idle_steps: int = 32) -> int:
+    """⚠️【2026-10-27 默认关闭】审计发现：`_SEG_BUF` 等缓冲的设备地址**被烘进 CUDA Graph**，
+    而淘汰判据是"Python 侧最近使用"——图重放**不经过 Python** ⇒ 只被图消费的缓冲会被判空闲、
+    被释放、随后被别的张量复用 ⇒ 图重放写已释放内存 ⇒ `cudaErrorIllegalAddress`（显存可以完全健康）。
+    这类 bug 症状与本次故障完全吻合，因此在把"图引用"纳入判据之前，**淘汰默认不启用**
+    （`XIAOTU_MEM_EVICT=1` 才开）。
+    """
+    if os.environ.get("XIAOTU_MEM_EVICT", "0") != "1":
+        return 0
+    """淘汰"本次用不到"的缓存条目，返回释放的字节数。
+
+    ⚠️ 必须先 `synchronize()`：这些缓冲可能刚被**侧流**写入，Python 侧释放后
+    caching allocator 会把内存再发出去 ⇒ 侧流仍写 = use-after-free（历史事故形态）。
+    """
+    freed = 0
+    torch.cuda.synchronize()
+    # ⛔ `_SEG_BUF` 永不可淘汰：它的设计目的就是"捕获期零分配" ⇒ 地址必然被烘进 CUDA Graph。
+    for cache in (_BUF_CACHE, _BUF_MOE):
+        for k in list(cache.keys()):
+            last = _LAST_USE.get(k, None)
+            if last is None or _STEP[0] - int(last) <= int(max_idle_steps):
+                continue                      # 未知(=可能在用) 或 仍在窗口内 ⇒ 不动
+            v = cache.pop(k, None)
+            _LAST_USE.pop(k, None)
+            for t in (v if isinstance(v, (list, tuple)) else [v]):
+                if isinstance(t, torch.Tensor):
+                    freed += int(t.numel()) * int(t.element_size())
+    return freed
+
+
+
+_CLEANER = {"thread": None, "lock": threading.Lock()}
+
+
+def _cleaner_loop(period_s: float) -> None:
+    """后台清理线程：周期把空闲段还给驱动 + 驱动显存守卫。
+
+    与 forward 路径解耦的**唯一理由**：`empty_cache()`（`cudaFree`）会隐式同步设备，
+    在计算线程上执行会阻塞后续 kernel 提交（最坏 = 一个 prefill chunk 的时间）。
+    在这个线程里同步，GPU 仍在为计算线程干活，摊销损失 ≈ T_free / 间隔。
+    """
+    while True:
+        time.sleep(max(5.0, float(period_s)))
+        try:
+            if capture_in_progress():
+                continue                  # CUDA Graph 捕获期间绝不能动 allocator
+            t0 = time.perf_counter()
+            for _i in range(torch.cuda.device_count()):
+                try:
+                    # ⚠️ `empty_cache()` 不接受参数；传 device 会 TypeError 且被吞 ⇒ 静默失效
+                    with torch.cuda.device(_i):
+                        torch.cuda.empty_cache()
+                except Exception as e:    # noqa: BLE001
+                    print(f"[xtu-vram] empty_cache(cuda:{_i}) 失败: "
+                          f"{type(e).__name__} {e}", flush=True)
+            ms = (time.perf_counter() - t0) * 1000.0
+            dev = torch.device("cuda", torch.cuda.current_device())
+            free, total = torch.cuda.mem_get_info(dev)
+            print(f"[xtu-vram] empty_cache 已执行（耗 {ms:.1f} ms）"
+                  f"⇒ free={int(free) / 2**30:.3f} GiB", flush=True)
+        except Exception:                 # noqa: BLE001
+            pass
+
+
+def _start_cleaner_thread() -> None:
+    with _CLEANER["lock"]:
+        if _CLEANER["thread"] is not None:
+            return
+        period = float(os.environ.get("XIAOTU_EMPTY_CACHE_EVERY_S", "300") or 300)
+        if period <= 0:
+            _CLEANER["thread"] = False    # 显式关闭
+            return
+        t = threading.Thread(target=_cleaner_loop, args=(period,),
+                             name="xtu-mem-cleaner", daemon=True)
+        t.start()
+        _CLEANER["thread"] = t
+        print(f"[xtu-vram] 显存清理线程已启动（周期 {period:.1f} s，独立于 forward 路径）",
+              flush=True)
+
+
+def maybe_report(period_s: float = 60.0, tag: str = "steady") -> None:
+    """每 `period_s` 秒打一次持久缓冲总账（`XIAOTU_VRAM_REPORT=0` 可关）。
+
+    判据：与启动那次 `startup-before-kv` 的 total_bytes **完全相等**即为"不涨"。
+    """
+    if os.environ.get("XIAOTU_VRAM_REPORT", "1") != "1":
+        return
+    now = time.monotonic()
+    if now - _LAST_REPORT[0] < period_s:
+        return
+    _LAST_REPORT[0] = now
+    bump_step()
+    vram_report(tag)
+    if tag == "steady":                    # 启动期不动手（权重加载时 reserved 天然高）
+        # ⭐【2026-10-27 修正】守卫**必须由这条 60 s 遥测驱动**：实测把 tick 只挂在
+        #   清理线程上时，线程首轮 sleep 未到 ⇒ 守卫完全不工作（free 已 50 MiB 仍 guard=0）。
+        #   tick 里的硬限检查只是 `mem_get_info`（微秒级、不同步），可以安全放在这条路径上。
+        try:
+            from . import mem_guard
+            mem_guard.tick(sys.modules[__name__], tag=tag)
+        except Exception:                  # noqa: BLE001
+            pass
+        # ⭐【2026-10-27 · 用户要求】清理**不在 forward 路径上做**：`cudaFree` 会隐式同步设备，
+        # 在计算线程上执行最坏可阻塞一个 32 s 的 prefill chunk（实测 prompt 吞吐 255 tok/s）。
+        # ⇒ 改为独立后台线程：它自己等 sync，计算线程照常发起 kernel。
+        _start_cleaner_thread()
+
+
+def persistent_bytes() -> int:
+    """**我们自己的**持久缓存总量（`evict_idle` 的可淘汰范围就是这个集合）。
+
+    用途：回答"为什么 evict 释放 0 MiB 却有 11 GiB 碎片" —— 那 11 GiB 属于
+    torch 段里**别处**（vLLM 的 workspace 等）的张量，不在本集合内。
+    """
+    total = 0
+    for cache in (_BUF_CACHE, _SEG_BUF, _BUF_MOE, _TILE_RINGS, _LANDING_BUF, _SLOTS):
+        stack = list(cache.values())
+        while stack:
+            v = stack.pop()
+            if isinstance(v, torch.Tensor):
+                total += int(v.numel()) * int(v.element_size())
+            elif isinstance(v, dict):
+                stack.extend(v.values())
+            elif isinstance(v, (list, tuple)):
+                stack.extend(v)
+            else:
+                b = getattr(v, "bufs", None)
+                if b:
+                    stack.extend(b)
+    return total
+
+
+def vram_report(tag: str = "") -> dict:
+    """把所有**持久缓冲**按类别加总并打印 —— "不随时间涨"的机械判据。
+
+    判据：启动打一次（`startup-before-kv`）、跑一段流量后再打，
+    **两组 total_bytes 必须完全相等**；任何上涨都是回归。
+    """
+    def _tensors(cache):
+        out = []
+        stack = list(cache.values())
+        while stack:
+            v = stack.pop()
+            if isinstance(v, torch.Tensor):
+                out.append(v)
+            elif isinstance(v, dict):
+                stack.extend(v.values())
+            elif isinstance(v, (list, tuple)):
+                stack.extend(v)
+            else:
+                b = getattr(v, "bufs", None)
+                if b:
+                    stack.extend(b)
+        return out
+
+    groups = {
+        "moe_reuse(_BUF_MOE)": _BUF_MOE,
+        "seg(_SEG_BUF)": _SEG_BUF,
+        "dma(_BUF_CACHE)": _BUF_CACHE,
+        "tile_ring(_TILE_RINGS)": _TILE_RINGS,
+        "landing(_LANDING_BUF)": _LANDING_BUF,
+        "slots(_SLOTS)": _SLOTS,
+    }
+    total = 0
+    per = {}
+    parts = []
+    for name, cache in groups.items():
+        ts = _tensors(cache)
+        nb = sum(int(t.numel()) * int(t.element_size()) for t in ts)
+        total += nb
+        per[name] = nb
+        parts.append(f"{name}={nb / 2**30:.3f}GiB/{len(ts)}块")
+    print(f"[xtu-vram] {tag or 'report'}: 持久缓冲合计 {total / 2**30:.3f} GiB | "
+          + " ".join(parts), flush=True)
+    # ⭐【2026-10-27 · 用户质疑"为什么涨"】上面只统计**插件自有**缓冲 ⇒ 它"平"**不等于**
+    # 整卡"平"。必须把 allocator 三项分开报，才能机械区分两种完全不同的"涨"：
+    #   · allocated 涨 ⇒ 真有对象没释放（泄漏），要找持有者
+    #   · reserved 涨、allocated 平 ⇒ 缓存/碎片（`expandable_segments:False` 下 reserved
+    #     只增不减，块尺寸种类越多涨得越多）⇒ 修法是固定分配模式或换 expandable，不是"留余量"
+    cuda_stats = {}
+    try:
+        for _i in range(torch.cuda.device_count()):
+            _d = torch.device(f"cuda:{_i}")
+            _a = int(torch.cuda.memory_allocated(_d))
+            _r = int(torch.cuda.memory_reserved(_d))
+            _m = int(torch.cuda.max_memory_allocated(_d))
+            if _a == 0 and _r == 0:
+                # 该进程没有 CUDA 上下文（如 API server）⇒ 不打，免噪声
+                continue
+            _free, _tot = torch.cuda.mem_get_info(_d)
+            cuda_stats[f"cuda:{_i}"] = {
+                "allocated": _a, "reserved": _r, "max_alloc": _m,
+                "frag": _r - _a, "free": int(_free), "total": int(_tot),
+            }
+            print(f"[xtu-vram] {tag or 'report'} cuda:{_i} "
+                  f"allocated={_a / 2**30:.3f} reserved={_r / 2**30:.3f} "
+                  f"max_alloc={_m / 2**30:.3f} frag={(_r - _a) / 2**30:.3f} "
+                  f"free={int(_free) / 2**30:.3f} total={int(_tot) / 2**30:.3f} GiB",
+                  flush=True)
+    except Exception as _e:                       # noqa: BLE001
+        print(f"[xtu-vram] {tag or 'report'} cuda 统计失败: "
+              f"{type(_e).__name__} {_e}", flush=True)
+    # ⭐ 逐次分配的离线快照（`XIAOTU_MEM_TRACE=1` 时按限频落盘）：
+    # 两份快照相减 ⇒ 按**调用栈**聚合差值 ⇒ 直接指出"哪个栈在长"。
+    try:
+        from . import mem_trace as _mt
+        _mt.maybe_dump(tag or "periodic")
+    except Exception:                             # noqa: BLE001
+        pass
+    return {"total_bytes": total, "groups": per, "cuda": cuda_stats}
 
 
 def _reuse_moe(key, shape, dtype, device):
-    k = (str(device), key, tuple(int(v) for v in shape), dtype)
+    """按**定长**复用；行数按 2 的幂向上取整 ⇒ 尺寸类有限，**永不随 qlen 累积**。
+
+    ⚠️ 背景（2026-10-26 审计）：旧实现把**整个 shape**（含行维 `A = T*K`）放进 key ⇒
+    每个新的 chunk 长度都新建一块、模块级 dict 无淘汰 ⇒ 显存随流量"只增不减"。
+    新实现：key 只含**列维**，行维按 2 的幂向上取整（MBT=8192/K=8 ⇒ 收敛到 65536），
+    大于当前容量才扩容一次。`XIAOTU_MOE_BOUND_BUF=0` 回退旧行为。
+    """
+    if os.environ.get("XIAOTU_MOE_BOUND_BUF", "1") != "1":
+        k = (str(device), key, tuple(int(v) for v in shape), dtype)
+        t = _BUF_MOE.get(k)
+        if t is None or tuple(t.shape) != tuple(int(v) for v in shape):
+            t = torch.empty(tuple(int(v) for v in shape), dtype=dtype, device=device)
+            _BUF_MOE[k] = t
+        return t
+    rows = int(shape[0])
+    tail = tuple(int(v) for v in shape[1:])
+    k = (str(device), key, tail, dtype)
     t = _BUF_MOE.get(k)
-    if t is None or tuple(t.shape) != tuple(int(v) for v in shape):
-        t = torch.empty(tuple(int(v) for v in shape), dtype=dtype, device=device)
+    if t is None or int(t.shape[0]) < rows:
+        cap = max(rows, int(t.shape[0]) if t is not None else 0)
+        cap = 1 << max(0, (cap - 1).bit_length())   # 2 的幂
+        t = torch.empty((cap,) + tail, dtype=dtype, device=device)
         _BUF_MOE[k] = t
-    return t
+        if not _BOUND_BUF_LOGGED.get(k):
+            _BOUND_BUF_LOGGED[k] = True
+            print(f"[xtu-bound] {key}: 定长缓冲 {cap}x{tail} "
+                  f"({t.numel() * t.element_size() / 2**20:.0f} MiB, 按 2 的幂上行、只增到上限)",
+                  flush=True)
+    return t[:rows]
 
 
 _SEG_BUF = {}
@@ -511,6 +766,7 @@ def _seg_buf(name, shape, dtype, device, init=None):
         if init is not None:
             init(t)
         _SEG_BUF[k] = t
+    _touch(k)
     return t
 
 
@@ -1289,6 +1545,12 @@ def install_profile_guard() -> list[str]:
                     print("[vllm-xtu-moe] ⛔ profile 期 staging 记账失败(不掩盖)"
                           f" ⇒ 本次 KV 可能按『没有 staging』定容:"
                           f" {type(_e).__name__}: {_e}", flush=True)
+                # ⭐【2026-10-27 修正】预算基线的正确位置 = **预分配之后、KV 定容之前**
+                #   （上一版打在预分配前 ⇒ 恒为 0.000 GiB，等于没有判据 ✗）
+                try:
+                    vram_report("startup-before-kv")
+                except Exception as _e:  # noqa: BLE001
+                    print(f"[xtu-vram] 基线报告失败(不掩盖): {type(_e).__name__}: {_e}", flush=True)
                 # 【MUSA A71】staging 占位必须在 KV 定容前释放（否则运行期多占 1.76 GiB）
                 # 【主线 R34】长上下文激活记账在 orig_dam 期间占住，让 KV 据实少算同样多
                 _lc_res = _reserve_lc_activation()
@@ -1385,8 +1647,8 @@ def staging_tile_experts(n_experts: int) -> int:
     不然显存肯定不够;而且**之前明确要求去掉之前的按层缓冲机制**」✓
     ⇒ 本函数**永不返回 `E`(整层)** —— 按层缓冲那条路**已不存在** ✗
 
-      * **默认(env 未设 / `0` / `>= E`)** ⇒ `max(1, E // 3)`
-        (E=288 时 = **96**,即先前生产在用、且**已实测**过的值 ✓)
+      * **默认(env 未设 / `0` / `>= E`)** ⇒ **48**（2026-10-27 用户裁定；
+        原为 `max(1, E//3)`。实测 tile 128/96/72/48 的 H2D 带宽平坦 ⇒ 更小不亏，显存更省 ✓）
       * `XIAOTU_GPF_STAGE_TILE_E=k` ⇒ 用 k,但**强制夹到 `[1, E-1]`**
         ⇒ ⛔ `=0` **不再能**退回整层(按层路径已删除 ✓)
 
@@ -1402,7 +1664,12 @@ def staging_tile_experts(n_experts: int) -> int:
     except (TypeError, ValueError):
         v = 0
     if v <= 0 or v >= E:
-        v = max(1, E // 3)
+        # ⭐【2026-10-27 · 用户裁定】默认值统一为 **48**（原 `max(1, E//3)`：E=384→128、
+        #   E=288→96）。实测依据（H2D 探针）：tile=128/96/72/48 的 H2D 带宽
+        #   26.83/26.82/26.81/**26.79** GB/s（差 0.15%，平坦）⇒ 更小的 tile **不付性能代价**，
+        #   而显存线性少占（v41 实测环 2.24 → **0.84 GiB**，KV 池多出 1.57 GiB）。
+        #   ⇒ 不再依赖 `serve_v41.sh` 传 env；插件默认即 48（GLM/E=288 同样受益）。
+        v = 48
     return min(max(1, int(v)), E - 1)
 
 
@@ -1479,7 +1746,28 @@ def activation_reserve_bytes() -> int:
     `XIAOTU_GP_ACT_RESERVE_GIB` 覆盖;置 0 恢复旧行为(只比 staging,不建议)。
     """
     try:
-        gib = float(os.environ.get("XIAOTU_GP_ACT_RESERVE_GIB", "3.0"))
+        # ⭐【2026-10-26 · 审计后重定】默认 3.0 → **1.0 GiB**。
+        #   理由（INCIDENT_2026-10-26 §31–§32）：
+        #     * 旧的 3.0 是在"运行期缓冲无界增长"前提下拍的；现在 `_BUF_MOE`/`_BUF_CACHE`
+        #       已按 2 的幂定长，运行期**固定**开销 ≈ inter 512 MiB + dma ~0.1 + 余量
+        #       ⇒ 1.0 GiB 足够覆盖，且不再需要为"不可预测的增长"付 2 GiB。
+        #     * vLLM **自己的**激活峰在它的公式里已单独扣除（`transient_peak_headroom`），
+        #       这里再留 3.0 属于**重复记账** ⇒ KV 池被白扣 2 GiB。
+        #   KV 影响：4.14 → 3.14 GiB ≈ 2.37×512K（仍需满足 2×512K ✓）。
+        # ⭐⭐【2026-10-27 · 用户裁定】"预算准确 + 运行期不涨" 之后**不需要预留**。
+        #   预算准确 = 运行期定长缓冲已在 KV 定容前真分配（`mixed_experts.prealloc_staging`
+        #   的 MXFP4 分支），vLLM 自己测得进 `total_consumed`；
+        #   运行期不涨 = `_BUF_MOE`/`_BUF_CACHE` 已按 2 的幂定长（见 `_reuse_moe`/`_reuse`）。
+        #   ⇒ 默认 0：不再用固定常数猜，也不再重复扣 vLLM 已单独扣除的 activation 峰。
+        #   仍可用 env 覆盖（例如把长上下文实测激活峰再加回来）。
+        # 默认 **0**（用户 2026-10-27 裁定）：inter + tile 环(含 raw 落点) 全部在
+        # profile 期真分配并进账 ⇒ 运行期**不该再有新分配**；真涨了就是 bug，让它立刻崩出来。
+        # 旧的 0.25 只是"落点未并入环"时的保险，现在不需要了。
+        # 原文：默认 0.25 GiB（不是 3.0）：inter + tile 环已在 profile 期真分配并进账，
+        # 这 0.25 只覆盖"DMA 暂存首次分配 + 碎片抖动"——它是一次性、有界的
+        # （每 (which,slot) 一块，2 的幂定长）。首次真实流量后可用 `[xtu-vram]` 复核，
+        # 若实测 DMA 总量已能并入 profile 预分配，则可降到 0。
+        gib = float(os.environ.get("XIAOTU_GP_ACT_RESERVE_GIB", "0.0"))
     except (TypeError, ValueError):
         gib = 3.0
     return int(max(0.0, gib) * 2**30)
@@ -1524,13 +1812,31 @@ _KMADAPTIVE_LOGGED = False
 
 
 def _reuse(key, shape, device):
-    """Get a reusable uint8 buffer of `shape` (allocates once per backend)."""
-    k = (str(device), int(shape[0]) if len(shape) == 1 else -1, tuple(shape))
+    """可复用的 uint8 缓冲；**定长**（字节数按 2 的幂上行，只增到上限）。
+
+    ⚠️ 旧实现把 `shape`（含字节数）放进 key ⇒ 每种 DMA 尺寸都新建一块且永不淘汰。
+    新实现键只含 key/device，容量按 2 的幂上行，超过才扩容一次。
+    `XIAOTU_MOE_BOUND_BUF=0` 回退旧行为。
+    """
+    if os.environ.get("XIAOTU_MOE_BOUND_BUF", "1") != "1":
+        k = (str(device), int(shape[0]) if len(shape) == 1 else -1, tuple(shape))
+        t = _BUF_CACHE.get(k)
+        if t is None or t.shape != tuple(shape) or t.device != torch.device(device):
+            t = torch.empty(tuple(shape), dtype=torch.uint8, device=device)
+            _BUF_CACHE[k] = t
+        return t
+    n = int(shape[0]) if len(shape) == 1 else int(__import__("math").prod(shape))
+    k = (str(device), str(key))
     t = _BUF_CACHE.get(k)
-    if t is None or t.shape != tuple(shape) or t.device != torch.device(device):
-        t = torch.empty(tuple(shape), dtype=torch.uint8, device=device)
+    if t is None or int(t.numel()) < n:
+        cap = 1 << max(0, (max(n, int(t.numel()) if t is not None else 0) - 1).bit_length())
+        t = torch.empty((cap,), dtype=torch.uint8, device=device)
         _BUF_CACHE[k] = t
-    return t
+        if not _BOUND_BUF_LOGGED.get(k):
+            _BOUND_BUF_LOGGED[k] = True
+            print(f"[xtu-bound] dma({key}): 定长缓冲 {cap / 2**20:.1f} MiB", flush=True)
+    _touch(k)
+    return t[:n]
 
 
 def _dma_hostbuf(engine, which: int, node: int, nbytes: int, device) -> torch.Tensor:
@@ -1540,7 +1846,12 @@ def _dma_hostbuf(engine, which: int, node: int, nbytes: int, device) -> torch.Te
     # 【§600】暂存缓冲**每张量一份**(不再每 node 一份)。同一条 stream 上
     # "DMA n → copy n → DMA n+1" 是严格有序的 ⇒ 复用安全;而每 node 一份会让
     # ns 份暂存同时常驻(TP=2 共 3.59 GiB),把真正的 staging 峰值从 ~11 GiB 抬到 ~14 GiB。
-    t = _reuse(("dma", int(which)), (int(nbytes),), device)
+    t = _LANDING.get((str(device), int(which)))
+    if t is None or int(t.numel()) < int(nbytes):
+        # 没预分配(未走 tile 环路径) ⇒ 回退到定长缓存（仍是 2 的幂、一次性）
+        t = _reuse(("dma", int(which)), (int(nbytes),), device)
+    else:
+        t = t[: int(nbytes)]
     stream = torch.cuda.current_stream(device).cuda_stream
     got = engine.copy_hostbuf_to_device(int(which), int(node), t.data_ptr(), stream)
     if int(got) != int(nbytes):
@@ -2175,6 +2486,12 @@ def prefetch_layer(w13, s13, w2, s2, device):
     except RuntimeError as e:  # includes torch.cuda.OutOfMemoryError
         if "out of memory" not in str(e).lower():
             raise
+        # 【2026-10-27】OOM 现场取证（不改变控制流：取证后仍走原来的降级路径）
+        try:
+            from . import mem_guard
+            mem_guard.on_oom(sys.modules[__name__], e, where="prefetch_slot.alloc")
+        except Exception:                     # noqa: BLE001
+            pass
         # vLLM sized the KV cache first; there is no room for ping-pong buffers.
         # Drop the (now useless) slots and disable overlap for this process.
         _SLOTS.pop(key, None)
@@ -2508,6 +2825,54 @@ def gpu_moe_layer_tiled(x, topk_ids, topk_weights, w13, s13, w2, s2,
 
 
 _TILE_RINGS: dict = {}
+_LANDING: dict = {}
+_LANDING_BUF: dict = {}
+
+
+def prealloc_tile_ring(device, E, H, I, group_k=32, nslots: int = 2) -> int:
+    """在 KV 定容**之前**把 tile 环真分配出来（返回字节数）。
+
+    ⭐【2026-10-27】tile 环原来"首次真实预填才分配" ⇒ 0.84 GiB 落在 vLLM 账外，
+    稳态 free 被它吃掉。现在 profile 期就分配 ⇒ 进 `total_consumed` ⇒ KV 据实让位。
+    形状与运行时 `_stage_tiles` 内**同一表达式**（tile/gk/rb13/rb2），不得另写一套。
+    """
+    device = torch.device(device) if not isinstance(device, torch.device) else device
+    tile = staging_tile_experts(int(E))
+    if not tile:
+        return 0
+    gk = int(group_k) if int(group_k) > 0 else 1
+    rb13, rb2 = int(H) // 2, int(I) // 2
+    shapes = ((tile, rb13, 2 * int(I)), (tile, int(H) // gk, 2 * int(I)),
+              (tile, rb2, int(H)), (tile, int(I) // gk, int(H)))
+    # ⚠️【2026-10-27 修正 · 实测教训】落点**不能**塞进同一个 `_tile_ring` 调用里！
+    #   我上一版 `nslots+1=3` 去分配，而运行时用的是 `XIAOTU_GPF_STAGE_NSLOTS`(默认 **2**)
+    #   ⇒ 两者的缓存键不同 ⇒ 运行期**又分配了一整环**：实测 `tile_ring=2.101 GiB/20 块`
+    #   （期望 1.26/12），凭空多出 0.84 GiB 账外增长 ✗。
+    #   现在：环按**运行时的 nslots** 预分配（键必须逐字一致），落点单独一块。
+    if nslots is None:
+        try:
+            nslots = int(os.environ.get("XIAOTU_GPF_STAGE_NSLOTS", "2") or 2)
+        except (TypeError, ValueError):
+            nslots = 2
+    ring = _tile_ring(device, shapes, max(2, int(nslots)))
+    # 落点：大小 = 一个槽的字节数；`which` 顺序与 `_dma_hostbuf` 调用点一致
+    # (0=w13, 1=w2, 2=w13_scale, 3=w2_scale)；node 分片比槽大时 `_dma_hostbuf` 自动回退。
+    _lk = (str(device), "landing", shapes)
+    land = _LANDING_BUF.get(_lk)
+    if land is None:
+        _n = sum(int(t.numel()) for t in ring[0])
+        land = torch.empty(_n, dtype=torch.uint8, device=device)
+        _LANDING_BUF[_lk] = land
+    _off = 0
+    _views = {}
+    for _i in range(4):
+        _n2 = int(ring[0][_i].numel())
+        _views[_i] = land[_off:_off + _n2]
+        _off += _n2
+    for _w, _i in {0: 0, 1: 2, 2: 1, 3: 3}.items():
+        _LANDING[(str(device), _w)] = _views[_i]
+    return (sum(int(t.numel()) * int(t.element_size()) for slot in ring for t in slot)
+            + int(land.numel()))
 
 
 def _tile_ring(device, shapes, nslots):

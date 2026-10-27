@@ -163,6 +163,9 @@ def main():
             time.sleep(10)
         if not healthy:
             log("SKIP: 服务一直不健康")
+            fh.write(json.dumps({"ts": rd.iso(), "item": pid, "skipped": "service_unhealthy"},
+                                ensure_ascii=False) + "\n")
+            fh.flush()
         else:
             try:
                 res = rd.chat(api, model, msgs, args.max_tokens, 0.0, 1.0, args.timeout)

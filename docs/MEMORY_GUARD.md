@@ -214,3 +214,62 @@ python ops/a100-stress/mem_snapshot_diff.py snapA.pickle snapB.pickle
     0.420 GiB  gpu_prefill.py:2719 prealloc_tile_ring <- mixed_experts.py:1560 prealloc_staging
     0.141 GiB  gpu_prefill.py:610 _reuse_moe <- mixed_experts.py:1555 prealloc_staging
 ```
+
+## 5. 与 custom allreduce 的互斥：`expandable_segments` 必须搭配 `--disable-custom-all-reduce`
+
+**结论（2026-10-27 实测，A100 / TP=2 / vLLM V1）**
+
+> **`PYTORCH_CUDA_ALLOC_CONF=expandable_segments:True` 与 vLLM 的 IPC 版 custom allreduce
+> 不可共存。要前者，就必须 `--disable-custom-all-reduce`（本仓 `serve_v41.sh` 的
+> `NO_CUSTOM_AR=1` 即为此开关，默认关）。**
+
+### 为什么（机制）
+
+1. `expandable_segments:True` 让 PyTorch 改用 **CUDA VMM 接口**（`cuMemCreate`/`cuMemMap`）分配显存；
+2. vLLM 的 `custom_all_reduce` 需要在 TP 各 rank 之间**交换显存块的 IPC 句柄**建 P2P 通路；
+3. **VMM 分配的显存不能导出 IPC 句柄** ⇒ 注册阶段返回 `invalid argument`：
+
+```
+Capturing CUDA graphs (FULL): 100%|██████████| 2/2
+Failed: Cuda error /workspace/csrc/custom_all_reduce.cuh:164 'invalid argument'
+Worker proc VllmWorker-0 died unexpectedly (exit code: None)
+EngineCore: RuntimeError: cancelled   ← 卡在 determine_available_memory
+```
+
+4. 该失败发生在 **KV profiling 之后、图捕获完成时**，是**秒级**失败，不是运行期问题。
+
+### 为什么仍然值得开 `expandable_segments`
+
+不开它时（`expandable_segments:False`），碎片形态是"**127 个段各差一点点满**"
+（实测：段利用率中位 **0.937**，其中 72/127 段 >90% 满），而 `empty_cache()` 的判定是**段级**的
+—— 段里只要还有 1 个活块，整段都还不掉。实测对照：
+
+| 配置 | 周期清理的效果 | `reserved` 走势 |
+|---|---|---|
+| `expandable_segments:False` | **释放 0 字节**（30 次清理白做） | 32 → **37.3** GiB 单向爬到墙 |
+| **`expandable_segments:True`（+ 关 custom AR）** | **真的降**：`reserved 32.9→25.7`、碎片 `10.1→2.3`、`free 5.5→12.1` | **25.7 ↔ 28.8** 往复 |
+
+### 代价（实测，可接受）
+
+| 代价 | 数值 |
+|---|---|
+| 每层 allreduce 由 custom AR 改为 NCCL | **0–13 µs**（10 KiB: −0.9 µs；120 KiB: +13.1 µs；多为 1.8–6 µs） |
+| KV 容量 | 1,221,977 → **1,070,006 tokens**（仍 **2.04×** 512K） |
+
+### 历史印证
+
+`scripts/serve_glm53_mainline.sh` 早前就默认"`expandable_segments:True` + `--disable-custom-all-reduce`"，
+其 `:299` 注释记录的同型事故是："PyTorch 已分配 **37.90 GiB**、另有 **695 MiB reserved-but-unallocated**"
+—— 与本手册描述的碎片形态一致。此次是在 A100 生产口径上把**机制**补全：不是 KV connector 的问题，
+而是 **VMM 分配与 IPC 句柄互斥**。
+
+### 如何验证 / 关闭
+
+```bash
+# 启用（推荐）：碎片可回收 + NCCL allreduce
+PYTORCH_CUDA_ALLOC_CONF=expandable_segments:True,garbage_collection_threshold:0.6 \
+NO_CUSTOM_AR=1 bash scripts/serve_v41.sh
+
+# 回到旧行为（custom AR + 不可回收的碎片）
+PYTORCH_CUDA_ALLOC_CONF=expandable_segments:False NO_CUSTOM_AR=0 bash scripts/serve_v41.sh
+```

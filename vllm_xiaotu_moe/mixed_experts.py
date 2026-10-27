@@ -2996,6 +2996,24 @@ class _XiaotuExpertsMixin:
                                     int(_pinp.planes[0].shape[0]), int(_E), int(qlen)), flush=True)
                     cpu_ids = torch.where(_res | _bad, _zids, ids_i32)
                     cpu_w = torch.where(_res, _zw, wts_f32)
+                    # ⛔【2026-10-27 · 用户裁定「宁可浪费电，不要乱 free」】
+                    #   这两块在 `_side` 上创建，却以**裸指针**交给 `engine.cpu_decode` 在
+                    #   **主流**上异步读。少两件事就会 UAF：① allocator 不知道主流还在读 ⇒
+                    #   块回到 `_side` 池后可能被提前复用；② Python 引用一丢，块就可能被判空闲。
+                    #   故：补 `record_stream(主流)` + 进 keepalive（保留最近 8 代，代价 KB 级）。
+                    _cdk = getattr(self, "_cd_keepalive", None)
+                    if _cdk is None:
+                        _cdk = []
+                        self._cd_keepalive = _cdk
+                    _cdk.append((cpu_ids, cpu_w))
+                    if len(_cdk) > 8:
+                        del _cdk[:len(_cdk) - 8]
+                    _main_s = torch.cuda.current_stream()
+                    for _t in (cpu_ids, cpu_w):
+                        try:
+                            _t.record_stream(_main_s)
+                        except Exception:      # noqa: BLE001
+                            pass
                     _ev_mask = getattr(self, "_pin_ev_mask", None)
                     if _ev_mask is None:
                         _ev_mask = torch.cuda.Event()

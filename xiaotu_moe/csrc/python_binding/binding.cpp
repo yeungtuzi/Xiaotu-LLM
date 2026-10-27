@@ -156,8 +156,15 @@ struct CpuDecodeState {
         auto grow = [&](void*& p, size_t& cap, size_t need) {
             if (need <= cap) return;
             if (p) {
-                if (retire) retired.push_back(p);
-                else cudaFreeHost(p);
+                // ⛔【2026-10-27 修复 · 静态审计 C#3】旧缓冲**必须**一律退休，不能 cudaFreeHost：
+                //   ① 已捕获的 CUDA graph 节点里烘着旧 pinned 缓冲的 VA ⇒ 直接释放会让后续
+                //      每次图重放的 D2H/H2D 指向已解映射主机内存 ⇒ cudaErrorIllegalAddress
+                //      （GPU 显存可以完全健康，与 2026-10-27 观测一致）；
+                //   ② 即便不考虑图，本函数内部**先释放**、调用方**后** cudaStreamSynchronize，
+                //      顺序反了 ⇒ 仍在读该缓冲的回调会读到已释放主机内存。
+                // 增长只有少数几步（每步数 MB），退休列表在析构时统一释放，代价可忽略。
+                (void)retire;                 // 保留参数以维持调用约定，行为不再区分
+                retired.push_back(p);
             }
             p = nullptr;
             cudaHostAlloc(&p, need, cudaHostAllocDefault);

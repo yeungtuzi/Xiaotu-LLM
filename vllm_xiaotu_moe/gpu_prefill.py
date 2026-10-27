@@ -29,6 +29,7 @@ in VRAM per layer.
 """
 
 import os
+import sys
 import threading
 import time
 
@@ -492,6 +493,101 @@ _BOUND_BUF_LOGGED: dict = {}
 
 
 _LAST_REPORT = [0.0]
+_LAST_EMPTY_CACHE = [0.0]   # 【2026-10-27】`XIAOTU_EMPTY_CACHE_EVERY_S` 的限频游标
+
+# ⭐【2026-10-27 · 软/硬上限的配套】按"最近使用步号"做**选择性**淘汰。
+# 与 empty_cache 的区别：只丢**空闲 >= max_idle_steps 步**的条目，正在用的一个不动。
+_STEP = [0]
+_LAST_USE: dict = {}
+
+
+def bump_step() -> None:
+    """每个模型步进一次（由 GPU MoE 入口调用）。"""
+    _STEP[0] += 1
+
+
+def _touch(key) -> None:
+    _LAST_USE[key] = _STEP[0]
+
+
+def evict_idle(max_idle_steps: int = 32) -> int:
+    """⚠️【2026-10-27 默认关闭】审计发现：`_SEG_BUF` 等缓冲的设备地址**被烘进 CUDA Graph**，
+    而淘汰判据是"Python 侧最近使用"——图重放**不经过 Python** ⇒ 只被图消费的缓冲会被判空闲、
+    被释放、随后被别的张量复用 ⇒ 图重放写已释放内存 ⇒ `cudaErrorIllegalAddress`（显存可以完全健康）。
+    这类 bug 症状与本次故障完全吻合，因此在把"图引用"纳入判据之前，**淘汰默认不启用**
+    （`XIAOTU_MEM_EVICT=1` 才开）。
+    """
+    if os.environ.get("XIAOTU_MEM_EVICT", "0") != "1":
+        return 0
+    """淘汰"本次用不到"的缓存条目，返回释放的字节数。
+
+    ⚠️ 必须先 `synchronize()`：这些缓冲可能刚被**侧流**写入，Python 侧释放后
+    caching allocator 会把内存再发出去 ⇒ 侧流仍写 = use-after-free（历史事故形态）。
+    """
+    freed = 0
+    torch.cuda.synchronize()
+    # ⛔ `_SEG_BUF` 永不可淘汰：它的设计目的就是"捕获期零分配" ⇒ 地址必然被烘进 CUDA Graph。
+    for cache in (_BUF_CACHE, _BUF_MOE):
+        for k in list(cache.keys()):
+            last = _LAST_USE.get(k, None)
+            if last is None or _STEP[0] - int(last) <= int(max_idle_steps):
+                continue                      # 未知(=可能在用) 或 仍在窗口内 ⇒ 不动
+            v = cache.pop(k, None)
+            _LAST_USE.pop(k, None)
+            for t in (v if isinstance(v, (list, tuple)) else [v]):
+                if isinstance(t, torch.Tensor):
+                    freed += int(t.numel()) * int(t.element_size())
+    return freed
+
+
+
+_CLEANER = {"thread": None, "lock": threading.Lock()}
+
+
+def _cleaner_loop(period_s: float) -> None:
+    """后台清理线程：周期把空闲段还给驱动 + 驱动显存守卫。
+
+    与 forward 路径解耦的**唯一理由**：`empty_cache()`（`cudaFree`）会隐式同步设备，
+    在计算线程上执行会阻塞后续 kernel 提交（最坏 = 一个 prefill chunk 的时间）。
+    在这个线程里同步，GPU 仍在为计算线程干活，摊销损失 ≈ T_free / 间隔。
+    """
+    while True:
+        time.sleep(max(5.0, float(period_s)))
+        try:
+            if capture_in_progress():
+                continue                  # CUDA Graph 捕获期间绝不能动 allocator
+            t0 = time.perf_counter()
+            for _i in range(torch.cuda.device_count()):
+                try:
+                    # ⚠️ `empty_cache()` 不接受参数；传 device 会 TypeError 且被吞 ⇒ 静默失效
+                    with torch.cuda.device(_i):
+                        torch.cuda.empty_cache()
+                except Exception as e:    # noqa: BLE001
+                    print(f"[xtu-vram] empty_cache(cuda:{_i}) 失败: "
+                          f"{type(e).__name__} {e}", flush=True)
+            ms = (time.perf_counter() - t0) * 1000.0
+            dev = torch.device("cuda", torch.cuda.current_device())
+            free, total = torch.cuda.mem_get_info(dev)
+            print(f"[xtu-vram] empty_cache 已执行（耗 {ms:.1f} ms）"
+                  f"⇒ free={int(free) / 2**30:.3f} GiB", flush=True)
+        except Exception:                 # noqa: BLE001
+            pass
+
+
+def _start_cleaner_thread() -> None:
+    with _CLEANER["lock"]:
+        if _CLEANER["thread"] is not None:
+            return
+        period = float(os.environ.get("XIAOTU_EMPTY_CACHE_EVERY_S", "300") or 300)
+        if period <= 0:
+            _CLEANER["thread"] = False    # 显式关闭
+            return
+        t = threading.Thread(target=_cleaner_loop, args=(period,),
+                             name="xtu-mem-cleaner", daemon=True)
+        t.start()
+        _CLEANER["thread"] = t
+        print(f"[xtu-vram] 显存清理线程已启动（周期 {period:.1f} s，独立于 forward 路径）",
+              flush=True)
 
 
 def maybe_report(period_s: float = 60.0, tag: str = "steady") -> None:
@@ -505,7 +601,45 @@ def maybe_report(period_s: float = 60.0, tag: str = "steady") -> None:
     if now - _LAST_REPORT[0] < period_s:
         return
     _LAST_REPORT[0] = now
+    bump_step()
     vram_report(tag)
+    if tag == "steady":                    # 启动期不动手（权重加载时 reserved 天然高）
+        # ⭐【2026-10-27 修正】守卫**必须由这条 60 s 遥测驱动**：实测把 tick 只挂在
+        #   清理线程上时，线程首轮 sleep 未到 ⇒ 守卫完全不工作（free 已 50 MiB 仍 guard=0）。
+        #   tick 里的硬限检查只是 `mem_get_info`（微秒级、不同步），可以安全放在这条路径上。
+        try:
+            from . import mem_guard
+            mem_guard.tick(sys.modules[__name__], tag=tag)
+        except Exception:                  # noqa: BLE001
+            pass
+        # ⭐【2026-10-27 · 用户要求】清理**不在 forward 路径上做**：`cudaFree` 会隐式同步设备，
+        # 在计算线程上执行最坏可阻塞一个 32 s 的 prefill chunk（实测 prompt 吞吐 255 tok/s）。
+        # ⇒ 改为独立后台线程：它自己等 sync，计算线程照常发起 kernel。
+        _start_cleaner_thread()
+
+
+def persistent_bytes() -> int:
+    """**我们自己的**持久缓存总量（`evict_idle` 的可淘汰范围就是这个集合）。
+
+    用途：回答"为什么 evict 释放 0 MiB 却有 11 GiB 碎片" —— 那 11 GiB 属于
+    torch 段里**别处**（vLLM 的 workspace 等）的张量，不在本集合内。
+    """
+    total = 0
+    for cache in (_BUF_CACHE, _SEG_BUF, _BUF_MOE, _TILE_RINGS, _LANDING_BUF, _SLOTS):
+        stack = list(cache.values())
+        while stack:
+            v = stack.pop()
+            if isinstance(v, torch.Tensor):
+                total += int(v.numel()) * int(v.element_size())
+            elif isinstance(v, dict):
+                stack.extend(v.values())
+            elif isinstance(v, (list, tuple)):
+                stack.extend(v)
+            else:
+                b = getattr(v, "bufs", None)
+                if b:
+                    stack.extend(b)
+    return total
 
 
 def vram_report(tag: str = "") -> dict:
@@ -550,7 +684,42 @@ def vram_report(tag: str = "") -> dict:
         parts.append(f"{name}={nb / 2**30:.3f}GiB/{len(ts)}块")
     print(f"[xtu-vram] {tag or 'report'}: 持久缓冲合计 {total / 2**30:.3f} GiB | "
           + " ".join(parts), flush=True)
-    return {"total_bytes": total, "groups": per}
+    # ⭐【2026-10-27 · 用户质疑"为什么涨"】上面只统计**插件自有**缓冲 ⇒ 它"平"**不等于**
+    # 整卡"平"。必须把 allocator 三项分开报，才能机械区分两种完全不同的"涨"：
+    #   · allocated 涨 ⇒ 真有对象没释放（泄漏），要找持有者
+    #   · reserved 涨、allocated 平 ⇒ 缓存/碎片（`expandable_segments:False` 下 reserved
+    #     只增不减，块尺寸种类越多涨得越多）⇒ 修法是固定分配模式或换 expandable，不是"留余量"
+    cuda_stats = {}
+    try:
+        for _i in range(torch.cuda.device_count()):
+            _d = torch.device(f"cuda:{_i}")
+            _a = int(torch.cuda.memory_allocated(_d))
+            _r = int(torch.cuda.memory_reserved(_d))
+            _m = int(torch.cuda.max_memory_allocated(_d))
+            if _a == 0 and _r == 0:
+                # 该进程没有 CUDA 上下文（如 API server）⇒ 不打，免噪声
+                continue
+            _free, _tot = torch.cuda.mem_get_info(_d)
+            cuda_stats[f"cuda:{_i}"] = {
+                "allocated": _a, "reserved": _r, "max_alloc": _m,
+                "frag": _r - _a, "free": int(_free), "total": int(_tot),
+            }
+            print(f"[xtu-vram] {tag or 'report'} cuda:{_i} "
+                  f"allocated={_a / 2**30:.3f} reserved={_r / 2**30:.3f} "
+                  f"max_alloc={_m / 2**30:.3f} frag={(_r - _a) / 2**30:.3f} "
+                  f"free={int(_free) / 2**30:.3f} total={int(_tot) / 2**30:.3f} GiB",
+                  flush=True)
+    except Exception as _e:                       # noqa: BLE001
+        print(f"[xtu-vram] {tag or 'report'} cuda 统计失败: "
+              f"{type(_e).__name__} {_e}", flush=True)
+    # ⭐ 逐次分配的离线快照（`XIAOTU_MEM_TRACE=1` 时按限频落盘）：
+    # 两份快照相减 ⇒ 按**调用栈**聚合差值 ⇒ 直接指出"哪个栈在长"。
+    try:
+        from . import mem_trace as _mt
+        _mt.maybe_dump(tag or "periodic")
+    except Exception:                             # noqa: BLE001
+        pass
+    return {"total_bytes": total, "groups": per, "cuda": cuda_stats}
 
 
 def _reuse_moe(key, shape, dtype, device):
@@ -597,6 +766,7 @@ def _seg_buf(name, shape, dtype, device, init=None):
         if init is not None:
             init(t)
         _SEG_BUF[k] = t
+    _touch(k)
     return t
 
 
@@ -1665,6 +1835,7 @@ def _reuse(key, shape, device):
         if not _BOUND_BUF_LOGGED.get(k):
             _BOUND_BUF_LOGGED[k] = True
             print(f"[xtu-bound] dma({key}): 定长缓冲 {cap / 2**20:.1f} MiB", flush=True)
+    _touch(k)
     return t[:n]
 
 
@@ -2315,6 +2486,12 @@ def prefetch_layer(w13, s13, w2, s2, device):
     except RuntimeError as e:  # includes torch.cuda.OutOfMemoryError
         if "out of memory" not in str(e).lower():
             raise
+        # 【2026-10-27】OOM 现场取证（不改变控制流：取证后仍走原来的降级路径）
+        try:
+            from . import mem_guard
+            mem_guard.on_oom(sys.modules[__name__], e, where="prefetch_slot.alloc")
+        except Exception:                     # noqa: BLE001
+            pass
         # vLLM sized the KV cache first; there is no room for ping-pong buffers.
         # Drop the (now useless) slots and disable overlap for this process.
         _SLOTS.pop(key, None)

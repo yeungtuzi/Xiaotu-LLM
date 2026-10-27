@@ -183,3 +183,12 @@ mainline_shims.apply_mainline_shims()
 _ple_hooks = ple_offload.install()
 if _ple_hooks:
     print(f"[vllm-xtu-moe/ple] PLE 表走主机内存: {', '.join(_ple_hooks)}", flush=True)
+
+# ⭐【2026-10-27】逐次显存分配插桩（`XIAOTU_MEM_TRACE=1` 才生效）。
+# 必须在**模型加载前**开启，否则权重的分配点抓不到 ⇒ 放在包导入尾部、越早越好。
+# 任何异常都吞掉：诊断能力绝不能影响服务启动。
+try:
+    from . import mem_trace as _mem_trace
+    _mem_trace.start()
+except Exception as _e:                      # noqa: BLE001
+    print(f"[xtu-mem] 插桩未启用: {type(_e).__name__} {_e}", flush=True)

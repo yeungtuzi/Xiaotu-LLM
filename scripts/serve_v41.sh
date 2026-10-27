@@ -21,7 +21,7 @@
 #   bash scripts/serve_v41.sh                 # dummy weights (fast bring-up)
 #   LOAD=auto bash scripts/serve_v41.sh       # real weights (~long load)
 #
-# Env: TAG PORT GPUS TP MAXLEN LOAD GPU_UTIL EXTRA_ENV MAXSEQS
+# Env: TAG PORT GPUS TP MAXLEN LOAD GPU_UTIL EXTRA_ENV MAXSEQS NO_CUSTOM_AR
 #      PIN_MAX_PER_LAYER(默认 0=不限;也可写 XIAOTU_PIN_MAX_PER_LAYER):热专家每层常驻上限，
 #        池在 KV profiling 前分配 ⇒ 每砍 1 槽 ≈ +9.1 MiB KV（用途：给 2×512K 腾地方）
 #      TOOL_PARSER / REASONING_PARSER(默认 deepseek_v41;置空关闭):DSH 工具调用与思考强度所需
@@ -208,6 +208,14 @@ DEFAULT_CHAT_KWARGS="${DEFAULT_CHAT_KWARGS-{\"thinking\":true}}"   # 解析器�
 #   上游 #56752 复用 `CacheConfig.swa_bounded_replay`,没有单独的 CED 旗标,
 #   所以 A/B 只能靠这个旗标;两臂必须**各起一次服务**(旗标在 CacheConfig 构造时读取,
 #   服务起来后改不了)。
+#
+# NO_CUSTOM_AR(默认 **0** = 不传旗标,行为逐字不变):
+#   =1 时追加 `--disable-custom-all-reduce`,让 TP 通信退回 NCCL。
+#   **为什么需要**:`PYTORCH_CUDA_ALLOC_CONF=expandable_segments:True` 用 CUDA VMM 分配显存,
+#   而 VMM 显存**不能导出为 IPC 句柄** ⇒ vLLM 的 custom_all_reduce 在 KV profiling 阶段
+#   报 `custom_all_reduce.cuh:164 'invalid argument'`,Worker 被信号杀死(2026-10-27 两次实测)。
+#   只认 `=1`(与 CED/EAGER 同约定;`true`/`yes` 会被当作关闭)。
+#
 #   ⚠️ 该机制要求 **Model Runner V2**(否则 attention.py 会 warning_once 后自行关闭):
 #   日志里若出现 "SWA bounded replay needs model runner V2" 就说明 CED 没生效。
 CED="${CED:-1}"
@@ -523,6 +531,7 @@ fi
     $( [ "${PROMPT_TOKENS_DETAILS:-1}" = "1" ] && echo --enable-prompt-tokens-details ) \
     $( [ "${EAGER:-0}" = "1" ] && echo --enforce-eager )  \
     $( [ "${CED:-1}" = "0" ] && echo --no-swa-bounded-replay ) \
+    $( [ "${NO_CUSTOM_AR:-0}" = "1" ] && echo --disable-custom-all-reduce ) \
     $( [ "${SPEC:-1}" = "1" ] && echo --speculative-config "$SPEC_CONFIG" )  \
     $( [ -n "$CC_JSON" ] && printf -- '--compilation-config %s' "$CC_JSON" ) \
     $( [ "${PREFIX_CACHE:-1}" = "1" ] || echo --no-enable-prefix-caching ) --trust-remote-code \

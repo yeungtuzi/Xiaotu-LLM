@@ -1,0 +1,22 @@
+From: Xiaotu-LLM <xiaotu@local>
+Subject: [PATCH 0017] fix: workspace 扩容前先 synchronize 再 empty_cache（expandable_segments 下解映射物理页导致异步非法访存）
+
+CUDA graphs 与 expandable_segments 并存时，workspace 在 prefill 前向中途扩容会调用
+empty_cache()；expandable_segments 下该调用会解映射物理页，而上一轮 workspace 视图可能
+仍被在飞 kernel 引用 ⇒ cudaErrorIllegalAddress（异步，在下一次 synchronize 才暴露）。
+修复：释放前先 torch.accelerator.synchronize()。
+
+--- a/vllm/v1/worker/workspace.py	2026-10-27 20:57:50.619439488 +0000
++++ b/vllm/v1/worker/workspace.py
+@@ -262,6 +262,11 @@
+             # allocation below. Without this, each resize may leave a
+             # dead segment in reserved memory which can cause higher peak
+             # memory usage.
++            # ⛔ [xtu] expandable_segments 下 empty_cache() 会**解映射物理页**；
++            #    若此刻仍有 kernel 在飞（上一轮的 workspace 视图仍被 kernel 引用），
++            #    解映射后再访问即 cudaErrorIllegalAddress（异步、暴露在下一次同步）。
++            #    ⇒ 释放前必须先同步设备（2026-10-28 r93/r94/r95 的非法访存根因）。
++            torch.accelerator.synchronize()
+             torch.accelerator.empty_cache()
+             # In sleep mode, entering the pool also trims outgrown buffers.
+             with self._alloc_context():

@@ -559,8 +559,13 @@ def _cleaner_loop(period_s: float) -> None:
             t0 = time.perf_counter()
             for _i in range(torch.cuda.device_count()):
                 try:
-                    # ⚠️ `empty_cache()` 不接受参数；传 device 会 TypeError 且被吞 ⇒ 静默失效
+                    # ⛔ 先同步设备，再 empty_cache：`expandable_segments` 下它会把物理页
+                    #    **解映射**；若此时仍有 kernel 在使用某块（裸指针缓冲不在 allocator
+                    #    的流追踪里），解映射后再访问就是 cudaErrorIllegalAddress，
+                    #    且直到下次 synchronize 才报（2026-10-28 r93/r94 的形态）。
                     with torch.cuda.device(_i):
+                        torch.cuda.synchronize(_i)
+                        # ⚠️ `empty_cache()` 不接受参数；传 device 会 TypeError 且被吞 ⇒ 静默失效
                         torch.cuda.empty_cache()
                 except Exception as e:    # noqa: BLE001
                     print(f"[xtu-vram] empty_cache(cuda:{_i}) 失败: "

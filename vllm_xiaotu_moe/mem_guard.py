@@ -155,6 +155,9 @@ def tick(gp, tag: str = "", min_interval_s: float = 5.0) -> None:
                 # ⚠️ 本 PyTorch 版本 `empty_cache()` **不接受参数**（传 device 会 TypeError，
                 #    而异常被吞 ⇒ 清理静默失效，2026-10-27 实测踩到）。切设备用上下文。
                 with torch.cuda.device(dev):
+                    # ⛔ 同步后再清（同 gpu_prefill 清理线程的注释）：expandable 下会解映射物理页，
+                    #    绝不能在还有 kernel 在飞时做。
+                    torch.cuda.synchronize(dev)
                     torch.cuda.empty_cache()
             except Exception as e:                    # noqa: BLE001
                 _err = f"{type(e).__name__}: {str(e)[:120]}"

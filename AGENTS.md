@@ -49,7 +49,7 @@
 
 | 用途 | 路径 | 分支 | 说明 |
 |---|---|---|---|
-| **唯一工作树（唯一主线）** | `/root/lvllm/repos/vllm-xiaotu-moe` | `main` | 只有这一棵；基准树与 MUSA 归档均已删除（2026-10-27） |
+| **唯一工作树（唯一主线）** | `/root/lvllm/repos/xiaotu-llm` | `main` | 只有这一棵；基准树与 MUSA 归档均已删除（2026-10-27） |
 
 ⚠️ 2026-10-27 之前的"基准 / 编译树 `/root/lvllm/repos/vllm-mainline`"与"`archive/musa-merged-20261026`"**已不存在**；
 文档里凡提到它们的地方，一律以本条为准。

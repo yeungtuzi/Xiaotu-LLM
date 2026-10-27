@@ -78,10 +78,10 @@ VLLM_USE_PRECOMPILED=1 pip install -e .  # 复用预编译算子,避免长时间
 
 ---
 
-## 2. 安装 vllm-xtu-moe
+## 2. 安装 Xiaotu-LLM
 
 **方式 A(推荐,v0.2.2 起):直接装 whl,不需要本地编译器** —— GitHub Release 页面
-([`v0.2.2`](https://github.com/yeungtuzi/vllm-xtu-moe/releases/tag/v0.2.2))附带
+([`v0.2.2`](https://github.com/yeungtuzi/Xiaotu-LLM/releases/tag/v0.2.2))附带
 
 ```
 vllm_xtu_moe-0.2.2-cp312-cp312-manylinux_2_34_x86_64.whl
@@ -100,7 +100,7 @@ pip install ./vllm_xtu_moe-0.2.2-cp312-cp312-manylinux_2_34_x86_64.whl   # vLLM 
 **方式 B:源码安装(需要构建引擎)**
 
 ```bash
-git clone https://github.com/yeungtuzi/vllm-xtu-moe.git
+git clone https://github.com/yeungtuzi/Xiaotu-LLM.git
 cd vllm-xtu-moe
 
 # 2a) 构建内置 CPU 引擎的原生扩展(生成 6 个 ISA 变体,约 3-6 分钟)

@@ -33,7 +33,7 @@
 
 ## 分支 / 工作树
 
-- 主开发树：`/root/lvllm/repos/vllm-xiaotu-moe`（`main`）
+- 主开发树：`/root/lvllm/repos/xiaotu-llm`（`main`）
 - 基准 / 编译树：`/root/lvllm/repos/vllm-mainline`（**detached @ `main`**，只读/基准，不提交）
 - ⭐ **纪律：主线 = `main`，没有 `mainline`**。开发从 `main` 开短命 `topic/*`，验收后合并回 `main` 并删除；
   不要再恢复 `dev/mainline` / `feature/musa-correctness`。

@@ -1,7 +1,7 @@
-# vllm-xtu-moe
+# Xiaotu-LLM
 
-[![Version](https://img.shields.io/github/v/tag/yeungtuzi/vllm-xtu-moe?label=version&color=blue)](https://github.com/yeungtuzi/vllm-xtu-moe/releases)
-[![License](https://img.shields.io/github/license/yeungtuzi/vllm-xtu-moe?color=lightgrey)](LICENSE)
+[![Version](https://img.shields.io/github/v/tag/yeungtuzi/Xiaotu-LLM?label=version&color=blue)](https://github.com/yeungtuzi/Xiaotu-LLM/releases)
+[![License](https://img.shields.io/github/license/yeungtuzi/Xiaotu-LLM?color=lightgrey)](LICENSE)
 [![vLLM](https://img.shields.io/badge/vLLM-plugin-blueviolet)](https://github.com/vllm-project/vllm)
 [![CPU](https://img.shields.io/badge/CPU-AVX512--VNNI%20%C2%B7%20BF16%20%C2%B7%20MXFP4%20%C2%B7%20FP8-orange)](#project-highlights)
 [![Platform](https://img.shields.io/badge/Platform-2%C3%97%20EPYC%209654%20%2B%203%C3%97%20A100-76b900)](#measurement-host)
@@ -9,10 +9,19 @@
 
 > **v0.2.9**: Qwen3.8-Flash-Next expert-layer residency — 12 selected layers fully resident, decode 46.3/92.9/127.3 tok/s at C=1/2/4; CUDA Graph capture crash fixed. See [release notes](RELEASE_NOTES_v0.2.9.md).
 
-> **XTU = X Transformers Unity** (pronounced *"xiao tu"*, Chinese for "little rabbit") —
-> a **high-performance MoE inference acceleration layer**.
+> **Xiaotu-LLM** (pronounced "shyau-too L-L-M", Chinese for "little rabbit") —
+> an **inference architecture for MoE models far larger than GPU memory**, shipped as a vLLM plugin.
 >
-> It is a **vLLM plugin for very large MoE models**. The core idea is **tiered data placement**,
+> The name expands to **eXpert Inference with Adaptive Orchestration of Tiered Units**:
+> experts and layers are *tiered* across GPU, CPU and NVMe, and a single scheduler
+> *orchestrates* prefetch, residency and compute overlap, so inference stays efficient
+> even when GPU memory holds only a fraction of the weights.
+>
+> ⚠️ Naming history: the project was previously published as **vllm-xtu-moe** (abbreviated XTU);
+> since 2026-10 it is **Xiaotu-LLM**, while the compute engine keeps the name **xiaotu-moe**.
+> Historical documents retain the old name as a matter of record.
+>
+> The core idea is **tiered data placement**,
 > with one scheduler handling swap-in, prefetch and overlap across tiers:
 >
 > * **Resident GPU**: attention/KV, dense and drafter — the parts used every step;

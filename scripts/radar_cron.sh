@@ -3,11 +3,11 @@
 # 不把 API key 写进本文件；运行时从 root-only 的 DSH credential 文件读取。
 set -euo pipefail
 
-ROOT="/root/lvllm/repos/vllm-xiaotu-moe"
+ROOT="/root/lvllm/repos/xiaotu-llm"
 LOG_DIR="$ROOT/dev-docs/report/tuning/logs"
 LOG="$LOG_DIR/radar_cron.log"
 LOCK="/tmp/vllm_xtu_radar_cron.lock"
-PROMPT='你是“参考项目雷达”的定期维护任务，不需要询问用户。工作目录固定为 /root/lvllm/repos/vllm-xiaotu-moe。
+PROMPT='你是“参考项目雷达”的定期维护任务，不需要询问用户。工作目录固定为 /root/lvllm/repos/xiaotu-llm。
 
 步骤：
 1) 先运行 `bash scripts/research_preflight.sh`，并阅读命中的本地台账；不要凭记忆下结论。

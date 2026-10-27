@@ -1,4 +1,4 @@
-# 安装指南 v0.2:mainline vLLM + vllm-xtu-moe
+# 安装指南 v0.2:mainline vLLM + Xiaotu-LLM
 
 > 本文档**就是本项目从零验证的过程记录**:下面每一步都是在本机按顺序真实执行过的命令与输出,
 > 你照着做就能得到同样的结果。凡"实测"字样后面都是真实观测,不是预期。
@@ -61,7 +61,7 @@ VLLM_USE_PRECOMPILED=1 pip install -e .     # 复用官方预编译二进制,避
 
 ---
 
-## 3. 应用 vllm-xtu-moe 补丁
+## 3. 应用 Xiaotu-LLM 补丁
 
 补丁位于本仓库 `patches/upstream/`,**按"上游 PR"组织**,并针对 vLLM 主线
 **`dabc4362b`(2026-09-14)** 重新生成:
@@ -99,7 +99,7 @@ DRY=1 bash scripts/apply_xtu_patches.sh "$TREE"
 
 ---
 
-## 4. 安装 vllm-xtu-moe 插件
+## 4. 安装 Xiaotu-LLM 插件
 
 ```bash
 pip install vllm_xtu_moe-0.2.0-<tag>.whl

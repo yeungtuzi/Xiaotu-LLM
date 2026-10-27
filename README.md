@@ -1,7 +1,7 @@
-# vllm-xtu-moe
+# Xiaotu-LLM
 
-[![Version](https://img.shields.io/github/v/tag/yeungtuzi/vllm-xtu-moe?label=version&color=blue)](https://github.com/yeungtuzi/vllm-xtu-moe/releases)
-[![License](https://img.shields.io/github/license/yeungtuzi/vllm-xtu-moe?color=lightgrey)](LICENSE)
+[![Version](https://img.shields.io/github/v/tag/yeungtuzi/Xiaotu-LLM?label=version&color=blue)](https://github.com/yeungtuzi/Xiaotu-LLM/releases)
+[![License](https://img.shields.io/github/license/yeungtuzi/Xiaotu-LLM?color=lightgrey)](LICENSE)
 [![vLLM](https://img.shields.io/badge/vLLM-plugin-blueviolet)](https://github.com/vllm-project/vllm)
 [![CPU](https://img.shields.io/badge/CPU-AVX512--VNNI%20%C2%B7%20BF16%20%C2%B7%20MXFP4%20%C2%B7%20FP8-orange)](#项目特色)
 [![Platform](https://img.shields.io/badge/Platform-2%C3%97%20EPYC%209654%20%2B%203%C3%97%20A100-76b900)](#实测平台)
@@ -9,10 +9,16 @@
 
 > **v0.2.9**:针对 **Qwen3.8-Flash-Next** 优化 —— 新增**专家层常驻**(12 层精选,decode 46.3/92.9/127.3 tok/s @C=1/2/4),并修复 CUDA Graph 捕获崩溃。详见 [发行说明](RELEASE_NOTES_v0.2.9.md)。
 
-> **XTU = X Transformers Unity**(读音:汉语「小兔」)—— 一个**高性能 MoE 推理加速层**。
+> **Xiaotu-LLM**(读音:小兔-LLM)—— 一个面向**超大 MoE 模型**的**推理架构**,以 vLLM 插件形式提供。
 >
-> 这是一个面向**超大 MoE 模型**的 **vLLM 插件**。核心思路是**数据分层放置**,
-> 再由一个统一调度器在层间换入、预取和重叠:
+> 名字展开为 **eXpert Inference with Adaptive Orchestration of Tiered Units**:
+> 专家与层被**分层放置**,再由一个统一调度器**编排**预取、驻留与计算重叠 ——
+> 即使显存只够放下权重的一个零头,仍能高效推理。
+>
+> ⚠️ 名称沿革:本项目早期称 **vllm-xtu-moe**(当时缩写写作 XTU),2026-10 起统一为 **Xiaotu-LLM**;
+> 计算引擎仍叫 **xiaotu-moe**。历史文档中的旧名按当时事实保留。
+>
+> 核心思路是**数据分层放置**:
 >
 > * **GPU 常驻**:attention/KV、dense、drafter 等**每步都要用**的部分;
 > * **GPU 动态换入**:热专家池/热层,按路由与预算**按需驻留**;

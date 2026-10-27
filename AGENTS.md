@@ -34,6 +34,12 @@
 
 > **用户原话**：「我心目中没有什么mainline就是main」「都切换回main，并记录纪律“主线=main，没有mainline”」
 
+- ⛔⛔⛔ **【2026-10-27 用户明令·最终形态】从此刻起只有一条单线：`main`**
+  > 用户原话：「**从现在起只有一个单线就是main**」
+  * 远端只保留 `origin/main`（`feature/musa-correctness` 已于本日删除）；
+  * 本地只保留 `main`（`topic/*`、`archive/*`、`diag/*`、`dev/*`、`names`、`p2/*` 全部已删）；
+  * ⛔ **不得再新开基准树 / 归档树 / 第二棵 worktree**（`/root/lvllm/repos/vllm-mainline` 已于本日删除）；
+  * 唯一例外：正在开发的**短命** `topic/*`，**合并回 `main` 当轮即删**，不得留存。
 - ⛔ **不再存在 `dev/mainline` / `feature/musa-correctness` 这类长命线名**；远端 `dev/mainline` 已删除。
 - ✅ 唯一主线 = **`main`**；开发从 `main` 切短命 `topic/*`，验收后合并回 `main` 并删除。
 - ✅ CUDA 与 MUSA 是**同一份代码的两条运行时路径**（`GPU_DEVICE` 门控），不是两条分支。
@@ -43,9 +49,10 @@
 
 | 用途 | 路径 | 分支 | 说明 |
 |---|---|---|---|
-| 主开发树 | `/root/lvllm/repos/vllm-xiaotu-moe` | `main` | 唯一主线 |
-| 基准 / 编译树 | `/root/lvllm/repos/vllm-mainline` | detached @ `main` | 只读 / 基准；不提交 |
-| MUSA 归档 | 主树 | `archive/musa-merged-20261026` | 仅历史锚点，不再开发 |
+| **唯一工作树（唯一主线）** | `/root/lvllm/repos/vllm-xiaotu-moe` | `main` | 只有这一棵；基准树与 MUSA 归档均已删除（2026-10-27） |
+
+⚠️ 2026-10-27 之前的"基准 / 编译树 `/root/lvllm/repos/vllm-mainline`"与"`archive/musa-merged-20261026`"**已不存在**；
+文档里凡提到它们的地方，一律以本条为准。
 
 ### 历史：双开发线（2026-10-22 ~ 2026-10-26，已结束）
 
@@ -247,7 +254,8 @@ grep -n "^## " dev-docs/USER_QA_LEDGER.md             # 错题本(#322 条),同�
 2. ✅ **新特性开发**是允许新建**开发树**的情形 —— **一条特性至多一棵**开发树 ✓
 3. ⭐ **验收完成后必须合并回【唯一主线】**,随后 **`git worktree remove` 掉那棵开发树** ✓
    ⇒ 目的:**便于与上游 rebase** —— 避免多棵树各自漂移、各编一份 `.so`、`PYTHONPATH` 各指一处 ✗
-4. ⭐ **树上限 = 唯一主线 + 至多一条在用开发树**;同时存在两棵以上 ⇒ **违规** ✗
+4. ⭐⛔ **树上限 = 1 棵（唯一主线 `main`）**（2026-10-27 用户明令收紧，取代"主线+一条开发树"）：
+   同时存在两棵以上 ⇒ **违规** ✗；确需特性开发时最多临时加一棵，**合并回 `main` 当轮即 `git worktree remove`** ✓
 5. ⛔ 临时预演仍只在 `/tmp` 下做、**用完即 `git worktree prune`** ✗
    (历史教训:分叉出 **7 棵树**,收敛成本极高 ✓)
 6. ⭐ 机械自检:`git worktree list`(排除 prunable)应 **≤ 2 条**;有 prunable ⇒ 立即 prune ✓

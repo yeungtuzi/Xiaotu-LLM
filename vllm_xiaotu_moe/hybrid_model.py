@@ -1161,6 +1161,10 @@ class CpuXiaotuMoE(nn.Module):
         """Async H2D of this layer's GPU weights (issued by the previous layer)."""
         if self.engine is None or self._gpu_resident:
             return   # 常驻层权重已在显存,不需要 ping-pong 预取
+        # 【诊断开关】XIAOTU_MOE_PREFETCH=0 ⇒ 关闭侧流 ping-pong 预取，退回同步 H2D。
+        # 默认 "1" = 保持既有行为（预取开启）。仅用于隔离"侧流 DMA 是否参与非法访存"。
+        if os.environ.get("XIAOTU_MOE_PREFETCH", "1").strip() == "0":
+            return
         from vllm_xiaotu_moe.gpu_prefill import _pinned_kmajor, prefetch_layer
 
         w13, s13, w2, s2, _, _, _ = self._gpu_shard()

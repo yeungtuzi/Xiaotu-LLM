@@ -384,7 +384,9 @@ KV 池相应变小;短上下文(≤8K)完全够用,长上下文需要在"TTFT"�
 ## 6. 复现方式
 
 ```bash
-python scripts/bench_cpu_engine.py            # CPU 引擎(真实路由)
+# ⚠️ CPU 引擎基准要的是**模型目录**(含 model-*.safetensors)，不是 npz 固定件
+#    (fixtures/*.npz 是 test_block23_equiv.py 的 16 专家单元测试数据，两者别混)
+XIAOTU_LAYER1_NPZ=<ckpt>/snapshots/master LAYER=3 BS=8,512 python scripts/bench_cpu_engine.py
 python scripts/bench_fp8_engine.py            # FP8 引擎
 python scripts/bench_llm.py                   # 端到端 decode 吞吐
 python scripts/server_concurrency_test.py     # 并发

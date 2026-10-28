@@ -17,9 +17,25 @@ from safetensors import safe_open
 REPO = os.path.dirname(os.path.dirname(os.path.abspath(__file__)))
 sys.path.insert(0, REPO)
 
+# ⚠️ 变量名有历史包袱：`XIAOTU_LAYER1_NPZ` 在 `test_block23_equiv.py` 等**逐位对齐**脚本里
+#    指的是 npz 固定件**文件**（`fixtures/real_layer1_model.npz`，16 专家、预打包的单元测试数据），
+#    而本基准要的是**模型目录**（含 `model-*.safetensors`，从真实 checkpoint 取全部专家）。
+#    ⇒ 两者不是同一个东西；传错以前只会得到含糊的 "shard not found"。
 MODEL = os.environ.get("XIAOTU_LAYER1_NPZ", "")
 if not MODEL:
-    raise SystemExit("set XIAOTU_LAYER1_NPZ=<real layer-1 npz fixture> (see docs/BENCHMARKS.md)")
+    raise SystemExit(
+        "set XIAOTU_LAYER1_NPZ=<模型目录>（需含 model-*.safetensors，见 docs/BENCHMARKS.md）\n"
+        "  ⚠️ 不要传 fixtures/*.npz —— 那是 test_block23_equiv.py 的单元测试固定件，不是 checkpoint"
+    )
+if os.path.isfile(MODEL):
+    raise SystemExit(
+        f"XIAOTU_LAYER1_NPZ 指向的是文件：{MODEL}\n"
+        "  本基准需要**模型目录**（含 model-*.safetensors），例如：\n"
+        "    XIAOTU_LAYER1_NPZ=<ckpt>/snapshots/master LAYER=3 python scripts/bench_cpu_engine.py\n"
+        "  ⚠️ fixtures/real_layer1_model.npz 是 test_block23_equiv.py 的固定件（16 专家、预打包），不是这里要的东西"
+    )
+if not glob.glob(os.path.join(MODEL, "model-*.safetensors")):
+    raise SystemExit(f"目录里没有 model-*.safetensors：{MODEL}")
 # ---- dimensions -----------------------------------------------------------
 # Auto-detect from the checkpoint's config.json instead of hardcoding V4's
 # (H=4096, I=2048, E=256, 43 layers).  V4.1-Flash is H=5120, I=2304, E=384,

@@ -2630,7 +2630,7 @@ def gpu_moe_layer(
     # 想省这块分配只能改成"排序后行数=有效项数"或持久缓冲,不能再动行数语义。
     # 【§598】复用:见 `_reuse_moe` 的注释。`XIAOTU_GPF_REUSE=0` 可回退到每层新分配。
     if os.environ.get("XIAOTU_GPF_REUSE", "1") == "1" and slot is None:
-        inter = _reuse_moe("inter", (A, 2 * I), torch.bfloat16, device)
+        inter = _reuse_moe(("inter", int(K)), (A, 2 * I), torch.bfloat16, device)
     elif slot is not None:
         # PIN 分流(slot):垃圾桶(-1)行 kernel 不写 ⇒ 环/empty 残留(inf/nan)
         # 会以 0×inf=NaN 进入 partial ⇒ slot 路径专属 zeros 并禁用复用环。
@@ -2818,7 +2818,7 @@ def gpu_moe_layer_tiled(x, topk_ids, topk_weights, w13, s13, w2, s2,
         return out
 
     if os.environ.get("XIAOTU_GPF_REUSE", "1") == "1":
-        inter = _reuse_moe("inter", (A, 2 * I), torch.bfloat16, device)
+        inter = _reuse_moe(("inter", int(K)), (A, 2 * I), torch.bfloat16, device)
     else:
         inter = torch.empty((A, 2 * I), dtype=torch.bfloat16, device=device)
 
@@ -2978,7 +2978,7 @@ def gpu_moe_layer_from_engine_tiled(engine, x, topk_ids, topk_weights,
     if T == 0 or K == 0:
         return out
     if os.environ.get("XIAOTU_GPF_REUSE", "1") == "1":
-        inter = _reuse_moe("inter", (A, 2 * int(I)), torch.bfloat16, device)
+        inter = _reuse_moe(("inter", int(K)), (A, 2 * int(I)), torch.bfloat16, device)
     else:
         inter = torch.empty((A, 2 * int(I)), dtype=torch.bfloat16, device=device)
 

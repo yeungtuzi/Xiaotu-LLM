@@ -15,7 +15,7 @@
 --------------------------------------
     XIAOTU_MEM_TRACE=1                 总开关
     XIAOTU_MEM_TRACE_MAX_ENTRIES=...   记录条数上限（默认 200000，约占数百 MiB 宿主内存）
-    XIAOTU_MEM_TRACE_DIR=/tmp/xtu_mem  快照目录
+    XIAOTU_MEM_TRACE_DIR=$XTU_TMPBASE/xtu_mem  快照目录（默认 /var/tmp/xtu-trace/xtu_mem，**不写 /tmp**）
     XIAOTU_MEM_TRACE_EVERY_S=600       每隔多久自动 dump 一次
 
 纪律
@@ -65,7 +65,11 @@ def dump(tag: str = "") -> str | None:
     """落一份快照，返回路径。失败返回 None（绝不影响服务）。"""
     if not enabled():
         return None
-    d = os.environ.get("XIAOTU_MEM_TRACE_DIR", "/tmp/xtu_mem")
+    # ⛔ 默认**不写 /tmp**：多数机器 /tmp 是 tmpfs（吃 RAM）、且重启即丢；
+    #    快照是事后取证素材，必须留在持久目录（见 USER_QA_LEDGER #350）。
+    #    可用 XIAOTU_MEM_TRACE_DIR 覆盖。
+    d = os.environ.get("XIAOTU_MEM_TRACE_DIR") or os.path.join(
+        os.environ.get("XTU_TMPBASE", "/var/tmp/xtu-trace"), "xtu_mem")
     try:
         os.makedirs(d, exist_ok=True)
         path = os.path.join(d, f"snap_{time.strftime('%Y%m%dT%H%M%S')}_{tag or 'x'}.pickle")

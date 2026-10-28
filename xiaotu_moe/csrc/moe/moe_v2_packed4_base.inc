@@ -123,6 +123,20 @@
 #ifndef XIAOTU_MOE_GEMM_MR
 #define XIAOTU_MOE_GEMM_MR 6
 #endif
+// 【H1 2026-10-28】内层软件预取距离（单位：group，1 group = 16 B 权重）。
+//   0 = 关闭（**默认**，逐字保持历史行为）。>0 时在每个 (列, group) 解码前预取
+//   第 g+dist 个 group 所在的 cache line。
+//   动机：单流 decode 每线程只有 2–4 个 job，权重流每条 2560 B（160 group），
+//   实测轻载档每线程仅 ~3.1 GB/s、满负载档 ~5.2 GB/s ⇒ 差的是**未命中并行度**，
+//   不是指令数。HW 预取器在流首/流尾各要 1–2 次 miss 才跟上，软件预取补这一段。
+//   ⚠️ 数值上零影响（只读提示），但会占用 AGU/load 端口，必须 A/B 后再定默认。
+#ifndef XIAOTU_MOE_PF_DIST
+// 2026-10-28 窗口实测（load 0.9–1.6，DEDUP=12）：dist=8 在 60/96 线程下均为 **−8%**
+// （1.23→1.12、0.78→0.72 ms/层），且输出**逐位不变**（sha256 全臂一致）；dist=4/16 略差。
+// ⇒ 采纳为默认。要回到历史行为：`-DXIAOTU_MOE_PF_DIST=0` 或设同名 env 之外的构建变体。
+#define XIAOTU_MOE_PF_DIST 8
+#endif
+
 #ifndef XIAOTU_MOE_GEMM_NR_DEFAULT
 #define XIAOTU_MOE_GEMM_NR_DEFAULT 2
 #endif
@@ -612,6 +626,16 @@ inline void matmul_packed4_group(const uint16_t* A, const uint8_t* W,
     } while (0)
 #endif
 
+#if XIAOTU_MOE_PF_DIST > 0
+// 预取第 g+dist 个 group 的 16 B（与解码读的是同一行、同一列切片）。
+#define XIAOTU_PF_NEXT(b_row, g_in)                                                   \
+        if ((g_in) + XIAOTU_MOE_PF_DIST < group_count)                                \
+            _mm_prefetch((const char*)((b_row) +                                     \
+                          (size_t)((g_in) + XIAOTU_MOE_PF_DIST) * 16), _MM_HINT_T0);
+#else
+#define XIAOTU_PF_NEXT(b_row, g_in) do {} while (0)
+#endif
+
 #define XIAOTU_DECODE_GROUP_AVX512(b_row, g_in)                                        \
         /* 【第 215 轮·PERMV 解码】把 4bit 码经 fp32 LUT 直接 permute 成 fp32 权重:        \
            load(1)+and(1)+srli(1)+and(1)+unpack(2)+cvt(2)+permutexvar(2) = 10 条/32 权重,   \
@@ -747,6 +771,7 @@ inline void matmul_packed4_group(const uint16_t* A, const uint8_t* W,
             }                                                                             \
             for (int jj = 0; jj < (NRT); ++jj) {                                          \
                 const uint8_t* brow = W + (size_t)(j0 + jj - rowshift) * (K / 2);         \
+                XIAOTU_PF_NEXT(brow, g);                                                 \
                 XIAOTU_DECODE_GROUP_AVX512(brow, g);                                      \
                 const __m512 sv = _mm512_set1_ps(row_scale(srt[jj], g));                  \
                 /* 【§637b】折 scale **只在 MRT>=2 时**才划算:`mr=1` 时旧式是 1 mul + 2 fma = 3 个

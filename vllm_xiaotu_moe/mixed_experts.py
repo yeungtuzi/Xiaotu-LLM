@@ -231,6 +231,36 @@ def _host_mib() -> dict:
 
 _LAYER_IDX_RE = __import__("re").compile(r"layers\.(\d+)\.")
 
+# 【D2 2026-10-28】Expert Deferral 接线：把第 L 层的 CPU MoE 结果延后到第 L+1 层兑现，
+#   使 CPU 计算与 GPU 注意力重叠。默认关（XIAOTU_MOE_DEFER 未设/为 0）。
+#   仅支持 async 路径 + PIN=0；末层仍走原同步路径，用 cpu_decode_drain 补回。
+_DEFER_ON = (os.environ.get("XIAOTU_MOE_DEFER", "") not in ("", "0"))
+_DEFER_ST = {"prev": -1, "max": -1, "steps": 0}
+# 【诊断】XIAOTU_MOE_DEFER_NODRAIN=1 ⇒ 跳过末层兑现（只验证"延后"本身是否捕获安全）
+_DEFER_NODRAIN = (os.environ.get("XIAOTU_MOE_DEFER_NODRAIN", "") not in ("", "0"))
+# ⛔ 只在**小 batch（decode）**下启用 defer：warmup/prefill 的 qlen 可达 8192，
+#   而 defer 会强制"逐层等 CPU 算完"（实测 qlen=8192 时每层约 1 s，看起来像卡死）。
+_DEFER_MAXQ = int(os.environ.get("XIAOTU_MOE_DEFER_MAXQ", "16"))
+
+
+def _defer_mode(idx, qlen=0):
+    """返回 0=不变、1=延后本层、2=先兑现上一层再正常计算。"""
+    st = _DEFER_ST
+    if not _DEFER_ON or idx < 0:
+        return 0
+    if qlen > _DEFER_MAXQ:      # 预填/warmup 的大 batch：绝不接管
+        return 0
+    if st["prev"] >= 0 and idx <= st["prev"]:
+        st["steps"] += 1          # 层号回绕 ⇒ 走完一个完整 forward
+    st["prev"] = idx
+    if idx > st["max"]:
+        st["max"] = idx
+    if st["steps"] < 1:           # 第一个 forward 只用来学 max，不改变数值
+        return 0
+    if idx < st["max"]:
+        return 1
+    return 1 if _DEFER_NODRAIN else 2
+
 # ⛔ 2026-10-09:原 `_GPF_OK`(设备级 GPU/CPU 判定门)已删除 —— 用户要求"把需求报告给 vLLM,
 #   让它自己的启动分配决定成败,不做优雅回退"(QA #151/#152)⇒ 不再有"我们判 GPU/CPU"这一步 ✓
 # 【§601】首次 GPU 预填时的数字(staging / 要求空闲 / 实际空闲),**仅用于日志报告**:
@@ -373,6 +403,39 @@ def gp_capturing() -> bool:
         return bool(torch.cuda.is_current_stream_capturing())
     except Exception:  # noqa: BLE001  (驱动/后端缺席时按"没在捕获"处理)
         return False
+
+
+# 【R1 2026-10-28】命中率打印的 host 侧调用计数（配合下方打印分支）。
+#   原先每层每 forward 都做一次 `_nacc.item()`（device→host 排空，每步 ~48 次），
+#   而取模只决定"打不打印"。改为 host 计数门控后，只有到打印点才同步。
+_HIT_CALLS = 0
+
+# 【S1 2026-10-28】`cpu_decode` 返回码处理：<0 ⇒ 该层 CPU MoE 没有跑，
+#   此时 `out` 里是上一 step 的陈旧值。默认**抛异常**（静默算错比崩溃贵得多）；
+#   `XIAOTU_CD_SOFT=1` 可降级为警告（仅用于已知会跳层的诊断跑）。
+_CD_SOFT = os.environ.get("XIAOTU_CD_SOFT", "") not in ("", "0")
+
+
+def _cd_fail(rc: int, qlen: int, tag: str) -> None:
+    msg = ("[cd] cpu_decode 返回 %d（tag=%s qlen=%d）⇒ 本层 CPU MoE 未执行，"
+           "out 里是上一步的陈旧值" % (int(rc), tag, int(qlen)))
+    if _CD_SOFT:
+        print(msg + " [soft: 继续]", flush=True)
+    else:
+        raise RuntimeError(msg + "；确需跳过请设 XIAOTU_CD_SOFT=1")
+
+
+# 【R3 2026-10-28】两个**每层每 forward 都要读**的 env，前移到模块导入期读一次。
+#   原实现每层各 `os.environ.get` 一次（5 次/层，其中 `XIAOTU_ACT_DUMP` 是 dev-only
+#   却无条件读），纯浪费 3–5 µs/层。env 在进程内不变 ⇒ 导入期物化是等价语义。
+_ACT_DUMP_DIR = os.environ.get("XIAOTU_ACT_DUMP", "")
+_PIN_HITSTAT_ON = os.environ.get("XIAOTU_PIN_HITSTAT", "1") != "0"
+# 【B 档 2026-10-28】PIN 路径的掩码/分流改用一个 Triton 内核（默认关，A/B 用）。
+_PIN_MASK_TRITON = (os.environ.get("XIAOTU_PIN_MASK_TRITON", "") not in ("", "0")
+                    # ⚠️ 融合路径复用固定缓冲（避免每层分配），因此**只在同步模式安全**：
+                    #   async 下引擎会在 host-func 回调里异步读这些缓冲，下一层覆盖即踩数据。
+                    #   默认的 `XIAOTU_MOE_ASYNC=0` 满足该条件。
+                    and os.environ.get("XIAOTU_MOE_ASYNC", "0") in ("", "0"))
 
 
 def _in_capture_window() -> bool:
@@ -2780,8 +2843,10 @@ class _XiaotuExpertsMixin:
             #      不做 partial、也不触发自适应 ⇒ 小并发零代价 ✓
             #   ⚠️ 池本身仍在 profile 期建好(图捕获前),这里只控制"用不用" ✓
             # ---- XTU_SIDECAR=gpu0：本层 GPU0 池（只建一次；非捕获）----
-            if (not torch.cuda.is_current_stream_capturing()
-                    and not getattr(self, "_side_inited", False)):
+            # 【R4 2026-10-28】短路顺序：廉价属性检查放左，runtime API 查询放右。
+            #   原写法每层都调一次 `is_current_stream_capturing()`（PIN=0 也付）。
+            if (not getattr(self, "_side_inited", False)
+                    and not torch.cuda.is_current_stream_capturing()):
                 self._side_inited = True
                 self._side_layer_idx = -1
                 try:
@@ -2902,31 +2967,46 @@ class _XiaotuExpertsMixin:
                     #     ⇒ 捕获期(紧跟 warmup 之后)正好命中 ⇒ device-side assert ✓
                     #   ⇒ 修法:**只为 gather 做 clamp**(device 侧,零同步 ✓),
                     #     并把负 id **强制判为"非常驻"**(即走 CPU)✓ —— 与"miss 不赔"一致 ✓
-                    _ids_safe = ids_i32.clamp_min(0)
-                    _sl = _pinp.slotmap[_ids_safe.long()]
-                    # ⛔⛔【2026-10-16 B889 修复:全局/本地 id 空间混淆 ⇒ 命中恒 0】✗
-                    #   旧:`_res = (_sl >= _E) & (ids_i32 >= 0)` —— `_E = self._E_eng`
-                    #       = `cfg.expert_num` = **模型全局专家数**(GLM = 288)✗
-                    #   但 `slotmap` 是**本地空间**的:`expert_pool.py:176
-                    #       sm[e] = self.n_local + s`(`:282` swap_in 同)⇒
-                    #       值域 = `[n_local, n_local + S)` ✗
-                    #   `expert_pool.py:369` 逐字注释:「无 EP(TP=1):全局==本地」⇒
-                    #       **GLM 是 TP=2(有 EP)⇒ 全局 ≠ 本地** ✓
-                    #   (TP=2 + 288 专家 ⇒ `n_local` = 144 ⇒ `sm` 最大 = `144+7 = 151`
-                    #    ⇒ `151 >= 288` **永假** ⇒ `_res ≡ False` ⇒ `hits = 0.000%`)✗
-                    #   实测(drive74):`[xtu-pin][hit] hits=0/65536=0.000%` × 1008 行 ✗
-                    #   ⇒ 修:**比池自己的基址 `n_local`**,与 `_fp8_kmajor_tiled`
-                    #      (`expert_pool.py:210/213` 用 `n_local` 作分片尺寸)语义一致 ✓
-                    # ⛔⛔【2026-10-19 图捕获修复】profile/warmup 期 `ids=-1` 是哨兵 ✗
-                    #   实测(B1049):`Capturing CUDA graphs` 一开始就
-                    #   `device-side assert triggered`,日志逐字
-                    #   `[xtu-pf-progress] qlen=32 call=16 ids0=-1`;
-                    #   根因:`cpu_ids = where(_res, 0, ids_i32)` 对 -1 **原样透传**,
-                    #   引擎按 `uint32` 解释 ⇒ 0xFFFFFFFF 越界 ✗
-                    #   ⇒ 把无效 id 也并入"未命中"分支:CPU 收到 0 + 权重 0(安全),
-                    #      GPU 侧走 -1(内核对 -1 已有跳过语义)✓
-                    _bad = ids_i32 < 0
-                    _res = (_sl >= _pinp.n_local) & (~_bad)
+                    # 【B 档 2026-10-28】`XIAOTU_PIN_MASK_TRITON=1`：用一个 Triton 内核
+                    #   同时产出 cpu_ids / cpu_w / part_ids / 命中计数，替代旧路径的
+                    #   clamp+gather+cmp×4+where×3+zeros×2（约 10 个纯元素级小算子）。
+                    #   默认关 ⇒ 逐字走原路径。对拍：scripts/test_pin_mask_triton.py。
+                    _fused_on = _PIN_MASK_TRITON
+                    if _fused_on:
+                        _fz = getattr(self, "_pin_mask_fused", None)
+                        if _fz is None:
+                            from vllm_xiaotu_moe.pin_mask_triton import PinMaskFused
+                            _fz = PinMaskFused(ids_i32.device)
+                            _fz._enabled = True
+                            self._pin_mask_fused = _fz
+                        cpu_ids, cpu_w, part_ids, _res = _fz.step(
+                            ids_i32, wts_f32, _pinp.slotmap, int(_pinp.n_local))
+                    else:
+                        _ids_safe = ids_i32.clamp_min(0)
+                        _sl = _pinp.slotmap[_ids_safe.long()]
+                        # ⛔⛔【2026-10-16 B889 修复:全局/本地 id 空间混淆 ⇒ 命中恒 0】✗
+                        #   旧:`_res = (_sl >= _E) & (ids_i32 >= 0)` —— `_E = self._E_eng`
+                        #       = `cfg.expert_num` = **模型全局专家数**(GLM = 288)✗
+                        #   但 `slotmap` 是**本地空间**的:`expert_pool.py:176
+                        #       sm[e] = self.n_local + s`(`:282` swap_in 同)⇒
+                        #       值域 = `[n_local, n_local + S)` ✗
+                        #   `expert_pool.py:369` 逐字注释:「无 EP(TP=1):全局==本地」⇒
+                        #       **GLM 是 TP=2(有 EP)⇒ 全局 ≠ 本地** ✓
+                        #   (TP=2 + 288 专家 ⇒ `n_local` = 144 ⇒ `sm` 最大 = `144+7 = 151`
+                        #    ⇒ `151 >= 288` **永假** ⇒ `_res ≡ False` ⇒ `hits = 0.000%`)✗
+                        #   实测(drive74):`[xtu-pin][hit] hits=0/65536=0.000%` × 1008 行 ✗
+                        #   ⇒ 修:**比池自己的基址 `n_local`**,与 `_fp8_kmajor_tiled`
+                        #      (`expert_pool.py:210/213` 用 `n_local` 作分片尺寸)语义一致 ✓
+                        # ⛔⛔【2026-10-19 图捕获修复】profile/warmup 期 `ids=-1` 是哨兵 ✗
+                        #   实测(B1049):`Capturing CUDA graphs` 一开始就
+                        #   `device-side assert triggered`,日志逐字
+                        #   `[xtu-pf-progress] qlen=32 call=16 ids0=-1`;
+                        #   根因:`cpu_ids = where(_res, 0, ids_i32)` 对 -1 **原样透传**,
+                        #   引擎按 `uint32` 解释 ⇒ 0xFFFFFFFF 越界 ✗
+                        #   ⇒ 把无效 id 也并入"未命中"分支:CPU 收到 0 + 权重 0(安全),
+                        #   旧:`_res = (_sl >= _E) & (ids_i32 >= 0)` —— `_E = self._E_eng`
+                        _bad = ids_i32 < 0
+                        _res = (_sl >= _pinp.n_local) & (~_bad)
                     # env 门的一次性命中率取证(默认关 ⇒ 逐字零行为变化)。
                     # 来由(2026-10-14):臂差为负时必须能区分"表太稀 ⇒ 命中率低"与
                     # "命中率够但 fork/join 固定开销吃掉收益",否则只能靠猜。
@@ -2978,7 +3058,7 @@ class _XiaotuExpertsMixin:
                     # ⭐⭐⭐【#269 默认值化】默认**开启**(只有显式设 "0" 才关)
                     #   依据:实测 "不带它就捕获崩溃"(b1_nohit,连续多次)⇒ 用户不应被迫知道这个名字✓
                     #   ⛔ 本改动**不**解释为"已修复捕获问题" —— 它只是把开关从"必须设"变成"默认就对"✓
-                    _hitstat_print = os.environ.get("XIAOTU_PIN_HITSTAT", "1") != "0"
+                    _hitstat_print = _PIN_HITSTAT_ON   # 【R3】导入期物化
                     if _hitstat_print:
                         # ⭐ 只有统计开关打开时才累加(累加也是设备端算子,不影响图)✓
                         _hacc.add_(_res.sum())     # 命中数(设备端 ⇒ 可入图 ✓)
@@ -2986,16 +3066,33 @@ class _XiaotuExpertsMixin:
                         _nacc.add_(1)              # 调用次数(含图重放 ✓)
                         if not _in_capture_window():
                             _every = int(os.environ.get("XIAOTU_PIN_HITSTAT_EVERY", "1024") or 1024)
-                            _hn = int(_nacc.item())    # ⭐ 全流程唯一一次同步 ✓
-                            if _hn == 1 or _hn % max(1, _every) == 0:
+                            # 【R1 2026-10-28】原为**每层每 forward 无条件** `.item()`
+                            #   （每步 ~48 次 device→host 排空，会把 side stream 的 partial
+                            #   与本层 CPU MoE 的流水掐断），而 `% _every` 只决定打不打印。
+                            #   改为 **host 侧计数门控**：只有到打印点才同步。
+                            #   打印节奏与内容不变（`_hn` 仍是设备侧计数）。
+                            #   退回旧行为：XIAOTU_PIN_HITSTAT_HOST=0。
+                            global _HIT_CALLS
+                            _HIT_CALLS += 1
+                            if os.environ.get("XIAOTU_PIN_HITSTAT_HOST", "1") == "0":
+                                # 旧行为：每次都问设备（每层每 forward 一次同步）
+                                _hn = int(_nacc.item())
+                                _print_now = (_hn == 1 or _hn % max(1, _every) == 0)
+                            else:
+                                # 新行为：host 计数决定是否到打印点，只有到点才同步
+                                _print_now = (_HIT_CALLS == 1
+                                              or (_HIT_CALLS % max(1, _every)) == 0)
+                                _hn = int(_nacc.item()) if _print_now else 0
+                            if _print_now:
                                 _hh, _tt = int(_hacc.item()), int(_tacc.item())
                                 _hacc.zero_(); _tacc.zero_(); _nacc.zero_()
                                 print("[xtu-pin][hit] %s: hits=%d/%d=%.3f%% calls=%d slots=%d E=%d qlen=%d" % (
                                     getattr(layer, "layer_name", "?").split(".")[-4],
                                     _hh, _tt, (100.0 * _hh / _tt) if _tt else 0.0, _hn,
                                     int(_pinp.planes[0].shape[0]), int(_E), int(qlen)), flush=True)
-                    cpu_ids = torch.where(_res | _bad, _zids, ids_i32)
-                    cpu_w = torch.where(_res, _zw, wts_f32)
+                    if not _fused_on:      # 融合路径已在上面产出，跳过这 2 个 where
+                        cpu_ids = torch.where(_res | _bad, _zids, ids_i32)
+                        cpu_w = torch.where(_res, _zw, wts_f32)
                     # ⛔【2026-10-27 · 用户裁定「宁可浪费电，不要乱 free」】
                     #   这两块在 `_side` 上创建，却以**裸指针**交给 `engine.cpu_decode` 在
                     #   **主流**上异步读。少两件事就会 UAF：① allocator 不知道主流还在读 ⇒
@@ -3019,9 +3116,10 @@ class _XiaotuExpertsMixin:
                         _ev_mask = torch.cuda.Event()
                         self._pin_ev_mask = _ev_mask
                     _ev_mask.record(_side)
-                    part_ids = torch.where(
-                        _res, (_sl - _pinp.n_local).to(torch.int32),
-                        torch.full_like(ids_i32, -1))
+                    if not _fused_on:      # 融合路径已产出 part_ids
+                        part_ids = torch.where(
+                            _res, (_sl - _pinp.n_local).to(torch.int32),
+                            torch.full_like(ids_i32, -1))
                     # ⛔⛔【2026-10-17 B900 修复:漏传 swiglu_limit ⇒ 常驻专家不夹取】✗
                     #   `gpu_prefill_fp8.gpu_moe_layer:513` 的签名是
                     #       `swiglu_limit: float = 0.0`
@@ -3062,13 +3160,18 @@ class _XiaotuExpertsMixin:
                         engine, qlen, self.moe_config.experts_per_token,
                         h_bf16, cpu_ids, cpu_w, out)
                 else:
-                    engine.cpu_decode(
+                    # 【S1 2026-10-28】`cpu_decode` 失败时原来只 fprintf 后 return，
+                    #   Python 照旧读 out ⇒ 读到上一 step 的陈旧值且无信号（静默算错）。
+                    #   C++ 侧已改为返回码：0=正常，<0=该层未计算。
+                    _cd_rc = engine.cpu_decode(
                         stream.cuda_stream, qlen,
                         self.moe_config.experts_per_token,
                         h_bf16.data_ptr(), cpu_ids.data_ptr(), cpu_w.data_ptr(),
                         out.data_ptr(),
                         layer=getattr(self, "_side_layer_idx", -1),
                     )
+                    if _cd_rc:
+                        _cd_fail(_cd_rc, qlen, "pin")
                 torch.cuda.current_stream().wait_event(_ev_done)
                 out.add_(_partial.to(out.dtype))
             else:
@@ -3077,12 +3180,50 @@ class _XiaotuExpertsMixin:
                         engine, qlen, self.moe_config.experts_per_token,
                         h_bf16, ids_i32, wts_f32, out)
                 else:
-                    engine.cpu_decode(
+                    # 【S1 2026-10-28】`cpu_decode` 失败时原来只 fprintf 后 return，
+                    #   Python 照旧读 out ⇒ 读到上一 step 的陈旧值且无信号（静默算错）。
+                    #   C++ 侧已改为返回码：0=正常，<0=该层未计算。
+                    # 【D2】本分支即非 PIN 路径；defer 只在开关打开时生效。
+                    _dm = 0
+                    _mm = None
+                    if _DEFER_ON:
+                        _mm = _LAYER_IDX_RE.search(getattr(layer, "layer_name", "") or "")
+                        if _mm:
+                            _dm = _defer_mode(int(_mm.group(1)), qlen)
+                    if _dm == 2:
+                        # 末层：先把上一层的结果兑现出来（独立缓冲），再正常算本层。
+                        # 【D2-fix】捕获区内**禁止分配**（上次就是 torch.empty_like 卡死）：
+                        #   改用模块内预分配的 _defer_ov，按 qlen 切片使用；
+                        #   若 qlen 超出预分配上限 ⇒ 本轮回退到 defer=0（安全退化）。
+                        _ov = getattr(self, "_defer_ov", None)
+                        _cap_tok = int(os.environ.get("XIAOTU_CD_PREALLOC_TOKENS", "512"))
+                        if _ov is None or _ov.shape[0] < min(qlen, _cap_tok):
+                            # 只允许在**非捕获**时分配；捕获期一律退化为不 defer
+                            if torch.cuda.is_current_stream_capturing():
+                                _ov = None
+                            else:
+                                self._defer_ov = torch.empty(
+                                    max(qlen, _cap_tok), out.shape[1],
+                                    dtype=out.dtype, device=out.device)
+                                _ov = self._defer_ov
+                        if _ov is not None and _ov.shape[0] >= qlen:
+                            _ovs = _ov[:qlen]
+                            if engine.cpu_decode_drain(stream.cuda_stream,
+                                                       _ovs.data_ptr()) == 1:
+                                out.add_(_ovs)
+                        else:
+                            # 缓冲不够：**仍必须 drain 以释放槽位**，只是丢弃结果
+                            engine.cpu_decode_drain(stream.cuda_stream, None)
+                        _dm = 0
+                    _cd_rc = engine.cpu_decode(
                         stream.cuda_stream, qlen, self.moe_config.experts_per_token,
                         h_bf16.data_ptr(), ids_i32.data_ptr(), wts_f32.data_ptr(),
                         out.data_ptr(),
-                        layer=getattr(self, "_side_layer_idx", -1),
+                        layer=(int(_mm.group(1)) if _mm else -1),
+                        defer=_dm,
                     )
+                    if _cd_rc:
+                        _cd_fail(_cd_rc, qlen, "plain")
         _lt_t2 = time.perf_counter() if _LT_ON else 0.0
         if _sync == "post":
             torch.cuda.synchronize()
@@ -3103,7 +3244,7 @@ class _XiaotuExpertsMixin:
         # ⭐ dev-only (T1.2):把【真实 MoE 输入激活】存档,供离线数值对拍用 ✓
         #   `XIAOTU_ACT_DUMP=<目录>`(+ 可选 `XIAOTU_ACT_DUMP_LAYER=<layer_name 子串>`)⇒ 每层一次。
         #   存 {h[M,H] bf16, ids[M,topk] int32, wts[M,topk] fp32, layer} —— 与 dev-docs/mywork/artifacts/ 的旧 dump 同格式 ✓
-        _act_dump_dir = os.environ.get("XIAOTU_ACT_DUMP", "")
+        _act_dump_dir = _ACT_DUMP_DIR   # 【R3】导入期物化，见文件头同名注释
         if _act_dump_dir and not _ACT_DUMP_DONE[0]:
             _act_dump_layer = os.environ.get("XIAOTU_ACT_DUMP_LAYER", "")
             if not _act_dump_layer or _act_dump_layer in getattr(layer, "layer_name", ""):

@@ -205,6 +205,13 @@ def main():
         # fixed; `out` is freshly zeroed above, so this is a pure function of the
         # inputs + build. Force me>819 with DEDUP=6 to exercise the new path.
         if os.environ.get("CHECK") == "1":
+            # 【2026-10-28】逐位指纹：两个 build / 两个开关的 `out` 原始字节 SHA256。
+            #   `sum/abssum/max` 只能发现"改了数值"，发现不了"改了低位"；而本项目的
+            #   硬门是**逐位一致**（`test_block23_equiv`），所以这里给位精确指纹。
+            import hashlib
+            _raw = np.ascontiguousarray(out, dtype=np.float32).tobytes()
+            print(f"[hash] B={B} dedup={dedup} sha256={hashlib.sha256(_raw).hexdigest()[:32]}",
+                  flush=True)
             o = np.asarray(out, dtype=np.float64)
             print(f"[check] B={B} dedup={dedup} sum={o.sum():.10e} "
                   f"abssum={np.abs(o).sum():.10e} max={np.abs(o).max():.10e} "

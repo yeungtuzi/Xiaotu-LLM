@@ -130,6 +130,10 @@ struct CpuDecodeState {
     void (*w_fn)(void*, int, int, const uint16_t*, const uint32_t*, const float*, float*) = nullptr;
     void* out_ptr_seen = nullptr;   // out_gpu 指针缓存(避免每次调用做 Python shape 查询)
     size_t out_rows = 0;
+    // 【D2 2026-10-28】Expert Deferral：上一层的 CPU MoE 结果待兑现
+    bool d_pending = false;   // true = 有尚未 H2D 的结果
+    size_t d_bytes = 0;       // 那份结果的字节数
+    CpuDecodeState* d_last = nullptr;   // 【D2-pingpong】待兑现结果所在的槽
 
     // 【必须】mapped flag 的**分配**放在构造期,不能在 cpu_decode 里惰性分配:
     // 服务里第一次 cpu_decode 很可能发生在 **CUDA graph 捕获区**内
@@ -341,8 +345,16 @@ static void async_loop() {
             if (st->hin && st->hin[0] == 1) {
                 auto t_cb = std::chrono::steady_clock::now();
                 double ep = 0.0;
+                if (getenv("XIAOTU_DEFER_TRACE")) {
+                    fprintf(stderr, "[dfr] worker start qlen=%d\n", st->w_qlen);
+                    fflush(stderr);
+                }
                 if (st->w_fn) st->w_fn(st->w_engine, st->w_qlen, st->w_k,
                                        st->w_hid, st->w_ids, st->w_wts, st->w_out);
+                if (getenv("XIAOTU_DEFER_TRACE")) {
+                    fprintf(stderr, "[dfr] worker done, waiting hin==0\n");
+                    fflush(stderr);
+                }
                 if (timing) {
                     // EP 时间由 run_moe_and_ep 经 thread_local 传出(worker 是单线程)。
                     ep = g_async_ep_last;
@@ -812,7 +824,13 @@ static void bind_moe_class(py::module& m, const char* name) {
                               py::object stream_obj,
                               int qlen, int top_k,
                               py::object hidden, py::object expert_ids,
-                              py::object weights, py::object out_gpu, int layer) {
+                              py::object weights, py::object out_gpu, int layer,
+                              int defer) {
+            // defer=1: 【D2】Expert Deferral——本次调用先把**上一层**的结果交到本层
+            //   out_gpu（Python 照常加进残差），然后把本层计算排入后台**不等待**。
+            //   首层（无待兑现）改为向 out_gpu 写 0。末层由 cpu_decode_drain 兑现。
+            //   全部是流内操作（waitValue32/memcpyAsync/memsetAsync）⇒ 捕获安全。
+            //   缺省 0 ⇒ 逐字走原路径，行为不变。
             // Capture-safe API mirroring lk_moe.cpu_decode(stream_ptr, ...).
             //   hidden:  [qlen, hidden] bf16 (uint16 storage) DEVICE
             //   expert_ids/weights: [qlen, top_k] int32 / fp32 DEVICE
@@ -822,12 +840,15 @@ static void bind_moe_class(py::module& m, const char* name) {
             // host callback computes on pinned CPU buffers and writes back with
             // an async H2D memcpy into out_gpu.
             const int H = self.config().hidden_size;
-            if (qlen <= 0 || top_k <= 0 || H <= 0) return;
+            // 【S1 2026-10-28】返回码：0=正常/无事可做，<0=**该层未被计算**。
+            //   原实现失败时只 fprintf 后 `return;`，Python 侧照旧读 out_gpu ⇒
+            //   读到上一 step 的陈旧值且无任何信号（静默算错）。
+            if (qlen <= 0 || top_k <= 0 || H <= 0) return 0;
             // 【诊断专用】XIAOTU_MOE_FAKE_ALL=1:整个 cpu_decode 立即返回(不做 D2H/
             // host-func/H2D)⇒ 服务里量出的就是"纯 GPU 模型"每 token 时间。
             // 与 FAKE_CPU(只跳计算、仍做拷贝)相减 = 拷贝+host-func 的真实成本。
             static const bool fake_all = std::getenv("XIAOTU_MOE_FAKE_ALL") != nullptr;
-            if (fake_all) return;
+            if (fake_all) return 0;   // 诊断模式：故意不算，调用方须按 XIAOTU_MOE_FAKE_ALL 判断
 
             cudaStream_t s = nullptr;
             if (!stream_obj.is_none()) {
@@ -868,7 +889,7 @@ static void bind_moe_class(py::module& m, const char* name) {
                             "[cd] ERROR: out_gpu rows=%zu < qlen=%d (lk 的 output_gpu 按 "
                             "max_num_seqs 开;投机解码下需按 token 数开)-> skip layer\n",
                             rows, qlen);
-                    return;
+                    return -1;   // out 缓冲不够：该层未计算
                 }
             } catch (...) {
                 // 形状拿不到就不拦(旧调用方可能传入裸指针包装)
@@ -899,7 +920,7 @@ static void bind_moe_class(py::module& m, const char* name) {
                             "capture (qlen=%d > prealloc %d tokens); skipping this layer's "
                             "CPU decode. Raise kDecodeTokenFloor.\n",
                             qlen, kDecodeTokenFloor);
-                    return;
+                    return -2;   // 【S1】捕获期 pinned 缓冲不足：该层未计算
                 }
                 // 重新分配了 pinned 缓冲:旧的缓冲可能还有 pending 的回调在读,
                 // 先排空该 stream 再继续(只在缓冲区增长时发生,稳态下不会触发)。
@@ -930,7 +951,90 @@ static void bind_moe_class(py::module& m, const char* name) {
 
             // ---- 异步握手路径(item 1/3)---------------------------------
             // 参数(指针)在捕获期就固定下来;replay 时只有 pinned 内容与 flag 变化。
-            if (async_init(st.get())) {
+            // 【D1 2026-10-28】⚠️ 上面这句正是"单流下 async 慢 2×"的根因：
+            //   `st->w_qlen = qlen` 只在**捕获期**执行一次，而 vLLM 按 batch bucket
+            //   捕获（`qlen = hidden_states.size(0)` 是补齐后的桶大小）⇒ 重放时
+            //   每次仍按桶大小算 token，多算的部分是**真实路由**（pad 行来自
+            //   重复序列，`ids_i32 = topk_ids`、`topk_weights` 均为真值，引擎不会跳过）。
+            //   `XIAOTU_MOE_ASYNC_NOCAPTURE=1` ⇒ 捕获期退回同步路径，qlen 天然准确。
+            static const bool async_nocap = std::getenv("XIAOTU_MOE_ASYNC_NOCAPTURE") != nullptr;
+            if (async_init(st.get()) && !(async_nocap && capturing)) {
+                const size_t cur_no = (size_t)qlen * (size_t)H * sizeof(float);
+                if (defer) {
+                    CUstream cs0 = (CUstream)s;
+                    // 【D2-pingpong】双槽乒乓：本层提交到槽 (layer&1)，上一层在另一个槽。
+                    //   单槽时"归还"与"再提交"背靠背 ⇒ worker 观察不到 hin=0 ⇒ 死锁
+                    //   （实测：解码期 worker 一次都没被唤醒）。分槽后两者永不同槽。
+                    const void* k_alt = (const void*)((uintptr_t)&self | 1);
+                    auto& st_alt = g_cd_state[k_alt];
+                    if (!st_alt) st_alt = std::make_unique<CpuDecodeState>();
+                    CpuDecodeState* dcur = (layer & 1) ? st_alt.get() : st.get();
+                    dcur->ensure_buffers((size_t)qlen * H * sizeof(uint16_t),
+                                         (size_t)qlen * (size_t)top_k * sizeof(uint32_t),
+                                         (size_t)qlen * (size_t)top_k * sizeof(float),
+                                         cur_no, false);
+                    if (async_init(dcur)) {
+                        if (getenv("XIAOTU_DEFER_TRACE")) {
+                            fprintf(stderr, "[dfr] layer=%d qlen=%d slot=%d\n",
+                                    layer, qlen, (layer & 1));
+                            fflush(stderr);
+                        }
+                        if (st->d_last && st->d_last != dcur) {
+                            cuStreamWaitValue32(cs0, st->d_last->dout, 1,
+                                                CU_STREAM_WAIT_VALUE_EQ);
+                            cudaMemcpyAsync((void*)outg_dev, st->d_last->out, st->d_bytes,
+                                            cudaMemcpyHostToDevice, s);
+                            cuStreamWriteValue32(cs0, st->d_last->din, 0, 0);
+                        } else {
+                            cudaMemsetAsync((void*)outg_dev, 0, cur_no, s);
+                        }
+                        dcur->outg = outg_dev; dcur->out_bytes = cur_no;
+                        dcur->out = (float*)dcur->pin_out;
+                        dcur->w_qlen = qlen; dcur->w_k = top_k;
+                        dcur->w_hid = (const uint16_t*)dcur->pin_hidden;
+                        dcur->w_ids = (const uint32_t*)dcur->pin_ids;
+                        dcur->w_wts = (const float*)dcur->pin_weights;
+                        dcur->w_out = (float*)dcur->pin_out;
+                        dcur->w_engine = (void*)&self;
+                        if (!dcur->w_fn) {
+                            dcur->w_fn = [](void* e, int q, int k, const uint16_t* h,
+                                            const uint32_t* i, const float* w, float* o) {
+                                double ep = 0.0;
+                                run_moe_and_ep<MOE>((MOE*)e, q, k, h, i, w, o, &ep);
+                                g_async_ep_last = ep;
+                            };
+                        }
+                        cudaMemcpyAsync(dcur->pin_hidden, hid_dev,
+                                        (size_t)qlen * H * sizeof(uint16_t),
+                                        cudaMemcpyDeviceToHost, s);
+                        cudaMemcpyAsync(dcur->pin_ids, ids_dev,
+                                        (size_t)qlen * (size_t)top_k * sizeof(uint32_t),
+                                        cudaMemcpyDeviceToHost, s);
+                        cudaMemcpyAsync(dcur->pin_weights, wts_dev,
+                                        (size_t)qlen * (size_t)top_k * sizeof(float),
+                                        cudaMemcpyDeviceToHost, s);
+                        cuStreamWriteValue32(cs0, dcur->din, 1, 0);   // 排入，**不等**
+                        st->d_pending = true; st->d_bytes = cur_no; st->d_last = dcur;
+                        return 0;
+                    }
+                    st->d_pending = false; st->d_bytes = 0; st->d_last = nullptr;
+                }
+                    st->outg = outg_dev; st->out_bytes = cur_no;
+                    st->out = (float*)st->pin_out;
+                    st->w_qlen = qlen; st->w_k = top_k;
+                    st->w_hid = (const uint16_t*)st->pin_hidden;
+                    st->w_ids = (const uint32_t*)st->pin_ids;
+                    st->w_wts = (const float*)st->pin_weights;
+                    st->w_out = (float*)st->pin_out;
+                    st->w_engine = (void*)&self;
+                    if (!st->w_fn) {
+                        st->w_fn = [](void* e, int q, int k, const uint16_t* h,
+                                      const uint32_t* i, const float* w, float* o) {
+                            double ep = 0.0;
+                            run_moe_and_ep<MOE>((MOE*)e, q, k, h, i, w, o, &ep);
+                            g_async_ep_last = ep;
+                        };
+                    }
                 st->w_qlen = qlen; st->w_k = top_k;
                 st->w_hid = (const uint16_t*)st->pin_hidden;
                 st->w_ids = (const uint32_t*)st->pin_ids;
@@ -956,7 +1060,7 @@ static void bind_moe_class(py::module& m, const char* name) {
                 cuStreamWaitValue32(cs, st->dout, 1, CU_STREAM_WAIT_VALUE_EQ);
                 cudaMemcpyAsync(st->outg, st->out, no, cudaMemcpyHostToDevice, s);
                 cuStreamWriteValue32(cs, st->din, 0, 0);
-                return;
+                return 0;   // 【S1】async 路径：本层已排入（与同步路径同一返回码语义）
             }
 
             // 1) Async D2H copies on the caller stream (graph-capturable).
@@ -1100,6 +1204,7 @@ static void bind_moe_class(py::module& m, const char* name) {
             //    replay the graph executes D2H -> host(CPU compute) -> H2D.
             cudaMemcpyAsync(st->outg, st->out, st->out_bytes,
                             cudaMemcpyHostToDevice, s);
+            return 0;   // 【S1】本层已排入 D2H→host-func→H2D
 #ifdef XIAOTU_DEBUG_CD
             cudaError_t le = cudaGetLastError();
             if (le != cudaSuccess)
@@ -1107,7 +1212,32 @@ static void bind_moe_class(py::module& m, const char* name) {
 #endif
         }, py::arg("stream"), py::arg("qlen"), py::arg("top_k"),
            py::arg("hidden"), py::arg("expert_ids"), py::arg("weights"),
-           py::arg("out_gpu"), py::arg("layer") = -1)
+           py::arg("out_gpu"), py::arg("layer") = -1, py::arg("defer") = 0)
+        // 【D2】把最后一层待兑现的结果交出来（纯流内操作，捕获安全）。
+        //   Python 在最后一个 MoE 层之后调用，并把结果加进 hidden_states。
+        .def("cpu_decode_drain", [](MOE& self, py::object stream_obj, py::object out_gpu) {
+            if (!xiaotu_async_enabled()) return 0;   // 同步路径无待兑现
+            auto& stpq = g_cd_state[&self];
+            if (!stpq || !stpq->d_pending) return 0;   // 0 = 没有待兑现
+            CpuDecodeState& st = *stpq;
+            if (stream_obj.is_none()) return -1;
+            cudaStream_t s = reinterpret_cast<cudaStream_t>(
+                    py::cast<long long>(stream_obj));
+            if (!s) return -1;
+            CUstream cs = (CUstream)s;
+            // out_gpu=None ⇒ 只等 worker 完成并**释放槽位**，不拷贝结果。
+            //   必须保证槽位被释放：worker 算完会忙等 hin==0，若不释放会死锁。
+            const bool want_copy = !out_gpu.is_none();
+            float* outg_dev = want_copy ? as_f32m(out_gpu) : nullptr;
+            CpuDecodeState* dl = st.d_last ? st.d_last : &st;
+            cuStreamWaitValue32(cs, dl->dout, 1, CU_STREAM_WAIT_VALUE_EQ);
+            if (want_copy && outg_dev)
+                cudaMemcpyAsync((void*)outg_dev, dl->out, st.d_bytes,
+                                cudaMemcpyHostToDevice, s);
+            cuStreamWriteValue32(cs, dl->din, 0, 0);
+            st.d_pending = false; st.d_bytes = 0; st.d_last = nullptr;
+            return 1;   // 1 = 已把上一层结果写入 out_gpu
+        }, py::arg("stream"), py::arg("out_gpu"))
         .def("sidecar_attach", [](MOE&, uint64_t addr) {
             g_sidecar = reinterpret_cast<xiaotu_sidecar::SidecarCtl*>(addr);
         }, py::arg("ctl_addr"))

@@ -1179,8 +1179,13 @@ public:
         //
         // Env XIAOTU_MOE_SHARDSPLIT=N(>0) 仍然强制所有专家都用 N(逐字保留原语义);
         // =0 关闭;不设/负数 = 上面的自适应。
-        std::vector<int> subAe, subBe;
-        std::vector<size_t> eoffA, eoffB;   // 每个活跃专家的 job 前缀和
+        // 【M4 2026-10-28】原来每层在本函数里新建 4 个 vector（subAe/subBe/eoffA/eoffB）
+        //   + 2 个 jc，每层 6 次 malloc/free（~10–20 µs 的串行 setup 里占大头）。
+        //   改为成员并 `assign/resize` 复用容量 ⇒ 稳态零分配；语义逐字不变。
+        std::vector<int>& subAe = subAe_;
+        std::vector<int>& subBe = subBe_;
+        std::vector<size_t>& eoffA = eoffA_;   // 每个活跃专家的 job 前缀和
+        std::vector<size_t>& eoffB = eoffB_;
         {
             const char* eov = std::getenv("XIAOTU_MOE_SHARDSPLIT");
             const long ov = eov ? std::atol(eov) : -1L;
@@ -1223,11 +1228,9 @@ public:
 
         }
 
-        // Flattened job index for A2/B0 = sum over active experts of me*nc_gu.
-        exp_off_.resize(na + 1);
-        exp_off_[0] = 0;
-        for (size_t e_idx = 0; e_idx < na; ++e_idx)
-            exp_off_[e_idx + 1] = exp_off_[e_idx] + exp_[active_[e_idx]].ai_list.size() * (size_t)nc_gu;
+        // 【R5 2026-10-28】原此处算 `exp_off_` 前缀和（A2/B0 融合前的残留），
+        //   全仓唯一读者是下面的 `a2_total`，而 `a2_total` 从未被使用 ⇒ 死代码，删除。
+        //   （每层省 na 次加法 + 一次 resize；行为不变。）
         {   // A2 四段打点(XIAOTU_MOE_SETUP_PROF=1;NOTES §88.1/§113 的正确锚点)
             static const bool _sp = std::getenv("XIAOTU_MOE_SETUP_PROF") != nullptr;
             if (_sp) {
@@ -1264,7 +1267,6 @@ public:
                 }
             }
         }
-        const size_t a2_total = exp_off_[na];
 
         // XIAOTU_MOE_ME_DIAG=1: report the per-forward routing shape. WHY (NOTES
         // §438): the service's real-weight prefill measured 1535 ms/layer at
@@ -1307,7 +1309,8 @@ public:
             const size_t gu_crows = (size_t)inter / NS;
             const size_t gu_rb = wt::w13_row_bytes(hidden);   // trait width (packed4: H/2)
             const size_t gu_cbytes = gu_crows * gu_rb;
-            std::vector<size_t> jc(NS, eoffA[na]);
+            jcA_.assign((size_t)NS, eoffA[na]);   // 【M4】成员复用，免每层 malloc
+            std::vector<size_t>& jc = jcA_;
             pfor_sharded((int)NS, jc.data(), [&](size_t n, size_t job) {
                 // job -> (expert, slice) via the per-expert prefix sums (eoffA is
                 // strictly increasing because every subAe >= 1).
@@ -1416,7 +1419,8 @@ public:
             const size_t d_crows = (size_t)hidden / NS;
             const size_t d_rb = wt::w2_row_bytes(inter);      // trait width (packed4: I/2)
             const size_t d_cbytes = d_crows * d_rb;
-            std::vector<size_t> jc(NS, eoffB[na]);
+            jcB_.assign((size_t)NS, eoffB[na]);   // 【M4】成员复用，免每层 malloc
+            std::vector<size_t>& jc = jcB_;
             pfor_sharded((int)NS, jc.data(), [&](size_t n, size_t job) {
                 size_t e_idx = (size_t)(std::upper_bound(eoffB.begin(), eoffB.end(), job)
                                         - eoffB.begin()) - 1;
@@ -1473,8 +1477,13 @@ public:
         auto pB1 = clk::now();
 
         // Phase C: weighted reduce per token (rank order) - no output contention.
+        // 【M1 2026-10-28】本相的 job 数 = M（单流 decode 只有 6 个），走全池时
+        //   ~114 个 worker 空转后仍要 join 一次，屏障尾随常常大于归约本身
+        //   （归约只读 NASS×hidden×4B ≈ 590 KB）。
+        //   `XIAOTU_MOE_C_WLIMIT=N`（N>0）⇒ 参与者 = N*M（再被线程数夹紧）。
+        //   默认 0 ⇒ 逐字保持原行为（pfor 全池）。
             XTU_PROBE("PHASE-C(reduce)");
-        pfor((size_t)M, [&](size_t t) {
+        auto c_body = [&](size_t t) {
             float* out_t = output + t * (size_t)hidden;
             for (int r = 0; r < k; ++r) {
                 size_t ai = t * (size_t)k + r;
@@ -1485,7 +1494,18 @@ public:
                                  + inst_idx_[ai] * (size_t)hidden;
                 for (int h = 0; h < hidden; ++h) out_t[h] += w * d[h];
             }
-        });
+        };
+        {
+            static const long _cw_base = [] {
+                const char* e = std::getenv("XIAOTU_MOE_C_WLIMIT");
+                return e ? std::atol(e) : 0L;
+            }();
+            if (_cw_base > 0) {
+                pool_.parallel_for_limited((size_t)M, (size_t)_cw_base * (size_t)M, c_body);
+            } else {
+                pfor((size_t)M, c_body);
+            }
+        }
         auto pC = clk::now();
         prof_add((size_t)M, active_.size(),
                  std::chrono::duration_cast<std::chrono::nanoseconds>(pA1 - pA0).count(),
@@ -1891,7 +1911,11 @@ private:
     mutable std::vector<int> active_;       // reusable list of active expert ids
     mutable std::vector<size_t> count_;     // per-expert instance counts
     mutable std::vector<size_t> inst_idx_;  // ai -> instance rank within its expert
-    mutable std::vector<size_t> exp_off_;   // prefix sums for A2/B0 job mapping
+    mutable std::vector<size_t> exp_off_;   // (=R5 已无读者，保留成员仅避免 ABI 变动)
+    // 【M4 2026-10-28】原来每层在 forward_many_nsliced 里新建的 6 个临时 vector，
+    //   改为成员：`assign/resize` 复用容量 ⇒ 稳态零 malloc（每层省 6 次分配/释放）。
+    mutable std::vector<int>    subAe_, subBe_;
+    mutable std::vector<size_t> eoffA_, eoffB_, jcA_, jcB_;
     // 【§619d】N-sliced 路径的**扁平 scratch arena**。
     //
     // 不变量:`sum_{e ∈ active} me_e == NASS`(me_e = 专家 e 的 (token,rank) 指派数,

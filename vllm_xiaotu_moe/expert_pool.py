@@ -189,6 +189,14 @@ class LayerPool:
         self._win_t = None       # int64 标量 device 计数(距上次自适应跑了几个 forward)
         self.swaps_in = 0        # 可观测:累计换入/换出次数
         self.swaps_out = 0
+        # 【R2 2026-10-28】窗口策略关闭时（`XIAOTU_PIN_WINDOW` 缺省 0），`maybe_adapt`
+        #   在第一行就 return，`_hits` / `_win_t` **永远无人读取**；但 `note_routing` 仍
+        #   每层每步跑 ~11 个 kernel（reshape / to(long) / where×2 / index_add_ / +=）。
+        #   ⇒ 静态短路（env 在进程内不变，捕获期与重放期判定一致）。
+        #   强制计数（诊断用）：`XIAOTU_PIN_COUNT_ROUTES=1`。
+        _ovr = os.environ.get("XIAOTU_PIN_COUNT_ROUTES", "")
+        self._count_routes = ((int(os.environ.get(_ENV_WINDOW, "0") or 0) > 0)
+                              if _ovr == "" else (_ovr != "0"))
         if self.nslots == 0:
             self.planes = None
             self.slotmap = torch.arange(self.n_local, dtype=torch.int32, device=device)
@@ -323,6 +331,9 @@ class LayerPool:
         ⇒ 因此调用方**必须**在捕获区**之外**的判断里也调用它(即无条件调用)✓
         """
         if self.nslots == 0 or self._hits is None or self._win_t is None:
+            return
+        # 【R2 2026-10-28】窗口关闭 ⇒ 计数无人消费 ⇒ 静态短路（见 __init__ 的同名注释）
+        if not getattr(self, "_count_routes", True):
             return
         idx = topk_ids.reshape(-1).to(torch.long)
         # ⛔⛔【2026-10-19 · 图捕获期 `device-side assert` 的**真凶**】

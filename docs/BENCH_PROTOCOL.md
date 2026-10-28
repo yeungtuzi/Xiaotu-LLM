@@ -535,3 +535,26 @@ prompt_len ∈ {128, 512, 1024, 2048, 4096, 8192}
 * **本机(S4000 / Hygon C86 7385×2,64 核)** 尚未做该扫描,当前固定走 CPU prefill
   (`device=cpu` 的 `[xtu-pf-progress]` 即其证据),理论 CPU prefill ≈19.5 tok/s
   ⇒ 预期交叉点会**明显低于 2560**,必须实测,不得沿用。
+
+### 6.5 ⚠️ `bench_decode_window.py` 的 `--n` 是**并发线程数**，不是"总请求数"(2026-10-28 实测更正)
+
+```python
+n = a.n or a.conc
+ths = [threading.Thread(target=stream_request, args=(p, ...)) for i in range(n)]
+for t in ths: t.start()          # ← 全部同时启动
+```
+
+⇒ **`--conc 1 --n 16` 实际是 16 并发（C≈16），不是 C=1 的 16 条**。
+2026-10-28 按 `--n 16` 起跑，服务端 18 个 POST 同时抵达、worker CPU 冲到 2000%，
+测出的绝不是 C=1 步时，**不能与 `BENCH_HISTORY` 的 C=1 行对比** ✗。
+
+**正确口径（C=1、每档 16 条、2 条预热）**：**一次一条串行**跑 16 轮，各轮取窗口结果后汇总：
+
+```bash
+for i in $(seq 1 16); do
+  python scripts/bench_decode_window.py --port 8071 --model <id> \
+    --dataset <15k.jsonl> --conc 1 --n 1 --max-tokens 1024 --tokenizer <ckpt> | tail -1
+done   # 前 2 轮丢弃作为预热
+```
+
+⭐ 判据：若日志里出现"多个 POST 同时抵达 / CPU 远超单条解码所需"，说明 `--n` 传错了 ✓

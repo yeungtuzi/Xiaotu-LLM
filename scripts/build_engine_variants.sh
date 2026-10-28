@@ -131,6 +131,14 @@ VARIANTS=(
   # ⚠️ 这一档**故意不进 `loader._LADDER`**：用 `XIAOTU_MOE_VARIANT=avx512_bf16_vbmi_vnni` 显式选，
   #    以免"合并即改变生产默认路径"（见 /home/user/lvllm/archive/vllm-xiaotu-moe/2026-10-07-dev-docs-mywork/mywork/DECISIONS.md(原 dev-docs/mywork/ 已于 2026-10-07 取消) **D11**）✓
   "avx512_bf16_vbmi_vnni|-mavx512f -mavx512bw -mavx512vl -mavx512dq -mavx512bf16 -mavx512vbmi -mavx512vnni -mfma"
+  # 【H1 2026-10-28·受控实验】与 `avx512_bf16_vbmi` 同旗标，只多一条内层软件预取
+  #   （`XIAOTU_MOE_PF_DIST=8` ⇒ 预取当前行前方 2 条 cache line）。
+  #   用途：单流 decode 的"未命中并行度"假设 A/B；数值零影响（只读提示）。
+  #   ⚠️ 不进 `loader._LADDER`：用 `XIAOTU_MOE_VARIANT=avx512_bf16_vbmi_pf` 显式选。
+  "avx512_bf16_vbmi_pf|-mavx512f -mavx512bw -mavx512vl -mavx512dq -mavx512bf16 -mavx512vbmi -mfma -DXIAOTU_MOE_PF_DIST=8"
+  # H1 距离扫描：4（1 条 line）/ 16（4 条 line），与 8 一起构成单窗口可跑完的三点
+  "avx512_bf16_vbmi_pf4|-mavx512f -mavx512bw -mavx512vl -mavx512dq -mavx512bf16 -mavx512vbmi -mfma -DXIAOTU_MOE_PF_DIST=4"
+  "avx512_bf16_vbmi_pf16|-mavx512f -mavx512bw -mavx512vl -mavx512dq -mavx512bf16 -mavx512vbmi -mfma -DXIAOTU_MOE_PF_DIST=16"
   # 【受控实验用·不用于生产】同样的旗标(含 -mavx512vnni)但**强制 base 实现** ⇒
   #   把"旗标对共享 bf16 路径 codegen 的影响"与"W4A8 源码的影响"分离 ✓（线③② 归因）
   "avx512_bf16_vbmi_vnni_base|-mavx512f -mavx512bw -mavx512vl -mavx512dq -mavx512bf16 -mavx512vbmi -mavx512vnni -mfma -DXIAOTU_MOE_FORCE_PACKED4_BASE=1"

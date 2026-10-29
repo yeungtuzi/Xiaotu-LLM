@@ -10,6 +10,7 @@
 #          "empty_cache(cuda" + "失败"      清理线程报错（context 已污染）
 #          "illegal memory access"          直接非法访存
 #          "CUDA error"                     driver 级错误
+#          "No available shared memory..."  worker 失去响应（hang，每次 60 s 超时）
 #       采集内容：py-spy 栈(EngineCore + 各 Worker_TP) / nvidia-smi / 进程表 / 日志尾 200 行
 # 设计约束：⛔ 不含 kill/重启；每条命令带 timeout；只在命中时写盘（平时零开销）。
 set -uo pipefail
@@ -18,7 +19,9 @@ OUT="${2:-$HOME/lvllm/xtu-oct28-tools/logs/poison}"
 mkdir -p "$OUT"
 STAMP=$(date +%Y%m%d-%H%M%S)
 
-PAT='empty_cache\(cuda.*失败|illegal memory access|CUDA error'
+# 【2026-10-29 扩充】worker 挂住时最先出现的是 shm 广播超时（每次 60 s），
+# 此时 CUDA context 往往还没被污染 ⇒ 必须**在 hang 的当下**就抓栈，否则事后拿不到现场。
+PAT='empty_cache\(cuda.*失败|illegal memory access|CUDA error|No available shared memory broadcast block'
 
 # -F 跟随（日志被轮转也不断），命中即停
 timeout 90000 tail -n 0 -F "$LOG" 2>/dev/null | while IFS= read -r line; do

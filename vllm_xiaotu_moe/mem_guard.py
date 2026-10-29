@@ -147,7 +147,13 @@ def tick(gp, tag: str = "", min_interval_s: float = 5.0) -> None:
               f"ours={ours / 2**30:.3f} GiB 可淘汰范围, 整卡 frag={frag:.3f} GiB | "
               f"淘汰空闲条目 {freed / 2**20:.1f} MiB",
               flush=True)
-        if int(free_after_evict) / 2**30 < soft:
+        # ⛔⛔ 【默认不做自主回收 · 2026-10-29 用户定的原则（台账 #359 / 事故 §33.29）】
+        #    淘汰完**我们自己的**缓存后若仍不够，**不再**调用 `empty_cache()`：
+        #    它在 `expandable_segments` 下是拆 VMM 页表，会让仍被裸指针引用的地址变成
+        #    `Xid 31 / FAULT_PDE / VIRT_READ`。运行时回收交给 vLLM/allocator（它撞上限时自己会做）。
+        #    仅诊断需要时用 `XIAOTU_GUARD_EMPTY_CACHE=1` 显式打开。
+        if int(free_after_evict) / 2**30 < soft and \
+                os.environ.get("XIAOTU_GUARD_EMPTY_CACHE", "0") == "1":
             import time as _t_mod
             _t0 = _t_mod.perf_counter()
             _err = None

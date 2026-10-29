@@ -583,9 +583,16 @@ def _start_cleaner_thread() -> None:
     with _CLEANER["lock"]:
         if _CLEANER["thread"] is not None:
             return
-        period = float(os.environ.get("XIAOTU_EMPTY_CACHE_EVERY_S", "300") or 300)
+        # ⛔⛔ 【默认关闭 · 2026-10-29 用户定的原则】运行时显存管理交给 vLLM/allocator，
+        #    我们**不再自主回收**。理由见 dev-docs/USER_QA_LEDGER.md #359 与事故文档 §33.29：
+        #    `expandable_segments:True` 下 `empty_cache()` 做的是**拆 VMM 页表**，
+        #    而非 CUDA 传统的"把块还池"；任何此刻仍被裸指针引用的地址，
+        #    读它就从"读到垃圾"升级为 `Xid 31 / FAULT_PDE / VIRT_READ`（实测 8 次死亡全是它）。
+        #    `synchronize()` **不是锁**，返回后其它线程仍可立刻提交 kernel。
+        #    ⇒ 需要时用 `XIAOTU_EMPTY_CACHE_EVERY_S=<秒>` **显式**打开（仅诊断用）。
+        period = float(os.environ.get("XIAOTU_EMPTY_CACHE_EVERY_S", "0") or 0)
         if period <= 0:
-            _CLEANER["thread"] = False    # 显式关闭
+            _CLEANER["thread"] = False    # 默认关闭：不在运行时自主回收
             return
         t = threading.Thread(target=_cleaner_loop, args=(period,),
                              name="xtu-mem-cleaner", daemon=True)
@@ -1308,6 +1315,9 @@ def release_staging_reserve() -> None:
         _PROF_RESERVE.clear()
         # ⭐ A69：`clear()` 只是丢掉活引用，段仍留在 torch 缓存分配器里 ⇒
         #   记账以为已归还，实际没还 ⇒ **必须** empty_cache 才真正还给驱动 ✓
+        # ✅ 【允许 · 2026-10-29 台账 #359】这是**启动期**释放**我们自己的**占位，
+        #    此时还没有任何请求在跑、也没有裸指针引用它，属"加载权重后释放重复数据"那一类；
+        #    ⛔ 运行期（有请求在飞）一律不许这么做 —— 那才是 `Xid 31 / FAULT_PDE` 的来源。
         try:
             import torch as _t2
             _t2.cuda.empty_cache()

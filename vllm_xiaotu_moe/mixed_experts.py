@@ -2343,7 +2343,9 @@ class _XiaotuExpertsMixin:
                                                          _I, _slot_try))
                             _slot = _slot_try
                         except Exception as _exc:  # noqa: BLE001  (denied / OOM)
-                            torch.cuda.empty_cache()
+                            # ⛔ 不再 `empty_cache()`（台账 #359 / 事故 §33.29）：
+                            #    expandable 下它拆 VMM 页表，会毒化仍被裸指针引用的地址。
+                            #    拿不到 slot 就跳过本轮预取，回收交给 allocator/vLLM。
                             _dst = None
                             _slot = None
                             if not _GP_PF_WARNED.get(_dk):
@@ -2513,7 +2515,7 @@ class _XiaotuExpertsMixin:
                                 _gp_mod, _dev, _E, hidden_size, _I, _stry))
                             _slot = _stry
                         except Exception as _exc:  # noqa: BLE001  (显存门禁拒绝 / OOM)
-                            torch.cuda.empty_cache()
+                            # ⛔ 同上：不再自主 empty_cache，跳过本轮预取即可。
                             _dbufs = None
                             _slot = None
                             if not _GP_PF_WARNED.get(_pf_dk):

@@ -163,9 +163,17 @@ def main():
     log(f"INTEL_PROBE_START port={args.port} interval={args.interval}s pool={len(POOL)} start_idx={idx}")
     # ⛔【2026-10-27 修】启动即自检端口：端口给错时以前要等 10 分钟才打出 SKIP，
     #   表现为“探针在跑但什么也不做”。现在直接失败退出，不留哑进程。
-    _c, _ = rd.http_code(api_root + "/health", timeout=5.0)
+    # 端口自检：允许最多 5 分钟预热（服务重启后常处于 warming 状态），
+    # 超时仍不健康才判为端口写错并退出。
+    _deadline = time.time() + 300
+    _c = 0
+    while time.time() < _deadline:
+        _c, _ = rd.http_code(api_root + "/health", timeout=5.0)
+        if _c == 200:
+            break
+        time.sleep(10)
     if _c != 200:
-        log(f"⛔ 启动失败：{api_root}/health 返回 {_c}，请确认 --port（当前 {args.port}）")
+        log(f"⛔ 启动失败：{api_root}/health 5 分钟内未就绪（最后 {_c}），请确认 --port（当前 {args.port}）")
         return 2
 
     while True:
@@ -203,9 +211,13 @@ def main():
             except Exception as e:
                 rec = {"ts": rd.iso(), "item": pid, "error": f"{type(e).__name__}: {e}"}
                 ok = False
-            fh.write(json.dumps(rec, ensure_ascii=False) + "\n")
-            fh.flush()
-            os.fsync(fh.fileno())
+            try:
+                fh.write(json.dumps(rec, ensure_ascii=False) + "\n")
+                fh.flush()
+                os.fsync(fh.fileno())
+            except OSError as e:
+                # ⛔【2026-10-29 修】该盘偶发 fsync EIO 会直接打死探针（实测 r107 期间崩过一次）
+                log(f"⚠ 写结果失败（继续运行）：{type(e).__name__}: {e}")
             log(f"{'PASS' if ok else 'FAIL'} {pid} :: {rec.get('answer_head', rec.get('error'))}")
             if not ok:
                 ah.write(f"[{rd.iso()}] INTEL_FAIL {pid}: {rec.get('answer_head') or rec.get('error')}\n")

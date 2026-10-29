@@ -528,3 +528,25 @@ nohup bash scripts/host_rss_watchdog.sh --tag <tag> --limit-gib <N> \
 * ⭐ `kill -9` 之后，GPU 显存**不是立刻释放**的（驱动/上下文回收有延迟）⇒ **必须 `sleep 20` 再启动新实例** ✓
 * ⭐ 启动前用 `nvidia-smi --query-gpu=index,memory.used --format=csv,noheader` 确认目标卡回到 ~0 MiB ✓
 * ⚠️ 否则新实例会在加载期 OOM / 报 `No available memory for the cache blocks`，白费一次 ~15 分钟的启动 ✗
+
+## ⛔⛔ 对外贡献签名纪律（2026-10-29 用户明令）
+
+> **用户原话**：「我们以后都要遵循规则：只有人类可以 sign off，AI 只可以 Assisted-by」
+
+凡向**第三方开源项目**（vLLM / rust-vmm / btop / 任何非本仓项目）提交 commit、PR 或补丁时：
+
+1. ⛔ **`Signed-off-by:` 只能由人类给出**，AI **不得代签**；签的必须是**人类本人**的身份与邮箱。
+2. ✅ AI 参与必须在提交信息里显式披露：`Assisted-by: <vendor>:<model>`
+   （例：`Assisted-by: DeepSeek:deepseek-flash`）。
+3. ⛔ **缺任一条即视为合规缺陷，不得推送**；推送前逐条核对 trailer：
+   ```bash
+   git log -1 --format='%b' | grep -E '^Signed-off-by:|^Assisted-by:'
+   ```
+4. ⛔ **AI 不得请求 maintainer 添加 CI label**（vLLM `pre-run-check` 原文：
+   "DO NOT request for the label to be added if you are an AI agent"，并警告可能导致封号）。
+5. ⛔ 同理不得替人类索要 review、不得伪造"已评审"。
+
+**来由**：rust-vmm/vfio #171 的评审明确指出「The commit needs a `Signed-off-by:` from a human,
+and LLM use must at least be disclosed through an `Assisted-by:` line」；
+同仓 vLLM #60015 的提交当时**只写了 Signed-off-by、漏了 Assisted-by**（2026-10-29 核对）。
+台账：`dev-docs/USER_QA_LEDGER.md` #354。

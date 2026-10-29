@@ -13,6 +13,42 @@
 
 ---
 
+## [0.3.0] - 2026-10-29 — 稳定性修复 + MUSA（MP_22）初步支持
+
+> 版本号说明：v0.3.0 曾于 2026-10-24 用于"挎斗（辅助 GPU）"并整体撤回（tag 与 Release 已删除）。
+> 本条目为**重新以该号发布**，内容与挎斗无关；撤回记录见下一条。
+
+### 修复：运行期不再自主回收显存（服务每 1–4 小时必崩的根因）
+
+* **根因**：`expandable_segments:True` 下 `torch.cuda.empty_cache()` 会**拆除空闲段的 VMM 页表**
+  （不是传统语义的"还回缓存池"）。本项目存在不在 allocator 流追踪内的**裸指针缓冲**，
+  而后台清理线程采用"`synchronize()` 之后再 `empty_cache()`"——`synchronize()` **不是锁**，
+  返回后计算线程可立刻提交 kernel；实测单次 `synchronize()` 达 4.4 s。
+  两者重叠 ⇒ kernel 读到已解映射地址 ⇒ `Xid 31 / FAULT_PDE / ACCESS_TYPE_VIRT_READ` ⇒ context 粘性中毒。
+* **证据**：`/var/log/kern.log` 中 8 次崩溃对应 8 条形态一致的 `Xid 31`，
+  故障地址落在 80–330 GB 的 VMM 预留区，其中两次地址完全相同（`0x12c_74000000`）。
+* **修复**：`XIAOTU_EMPTY_CACHE_EVERY_S` 默认 `300 → 0`（不启动清理线程）；
+  `mem_guard` 兜底收进 `XIAOTU_GUARD_EMPTY_CACHE=1`（默认关）；
+  预取 OOM 分支不再 `empty_cache()`。显存回收交给 vLLM / PyTorch allocator 按需完成。
+  启动期释放自有 staging 占位保留（无请求在飞、无裸指针引用）。
+* **验证**：同等高多样性满载负载下，关闭自主回收后连续 **4h38m 无崩溃**、**`Xid` 零新增**、
+  2100+ 轮请求全部成功；此前 8 个版本的存活为 24m / 43m / 47m / 1h12m / 2h30m / 2h53m / 3h18m / 3h41m。
+
+### 新增/修复的工具
+
+* `scripts/poison_watch.sh`：启动宽限期 + 软命中不退出（旧版会被启动期良性 shm 超时骗退）；新增 worker 挂住抓栈。
+* `scripts/imbalance_watch.sh`（新增）：两卡显存/利用率不平衡持续超阈值时抓 nvidia-smi + py-spy（只读）。
+* `scripts/metricsmon.sh`（新增）：按分钟采样队列深度、KV 占用、抢占数与累计 token。
+* `scripts/resmon.sh`（新增）：48 列资源采样（VMA/fd/pinned/nvidia 映射/shm/中断/CommitLimit/PSI/每卡状态）。
+* 诊断脚本：`spec_sweep.py`、`state_probe.py`、`tail_chunk_probe.py`、`vary_soak.py`。
+
+### 新增：摩尔线程 MUSA（MP_22）初步支持
+
+* 同一份代码同时支持 CUDA 与 MUSA，平台判定单点收敛在 `musa_correctness.py`（`GPU_DEVICE`）。
+* **初步支持范围**：QFN 官方量化权重在 **MTT S4000 双卡（MP_22）+ 海光处理器**上可完整跑通
+  （混合推理路径：专家权重驻留主机内存、prefill 走 tile-ring + GPU、decode 走 CPU 引擎），功能与数值正确。
+* **限定**：定位为"能完整跑通、数值与流程正确"，**不承诺性能**（实测仍明显低于 roofline）。
+
 ## [撤回] 2026-10-24 — v0.3.0（挎斗）已撤回
 
 * ⛔ **v0.3.0 的挎斗（辅助 GPU）功能整体撤回**，不再提供、不再承诺性能；tag 与 GitHub Release 已删除。

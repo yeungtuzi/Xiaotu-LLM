@@ -1,125 +1,133 @@
-# v0.3.0 —— 辅助 GPU（挎斗）：提升多并发解码性能
+# v0.3.0 —— 稳定性修复：通过 4 小时满载压力测试；初步支持摩尔线程 MUSA（MP_22）
 
-> ⛔ **已撤回（2026-10-24）**：v0.3.0 的挎斗（辅助 GPU）功能已撤回，不再提供、不再承诺性能。
-> 本文件保留作为历史记录，但其中的性能数据（如 C=2/4 的 106.8 / 110.2 tok/s）是
-> “命中专家被静默丢弃”这个 bug 造成的错误结果，**不可引用**。
-> 修正后的实测：C=1/2/4 全部**慢于**无挎斗基线（C=4：122.6 ms vs 74.6 ms），
-> 完整证据见 [`docs/QUALITY_SIDECAR_SPEC_CONFLICT.md`](QUALITY_SIDECAR_SPEC_CONFLICT.md) §1–§14。
-
-
-> 主题：**新增辅助 GPU（挎斗）功能，把闲置的 GPU0 用来分担 MoE 热专家，
-> 提升多并发（C≥2）解码性能**。
-> 挎斗**默认关闭**；不设置 `XTU_SIDECAR` 时行为与 v0.2.9 完全一致。
+> 主题：**修掉一个潜伏已久、导致服务每隔 1–4 小时必崩的显存管理缺陷**，
+> 并用 **4 小时满载压测**给出可复现的验证；同时把 **摩尔线程 MUSA（MTT S4000 ×2，MP_22）**
+> 纳入同一份代码的**初步支持**范围。
+>
+> 说明：v0.3.0 这一版本号在 2026-10-24 曾用于"挎斗（辅助 GPU）"功能并整体撤回
+> （tag 与 Release 均已删除）。本版为**重新以该号发布**，内容完全不同；
+> 撤回记录保留在 [`RELEASE_NOTES_v0.3.0-sidecar-WITHDRAWN.md`](RELEASE_NOTES_v0.3.0-sidecar-WITHDRAWN.md)。
 
 ---
 
-## 一、新增能力
+## 一、稳定性修复（本版核心）
 
-### 1. 辅助 GPU（挎斗）`XTU_SIDECAR=gpu0`
+### 1.1 现象
 
-- 主服务仍占 **GPU1+GPU2（TP=2）**，第三张卡（物理 GPU0）作为**挎斗**：
-  常驻 200 / 1200 / 1900 个热专家（`expert_pin_sidecar_*.bin`），
-  与 CPU 引擎、GPU1/2 上的热专家**并行**计算；
-- 启动方式：`GPUS=1,2,0`（逻辑 0/1 = 物理 1/2，逻辑 2 = 物理 0），
-  并设置 `XTU_SIDECAR=gpu0`、`XTU_SIDECAR_TABLE=<表路径>`；
-- 已支持 ds41f（DeepSeek-V4.1-Flash 1017，FP8 稠密 + FP4 专家）；
-- **默认关闭**：未设置 `XTU_SIDECAR` 或表不存在 ⇒ 自动回退标准路径，**零行为变化**。
+生产配置（DeepSeek-V4.1-Flash / TP=2 / A100 ×2）在满载压测下**必然在 24 分钟至 3 小时 41 分之间崩溃**，
+连续 8 个版本无一例外。崩溃时的表象五花八门：
 
-### 2. 挎斗内核缓冲复用
-
-`sidecar_nmajor` 内核现在支持外部预分配缓冲（`bufs=`），
-每层省去 4 次 `torch.empty`，降低分配抖动。
-
----
-
-## 二、实测数据（ds41f 1017，15K，统一官方口径）
-
-口径：`docs/BENCH_PROTOCOL.md` §6（`dsh_15k_v2.jsonl`、`max_tokens=1024` 自然结束、
-每档 16 条、每档 2×C 预热）+ `bench_decode_window.py --tokenizer`（按 token 计数）。
-配置：`TP=2 · util 0.70 · MAXLEN 524288 · MBT 8192 · seqs 4 · DSpark k=5 · PIN off`。
-
-| 并发 | 无挎斗 decode | 挎斗 1900 槽 decode | 无挎斗步时 | 挎斗步时 |
-|---|---|---|---|---|
-| 1 | 68.6 | **72.5** | 82.2 ms | **66.8 ms** |
-| 2 | 70.8 | **106.8** | 115.8 ms | **85.4 ms** |
-| 4 | 79.6 | **110.2** | 197.5 ms | **119.4 ms** |
-
-- 步时三档均下降（82.2→66.8 / 115.8→85.4 / 197.4→119.4 ms）；
-- **tok/s 随 DSpark 接受率浮动**，表中取热机窗口口径；
-- prefill ≈1,250 tok/s（冷启动 TTFT 折算），与无挎斗 1,190 同量级。
-
----
-
-## 三、适用与不适用
-
-| 场景 | 结论 |
+| 表象（谁先报错） | 出现次数 |
 |---|---|
-| 多并发 C≥2，CPU MoE 是瓶颈，且有空闲 GPU0 | ✅ 推荐（步时显著下降） |
-| C=1 单流 | ⚠️ 中性，收益取决于每层固定开销 |
-| qfn（Qwen3.8-Flash-Next） | ❌ 不建议：每层跨设备开销 ~8.6ms，净负（见 `docs/QFN_NVFP4_SIDECAR_A_PLAN.md`） |
-| 显存 | 1900 槽约占 GPU0 **36 GB**；1200/200 槽可按需选择 |
+| `[xtu-vram] empty_cache 失败: illegal memory access` | 5 |
+| Triton `_init_handles` / `launch_metadata` 抛 `Triton Error [CUDA]` | 3 |
+| 分配器 `insert_events`（`~TensorImpl`）抛 `cudaErrorIllegalAddress` | 1 |
+| 无报错，但 worker 挂住（`shm_broadcast` 60 s 超时） | 1 |
 
----
+> 这些表象**都不是根因**。CUDA 的非法访存是**异步且粘性**的：肇事 kernel 早已返回，
+> 错误被记在 context 上，等**下一个** CUDA API 调用才爆出来 —— 所以栈顶永远只是"下一个碰到错误的调用"。
 
-## 四、已知问题
+### 1.2 定位
 
-1. **挎斗会降低 DSpark 接受率**（实测 83% → 65% → 40%），
-   因此 tok/s 的提升不稳定；步时收益真实，但需要数值对齐后才能稳定转化为吞吐；
-2. 挎斗要求 `GPUS` 显式包含物理 GPU0（`GPUS=1,2,0`），否则初始化会回退标准路径并打印原因；
-3. 挎斗与 PIN（`XIAOTU_PIN`）**不要同时开**，两者都会占用 GPU1/2 显存。
+关键证据来自**内核日志**（`/var/log/kern.log`，`adm` 组可读；`dmesg` 需 root）：
 
----
-
-## 五、口径与文档
-
-- 基准口径：[`docs/BENCH_PROTOCOL.md`](docs/BENCH_PROTOCOL.md) §6 / §6.1 / §6.2
-- 挎斗复盘（目标、设计、实现、测试、分析、建议）：
-  [`docs/SIDECAR_GPU0_POSTMORTEM.md`](docs/SIDECAR_GPU0_POSTMORTEM.md)
-- 挎斗计划与逐日记录：
-  [`docs/AUXILIARY_GPU_SIDECAR_PLAN_2026-10-22.md`](docs/AUXILIARY_GPU_SIDECAR_PLAN_2026-10-22.md)
-- qfn 挎斗 A 方案（负结果）：
-  [`docs/QFN_NVFP4_SIDECAR_A_PLAN.md`](docs/QFN_NVFP4_SIDECAR_A_PLAN.md)
-
----
-
-## 六、升级
-
-```bash
-pip install -U vllm-xtu-moe==0.3.0
+```
+NVRM: Xid (PCI:0000:c1:00): 31, pid=..., name=VLLM::Worker, channel 0x...
+  MMU Fault: ENGINE GRAPHICS GPC2 GPCCLIENT_T1_0 faulted @ 0x12c_74000000
+  Fault is of type FAULT_PDE  ACCESS_TYPE_VIRT_READ
 ```
 
-- 默认关闭，**升级本身不改变任何行为**；
-- 启用挎斗：`GPUS=1,2,0 XTU_SIDECAR=gpu0 XTU_SIDECAR_TABLE=<table.bin> bash scripts/serve_v41.sh`
-- 回滚：去掉 `XTU_SIDECAR*` 即可回到 v0.2.9 行为。
+* `FAULT_PDE` = 页目录项不存在；`ACCESS_TYPE_VIRT_READ` = **读**；
+* 故障地址落在 80–330 GB 的虚拟地址区间 —— 正是 `expandable_segments:True` 的 **CUDA VMM** 预留区；
+* 8 次崩溃对应 8 条 `Xid 31`，形态完全一致；其中两次的故障地址**一字不差**（`0x12c_74000000`）。
+
+⇒ 真正发生的事：**某个 kernel 去读一块已经被解除映射（unmapped）的显存**。
+
+### 1.3 根因
+
+在 `PYTORCH_CUDA_ALLOC_CONF=expandable_segments:True` 下，`torch.cuda.empty_cache()`
+做的不再是 CUDA 传统语义的"把空闲块还回缓存池"，而是**拆除空闲段的 VMM 页表**。
+本项目存在**裸指针缓冲**（不在 PyTorch allocator 的流追踪范围内），而当时的后台清理线程
+采用"`synchronize()` 之后再 `empty_cache()`"的写法：
+
+* `synchronize()` **不是锁** —— 它返回后，计算线程可以立刻提交新的 kernel；
+* 实测单次 `synchronize()` 耗时可达 **4.4 秒**，窗口极大；
+* 一旦解映射与"仍有 kernel 在读该段"重叠 ⇒ `Xid 31` ⇒ context 粘性中毒 ⇒ 服务不可用。
+
+这也解释了此前所有反常观察：**单次超长上下文（150K / 333K / 40 万 token）压不死**（需要清理线程与在飞 kernel 撞窗口），
+而**跑够时间必然崩**（碎片越多、被解映射的段越多、撞上的概率越高）。
+
+### 1.4 修复
+
+**运行期不再自主回收显存，显存管理交给 vLLM / PyTorch allocator 的按需路径**
+（分配无法满足时 allocator 自己会释放缓存段，且发生在知道"确实需要内存"的线程里）。
+
+| 位置 | 变更 |
+|---|---|
+| `vllm_xiaotu_moe/gpu_prefill.py` 后台清理线程 | `XIAOTU_EMPTY_CACHE_EVERY_S` **默认 300 → 0**（默认不启动） |
+| `vllm_xiaotu_moe/mem_guard.py` 兜底 | 收进 `XIAOTU_GUARD_EMPTY_CACHE=1`，**默认关** |
+| `vllm_xiaotu_moe/mixed_experts.py` 预取 OOM 分支 | 不再 `empty_cache()`，直接跳过本轮预取 |
+| `vllm_xiaotu_moe/gpu_prefill.py` 启动期释放 staging 占位 | **保留**（此时无请求在飞、无裸指针引用，属"释放自己的占位"） |
+
+改动是**默认更安全**的方向：即使启动时不传任何环境变量，也不会再开清理线程。
+
+### 1.5 验证（4 小时满载）
+
+同一负载、同一配置，唯一差异 = 关闭自主回收：
+
+| 实例 | 自主回收 | 存活 | `Xid 31` 新增 |
+|---|---|---|---|
+| r108 | 开 | 24 分钟 | 1 |
+| r103 / r104 | 开 | 43 / 47 分钟 | 1 / 1 |
+| r107 | 开 | 1 小时 12 分 | 1 |
+| r102 | 开 | 2 小时 30 分 | 1 |
+| r106 | 开 | 2 小时 53 分 | 1 |
+| r105 | 开 | 3 小时 18 分（挂住） | 1 |
+| r101 | 开 | 3 小时 41 分 | 1 |
+| **r110（本版）** | **关** | **4 小时 38 分以上，全程无崩溃** | **0（内核计数保持不变）** |
+
+压测条件：请求长度按真实分布随机（60% 1K–8K / 25% 8K–40K / 15% 40K–300K token），
+`max_tokens` 随机 1–512，10% 轮次双路并发，累计 **2100+ 轮**全部成功；
+两卡显存始终对称（差值 ≤ 2 MiB），温度 42–48 °C，无降频、无 Xid、无 ECC 错误。
+
+### 1.6 配套的工具与看门狗修复
+
+* `scripts/poison_watch.sh`：**启动宽限期**（默认 420 s）+ **软命中不退出** ——
+  旧版会被启动期那条良性的 `shm_broadcast` 超时骗退，导致真正出事的时刻无人看守；
+  新增对 worker **挂住**（`No available shared memory broadcast block`）的当场抓栈。
+* `scripts/imbalance_watch.sh`（新增）：两卡**显存/利用率不平衡**持续超阈值时抓
+  `nvidia-smi` + 两个 worker 的 py-spy 栈（只读，不杀进程）。
+* `scripts/metricsmon.sh`（新增）：按分钟采样 `num_requests_waiting`、`kv_cache_usage_perc`、
+  `num_preemptions_total`、累计 prompt/generation tokens。
+* `scripts/resmon.sh`（新增）：48 列资源采样（VMA / fd / 线程 / pinned / nvidia 映射 /
+  `/dev/shm` / 中断 / `CommitLimit` vs `Committed_AS` / PSI / 每卡显存·功耗·温度·降频）。
+* 诊断脚本：`spec_sweep.py`（特化扫描）、`state_probe.py`（形状×占用）、
+  `tail_chunk_probe.py`（小尾块+长上下文）、`vary_soak.py`（高多样性压测）。
 
 ---
 
-## 七、可变 K（DSpark adaptive verification）——已实现并评估，**暂时暂停**
+## 二、摩尔线程 MUSA（MP_22）初步支持
 
-本次一并完成了 DSpark「可变长度验证」的实现与评估，结论是**本机收益不大，暂停**：
+同一份代码同时支持 CUDA 与 MUSA，平台判定**单点**收敛在 `musa_correctness.py` 读取 `GPU_DEVICE`，
+不保留平台专用实现副本、不允许平台专用依赖（`scripts/check_single_code.sh` 可持续检查）。
 
-- **固定 k 扫描**（15K，官方口径）：C=1 最优 k=5（68.6 tok/s），C=4 最优 k=3（83.7 tok/s）⇒ 最优 k 随并发变化；
-- **完整 adaptive verification**：A100 上 `DeepseekV41IndexerBackend` 不支持设备侧裁剪，需移植 ROCm device-lens 路径，**评估为不划算**；
-- **置信度驱动 per-request 变长**：已实现且与固定 k=5 **逐 token 一致**，但各请求置信度曲线同质、verify 固定成本不随 k 缩短 ⇒ 无差异化收益；
-- **内建 batch-size 动态 k**（零代码，`num_speculative_tokens_per_batch_size = [[1,2,5],[3,4,3]]`）：
-  C=1 69.3 / C=2 74.1~75.3 / C=4 **83.2**（固定 k=5 为 68.6 / 70.8 / 79.6，C=4 **+4.5%**）。
+**支持范围（初步）**：**QFN 官方量化权重**在 **MTT S4000 双卡（MP_22）+ 海光处理器**上可完整跑通，
+混合推理路径（专家权重驻留主机内存、prefill 走 tile-ring + GPU、decode 走 CPU 引擎）功能与数值正确。
 
-**处置**：暂停进一步投入；**代码默认关**（不设 `XTU_VARLEN_K` 即原行为）；
-重新启用条件 = **硬件变化（sm90+/sm100）**或**其他挖潜手段穷尽**后再评估。
-实现细节、数据与门限见 [`docs/DYNAMIC_K_NOTES.md`](docs/DYNAMIC_K_NOTES.md)。
+**限定说明（重要）**：本版对 MUSA 的定位是「能完整跑通、数值与流程正确」，**不承诺性能**；
+实测性能仍明显低于 roofline，瓶颈已定量但尚未定位。
+
+## 三、升级说明
+
+* 本版**不需要**改任何配置即可获得稳定性修复（清理线程默认不再启动）。
+* 若确需诊断用途的周期性回收，显式设置 `XIAOTU_EMPTY_CACHE_EVERY_S=<秒>`（会解映射 VMM 页，慎用）。
+* 建议部署后把 `/var/log/kern.log` 的 `Xid` 计数纳入监控——这是 GPU 侧最直接的故障证据来源。
 
 ---
 
-## 八、已知问题（2026-10-24 发现，重要）
+## 四、已否证的假设（留档，避免重复走弯路）
 
-**挎斗目前只在单请求（qlen=1）下输出正确**；batch>1 时会出现空回复/截断/内容异常。
-实测（temp=0，SPEC=0，相同提示词并发对比）：
-
-| 配置 | 单请求 | batch=4 |
-|---|---|---|
-| 无挎斗 | 119 字 | 121 / 129 / 125 / 119（均完整）|
-| 有挎斗 | 118 字 | **0 / 153 / 0 / 33** |
-
-因此本页 §一 中 C≥2 的挎斗吞吐数据（106.8 / 110.2 tok/s）**是在输出已损坏的前提下测得的**，
-不能作为生产特性；C≥2 请勿启用挎斗。另：挎斗与 DSpark 投机解码叠加时质量同样不可接受。
-定位与复现见 [`docs/QUALITY_SIDECAR_SPEC_CONFLICT.md`](docs/QUALITY_SIDECAR_SPEC_CONFLICT.md)。
+崩溃原因曾先后被怀疑为：① 预热不足；② CUDA 惰性模块加载；③ 侧流预取跨流释放；
+④ 新 Triton 特化首次加载（30 个构造扫描）；⑤ 新特化 × 高占用（27.8% KV + 40 万上下文 decode）；
+⑥ 小尾块 + 长上下文（`8192k+q` 精确构造）。
+以上六项均以**独立实验否证**，最终由内核日志的 `Xid 31 / FAULT_PDE / VIRT_READ` 定案。

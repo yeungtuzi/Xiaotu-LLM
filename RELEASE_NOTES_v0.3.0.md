@@ -117,7 +117,23 @@ NVRM: Xid (PCI:0000:c1:00): 31, pid=..., name=VLLM::Worker, channel 0x...
 **限定说明（重要）**：本版对 MUSA 的定位是「能完整跑通、数值与流程正确」，**不承诺性能**；
 实测性能仍明显低于 roofline，瓶颈已定量但尚未定位。
 
-## 三、升级说明
+## 三、安装
+
+```bash
+pip install ./xiaotu_llm-0.3.0-cp312-cp312-manylinux_2_34_x86_64.whl   # 需已安装 vLLM
+```
+
+* 平台/ABI：**CPython 3.12 · x86_64 · glibc ≥ 2.34**（`manylinux_2_34`）；
+* 内含 11 个 CPU 引擎变体（`scalar` / `avx2` / `avx512_base` / `avx512_vnni` /
+  `avx512_bf16` / `avx512_bf16_vbmi` 及其 `_pf*` 微变体），运行时按 CPU 能力**自动选择**；
+* checksum：`sha256:84207cb93adc302810e184c66c5d547bf5127aae4a0979dfe5851da2909e3f43`；
+* ⚠️ **包名变更**：项目自 2026-10-27 起正式名为 **Xiaotu-LLM**，因此 wheel 文件名由
+  `vllm_xtu_moe-*` 变为 **`xiaotu_llm-*`**（Python 包名仍是 `xiaotu_moe` / `vllm_xiaotu_moe`，
+  插件入口不变，`pip uninstall vllm-xtu-moe` 后安装本包即可）。
+
+---
+
+## 四、升级说明
 
 * 本版**不需要**改任何配置即可获得稳定性修复（清理线程默认不再启动）。
 * 若确需诊断用途的周期性回收，显式设置 `XIAOTU_EMPTY_CACHE_EVERY_S=<秒>`（会解映射 VMM 页，慎用）。
@@ -125,7 +141,7 @@ NVRM: Xid (PCI:0000:c1:00): 31, pid=..., name=VLLM::Worker, channel 0x...
 
 ---
 
-## 四、已否证的假设（留档，避免重复走弯路）
+## 五、已否证的假设（留档，避免重复走弯路）
 
 崩溃原因曾先后被怀疑为：① 预热不足；② CUDA 惰性模块加载；③ 侧流预取跨流释放；
 ④ 新 Triton 特化首次加载（30 个构造扫描）；⑤ 新特化 × 高占用（27.8% KV + 40 万上下文 decode）；

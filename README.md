@@ -7,7 +7,7 @@
 [![Platform](https://img.shields.io/badge/Platform-2%C3%97%20EPYC%209654%20%2B%203%C3%97%20A100-76b900)](#实测平台)
 [![Models](https://img.shields.io/badge/models-DeepSeek--V4.1--Flash%20%C2%B7%20GLM--5.3--Flash%20%C2%B7%20Qwen3.8-green)](docs/MODEL_GUIDES.md)
 
-> **v0.3.0**:稳定性修复 —— **可稳定通过 4 小时满载压测**;新增**摩尔线程 MUSA 初步支持**(QFN 官方量化权重,S4000 双卡 + 海光处理器)。详见 [发行说明](RELEASE_NOTES_v0.3.0.md)。
+> **v0.3.0**:稳定性修复 —— **可稳定通过 12 小时满载压测**;新增**摩尔线程 MUSA 初步支持**(QFN 官方量化权重,S4000 双卡 + 海光处理器)。详见 [发行说明](RELEASE_NOTES_v0.3.0.md)。
 
 > **Xiaotu-LLM**(读音:小兔-LLM)—— 一个面向**超大 MoE 模型**的**推理架构**,以 vLLM 插件形式提供。
 >

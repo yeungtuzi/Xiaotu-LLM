@@ -28,12 +28,26 @@ from __future__ import annotations
 import argparse
 import json
 import queue
+import random
 import statistics
+import string
 import threading
 import time
 import urllib.request
 
 DS = "/home/user/lvllm/process_data/data/dsh_15k_v2.jsonl"
+
+
+def _cache_hits(port):
+    """读服务端前缀缓存命中累计值（用不到就返回 None）。"""
+    try:
+        with urllib.request.urlopen("http://127.0.0.1:%d/metrics" % port, timeout=5) as r:
+            for line in r.read().decode().splitlines():
+                if line.startswith("vllm:prefix_cache_hits_total{"):
+                    return float(line.rsplit(" ", 1)[1])
+    except Exception:  # noqa: BLE001
+        return None
+    return None
 
 
 def deg(t, n=8):
@@ -50,7 +64,7 @@ def deg(t, n=8):
     return dup / tot
 
 
-def one(prompt, outlen, port, model, sink, tag):
+def one(prompt, outlen, port, model, sink, tag, cache_bust=0):
     """流式发一条:记 ttft / 末 token 时刻 / chunks(≈解码步数)/ 全文。"""
     # ⭐⭐【2026-10-17 用户裁定 · QA #264】**不得强制输出**:`max_tokens` 仅作上限,模型自然结束 ✓
     #   废止旧口径 `"min_tokens": outlen` + `"ignore_eos": True` ✗
@@ -59,6 +73,15 @@ def one(prompt, outlen, port, model, sink, tag):
     #   ⚠️ 连带重构(缺一即不可读):
     #     ① 长度不再固定 ⇒ `tok/s` **失去可比性** ⇒ ⭐ **主判据改为"步时"**(协议 §4.1 ✓)
     #     ② **必须同报**【实际输出长度中位】与【被上限截断的比例】⇒ 否则等于"偷偷变短" ✗
+    # ⭐⭐【2026-10-31 用户明令 · 协议 §9.2】**prefill 测量必须破缓存**：
+    #   载荷 dsh_15k_v2.jsonl 的 32 条共用 24 个会话 ⇒ 前缀高度重叠，
+    #   实测服务端 prefix_cache_hits/queries = 57.5% ⇒ TTFT 测到的是"命中缓存"，
+    #   prefill 速度被虚高到 20 倍以上（报出 26k，真值 ≈1K）✗
+    #   ⇒ 在每个 prompt 最前面插随机头（默认 400 字符），并断言缓存命中不增加 ✓
+    if cache_bust > 0:
+        prompt = ("".join(random.choice(string.ascii_letters + " .,")
+                          for _ in range(int(cache_bust))) + "\n\n" + prompt)
+    _h0 = _cache_hits(port)
     body = {"model": model, "prompt": prompt,
             "max_tokens": outlen, "ignore_eos": False,
             "temperature": 0.0, "stream": True,
@@ -104,6 +127,12 @@ def one(prompt, outlen, port, model, sink, tag):
     sink[tag] = {"tok": _nt,
                  "n_src": "usage" if ntok else "chunks",
                  "ptok": ptok, "ttft": first, "tlast": last,
+                 # ⭐【2026-10-31 补】绝对时刻(同一时钟)：多流"聚合"必须靠它，
+                 #   因为每路的 ttft/tlast 都相对自己发起时刻，跨请求拼会串行化 ✗
+                 "cache_hits": (_cache_hits(port) or 0) - (_h0 or 0),
+                 "t_send_abs": t0,
+                 "t_first_abs": (t0 + first) if first else None,
+                 "t_last_abs": (t0 + last) if last else None,
                  "dt": time.time() - t0, "chunks": nchunk,
                  "outlen": _nt, "cap": int(outlen),
                  "capped": int(_nt >= int(outlen)),
@@ -121,6 +150,8 @@ def main():
     ap.add_argument("--model", default="DeepSeek-V4.1-Flash")
     ap.add_argument("--tag", default="")
     ap.add_argument("--dataset", default=DS)
+    ap.add_argument("--cache-bust", type=int, default=0,
+                    help="在 prompt 前插入 N 个随机字符以破前缀缓存（协议 §9.2 建议 400）")
     ap.add_argument("--jsonl", default="", help="把每条原始记录写到该文件(供事后分层)")
     a = ap.parse_args()
     recs = [json.loads(ln) for ln in open(a.dataset, encoding="utf-8") if ln.strip()]
@@ -143,7 +174,7 @@ def main():
             with lock:
                 if t_start[0] is None:
                     t_start[0] = time.time()
-            one(pr, a.outlen, a.port, a.model, sink, "r%d_%d" % (rd, i))
+            one(pr, a.outlen, a.port, a.model, sink, "r%d_%d" % (rd, i), a.cache_bust)
             with lock:
                 t_end[0] = time.time()
 
@@ -182,8 +213,22 @@ def main():
     print("① 聚合输出吞吐(含预填 = vLLM `Output token throughput`)= %d / %.1fs = **%.1f tok/s**"
           % (stok, wall, stok / wall))
     if sdur > 0:
-        print("② 聚合解码吞吐(仅解码段,与 README 的 decode 列同口径)= %d / %.1fs = **%.1f tok/s**"
-              " ⇒ **×C 外推 = %.1f**" % (stokd, sdur, stokd / sdur, stokd / sdur * a.conc))
+        # ⚠️【2026-10-31 更正标签】原称"聚合解码吞吐"是错的：分母 Σ(tlast−ttft) 把
+        #   多路**并行**的解码时长相加 ⇒ 实际是"平均每路解码速率"，不是墙钟吞吐 ✗
+        print("②a 平均每路解码速率(Σtok ÷ Σ每路解码时长)= %d / %.1fs = **%.1f tok/s**"
+              % (stokd, sdur, stokd / sdur))
+    # ⭐ 墙上聚合(唯一正确的多流口径)：用**绝对时刻**从最早首 token 到最晚末 token
+    absd = [v for v in dec if v.get("t_first_abs") and v.get("t_last_abs")]
+    if absd and len(absd) >= 2:
+        t_f = min(v["t_first_abs"] for v in absd)
+        t_l = max(v["t_last_abs"] for v in absd)
+        span = t_l - t_f
+        tok_abs = sum(v["tok"] for v in absd)
+        if span > 0:
+            print("②b 墙上聚合解码吞吐(Σtok ÷ 最早首token→最晚末token %.2fs)= **%.1f tok/s**"
+                  " ⇒ 每路均分 ≈ %.1f" % (span, tok_abs / span, tok_abs / span / max(1, a.conc)))
+    else:
+        print("②b 墙上聚合：本文件缺绝对时刻(旧 jsonl)，请用 ②a 或重跑")
     print("③ 每请求解码速率中位 = %.1f tok/s ;**TPOT 中位 = %.1f ms/token** ;TTFT 中位 = %.1f ms"
           % (statistics.median(per_req) if per_req else float("nan"),
              statistics.median(tpot) if tpot else float("nan"),

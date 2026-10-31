@@ -432,3 +432,25 @@ timeout 150 python scripts/bench_cpu_engine.py
 **测量陷阱留档**：曾把"同波最早首 token → 最晚末 token"当聚合分母，C=2 时该窗口包含第二路
 **串行的 14 s 预填等待**，算出 30 tok/s（比每路 24 还接近），属**口径错误**——聚合必须用
 `C × 每路` 或 `AL ÷ 步时`，不能把预填交错算进解码窗口。
+
+### 6.13 勘误：CED 不是开关，prefill 的「减半」来自架构（2026-10-31）
+
+**错误结论（本日早些时候，已作废）**：把 prefill 804 vs 1,190 的差距归因为「生产没传
+`--swa-bounded-replay` ⇒ CED 关闭」。
+
+**事实**：
+
+| 层 | 内容 | 是否可开关 |
+|---|---|---|
+| **架构级 CED**（Causal Encoder-Decoder） | 40 层 = 20 encoder + 20 decoder；**prefill 只跑 encoder（8B 激活/token）**、decode 跑 40 层（16B） | ❌ 模型自带，**永远生效** |
+| **SWA Bounded Replay**（上游 PR #56752） | 只对 SWA 层的 KV 写回/回放做有界化；`vllm/config/cache.py:240` 默认 `True` | ✅ 只有 `--no-swa-bounded-replay` 才关 |
+
+本树已在 `vllm/models/deepseek_v41/decoder_replay_layers.py` 实现 decoder 侧 prefill 跳过
+（"in eager prefill steps they run on each request's last `window` rows only"）。
+
+⇒ **804（本引擎实测）与 1,190（README）两个数都是在 CED 生效下取得的**，差距**与 CED 无关**。
+可变项只剩：`GPU_UTIL`（README 0.70 / 实测 0.85）、`MAXLEN`（524288 / 262144）、载荷（v2 / v3）、
+以及 warm / 冷口径。
+
+**教训**：凡涉及"某特性是否开启"，先读**模型与缓存代码的默认值**，再谈命令行旗标；
+"命令行没有该旗标"与"该特性关闭"是两件事。

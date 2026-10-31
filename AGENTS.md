@@ -577,3 +577,21 @@ and LLM use must at least be disclosed through an `Assisted-by:` line」；
    * 开关在 `CacheConfig` 构造时读取 ⇒ **起来后改不了**，只能重启。
 3. ⛔ **不得用直接 `api_server` 命令行绕过 `serve_v41.sh`** 做"生产口径"测量；确实要绕过时，必须显式补 `--swa-bounded-replay`。
 4. ⭐ 报告里凡出现 prefill 数字，**必须标注 CED=1 / CED=0**，否则该数字不可比（历史 README 1,190 是 CED=1 口径）。
+
+### ⚠️ 2026-10-31 勘误（同纪律，当天更正）
+
+上节第 2 条中"命令行**含** `--swa-bounded-replay` 才算生效"的判据**是错的**，原因：
+
+* 本树 `vllm/config/cache.py:240` 的默认值是 **`swa_bounded_replay: bool = True`** ⇒
+  **CED 默认就是开的**；`--swa-bounded-replay` 是 **no-op**，只有 `--no-swa-bounded-replay` 才关掉它；
+* 因此"命令行里没有该旗标"**不等于** CED 关闭（实测：生产 k3 从未传过该旗标，CED 一直是开的，
+  日志里也没有 `SWA bounded replay needs model runner V2` 警告，KV 池占用与 CED 开启相符）。
+
+⇒ **正确判据（脚本 `scripts/check_ced_on.sh` 已按此实现）**：
+
+1. 命令行**不含** `--no-swa-bounded-replay`；
+2. 日志**不含** `SWA bounded replay needs model runner V2`
+   （该机制要求 `use_v2_model_runner`，见 `vllm/models/deepseek_v41/attention.py:530`）。
+
+⇒ 推论：**要做 CED A/B，基线臂必须显式传 `--no-swa-bounded-replay`**；
+"传了 `--swa-bounded-replay`"与"没传"在行为上**完全等价**。

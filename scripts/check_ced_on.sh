@@ -8,9 +8,12 @@
 # 只读脚本：只读 /proc 与日志，不启停任何进程、不发信号。
 #
 # 判据（全部满足才算 CED 生效）：
-#   ① 进程存在，且命令行含 `--swa-bounded-replay`
+#   ⭐ 树的默认值是 **开**（`vllm/config/cache.py: swa_bounded_replay: bool = True`）
+#      ⇒ `--swa-bounded-replay` 是 no-op；**只有** `--no-swa-bounded-replay` 才关掉它。
+#   ① 进程存在
 #   ② 命令行**不含** `--no-swa-bounded-replay`
-#   ③ 日志里不出现 `SWA bounded replay needs model runner V2`（出现 = CED 没生效）
+#   ③ 日志里不出现 `SWA bounded replay needs model runner V2`（出现 = CED 没生效：
+#      该机制要求 use_v2_model_runner，见 vllm/models/deepseek_v41/attention.py:530）
 #
 # 退出码：0=生效；1=未生效；2=服务不存在
 #
@@ -68,12 +71,7 @@ if printf '%s' "$CMD" | grep -q -- '--no-swa-bounded-replay'; then
     exit 1
 fi
 
-if printf '%s' "$CMD" | grep -q -- '--swa-bounded-replay'; then
-    echo "✓ 命令行含 --swa-bounded-replay"
-else
-    echo "✗ 命令行**不含** --swa-bounded-replay ⇒ CED 静默关闭（2026-10-31 事故同款）" >&2
-    exit 1
-fi
+echo "✓ 命令行不含 --no-swa-bounded-replay（树默认开）"
 
 if [ -n "$LOG" ] && [ -r "$LOG" ]; then
     if grep -aq 'SWA bounded replay needs model runner V2' "$LOG"; then

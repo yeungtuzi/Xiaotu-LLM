@@ -44,8 +44,16 @@ setsid nohup bash scripts/host_rss_watchdog.sh --tag qfn_029 --limit-gib 620 \
   > /tmp/wd_qfn_029.out 2>&1 < /dev/null &
 ```
 
-⚠️ **`THREADS=60` 的含义**:TP=2 下 = 每 rank 60、合计 **120 线程 = 5 核/CCD**(本机 SMT 关),
-是"吃满带宽且无争用"的最优点;⛔ **不许上调**。
+⚠️ **`THREADS=60` 的含义**:TP=2 下 = 每 rank 60、合计 **120 线程 = 5 核/CCD**。
+
+> **2026-10-30 勘误（实测，取代"不许上调"）**：引擎把 job 切分改成按工作量正比之后，
+> **8 核/CCD（=96 线程/rank）比 5 核/CCD 更快**：服务级 **77.32 vs 78.13 ms/步、+2.7% tok/s**。
+> ⚠️ **但只在 SMT 打开时成立**：SMT 关时 96/rank 占满该 node 全部物理核、没有余量，
+> 服务级实测 **87.60 ms/步、43.00 tok/s（−12.7%）**。
+> ⇒ **默认值按 SMT 状态门控**（2026-10-30 起，`scripts/serve_v41.sh` 读 `smt/active`）：
+> `=1` ⇒ **96/rank**；`=0` 或读不到 ⇒ **60/rank**。可用 `XIAOTU_MOE_THREADS` 覆盖。
+> 硬上限仍是**每 CCD ≤8 线程（每物理核 1 个）**。判据、端点与"REP≥200"的测量坑见
+> `dev-docs/report/tuning/IRON_RULES.md` **R12** 与 `docs/EXPERIMENTS.md` **B1081/B1082/B1085**。
 
 ---
 
@@ -1083,7 +1091,7 @@ curl -s localhost:8700/v1/chat/completions -H 'Content-Type: application/json' \
 | `MBT=8192` | 8192 | 与 §570 一致;⚠️ **别用 32768**(§593(f) 会 hang) |
 | ~~`COMPILE=0`~~ | ⛔ 作废 | §0 已改为 `COMPILE=1 + FULL_DECODE_ONLY`(2026-10-19 实测图对 decode 是数倍收益) |
 | `GPU_RESIDENT_LAYERS`(空) | 0 层 | §584 实测**负收益**(TPOT 43.19 vs 42.86;C=4 −12%);这块显存改投 KV 收益确定 |
-| `THREADS=60` | 每 rank 60 | 本机 24 CCD 拐点;TP=2 下 184/rank 会 368 线程超订 |
+| `THREADS=60` | 每 rank 60 | 硬约束是**每 CCD ≤8 线程**（184/rank = 超订，实测 TPOT 436 ms）。⚠️ 2026-10-30 实测：当前内核下 **8 核/CCD（96/rank）比 60 更快（+2.7%）**，见 `IRON_RULES.md` **R12** |
 | `SPIN=300` | 300 | SPIN=0 时每层白付 ~0.5 ms futex(0.94-1.00 vs 0.44 ms/层) |
 | `ENGRAM_LAST=1` | 默认 | 峰值主机内存 **629.4 GiB vs 1087.6 GiB(−42%)** |
 | `RELEASE_SOURCE=1` | 默认 | 逐层 load/slice/release,主机专家内存 522→253 GiB |

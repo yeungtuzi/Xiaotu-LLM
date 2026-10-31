@@ -476,6 +476,77 @@ def select_local_topk(g_list, em_global_to_local, e_local: int, cap: int) -> lis
     return sel
 
 
+# ══════════════════════════════════════════════════════════════════════════════
+# 【2026-10-31 · 用户明令】禁止出现 vLLM 不知道的显存占用
+#
+# 事故形态（实测，生产 k3 / util 0.90 / 524288）：
+#   * `gpu_worker.py:721 Available KV cache memory: 11.15 GiB`  ← KV 预算在这里定
+#   * `[xtu-pin] layer0…layer39` 在它**之后**才分配（日志行号 713–868 > 699）
+#   ⇒ 热专家常驻池 **5.1 GiB/worker 完全没进 vLLM 的账** ⇒ 进程实际占用 38.8 GiB
+#     而预算只有 35.5 GiB ⇒ 余量被吃到 0.6 GiB，长上下文迟早 OOM ✗
+#
+# 修法（与 `gpu_prefill.reserve_staging_for_profile` 同一范式）：
+#   在 `determine_available_memory` 入口（内存探测**之前**）占位一块与常驻池
+#   等量的活张量 ⇒ 被 `memory_profiling` 的 after_profile 测到 ⇒ KV 据实定容；
+#   在**第一次真正建池**之前释放占位 ⇒ 那块显存正好被真池子接走，净占用不变。
+# ══════════════════════════════════════════════════════════════════════════════
+
+_PROF_PIN_RESERVE: list = []
+
+# 每槽实测占用（`expert_pool` 注释里的实测值：3.98 GiB / 448 槽 ≈ 9.1 MiB）
+_PIN_BYTES_PER_SLOT = int(9.5 * 2**20)
+
+
+def pin_reserve_bytes() -> int:
+    """本次进程**预计**要被热专家常驻池吃掉的显存（占位用，宁多勿少）。"""
+    slots = _pin_cap_per_layer()
+    if slots <= 0 or not pin_enabled():
+        return 0
+    try:
+        n_layers = int(os.environ.get("XIAOTU_PIN_LAYERS", "40") or 40)
+    except Exception:  # noqa: BLE001
+        n_layers = 40
+    return int(slots) * _PIN_BYTES_PER_SLOT * n_layers
+
+
+def reserve_pin_for_profile(device=None) -> bool:
+    """在 vLLM 测 KV 预算**之前**占位，让常驻池进 vLLM 的账 ✓
+
+    返回是否成功；失败**必须出声**（静默退化正是这次事故的形态）✗
+    """
+    need = pin_reserve_bytes()
+    if need <= 0:
+        return False
+    try:
+        import torch
+        if device is None:
+            device = torch.device("cuda", torch.cuda.current_device())
+        t = torch.empty(int(need), dtype=torch.uint8, device=device)
+    except Exception as exc:  # noqa: BLE001
+        print(f"[xtu-pin] ⛔ profile 期常驻池占位失败({need / 2**30:.2f} GiB):"
+              f"{type(exc).__name__}: {exc} —— KV 会按'没有常驻池'定容，运行期有 OOM 风险 ✗",
+              flush=True)
+        return False
+    _PROF_PIN_RESERVE.append(t)
+    print(f"[xtu-pin] ⭐ profile 期常驻池占位 {need / 2**30:.2f} GiB"
+          f"(进 vLLM 的 total_consumed ⇒ KV 据实定容;首次建池时释放归还) ✓", flush=True)
+    return True
+
+
+def release_pin_reserve() -> None:
+    """释放占位 —— 必须**紧接着**第一次真建池之前调用，净占用不变 ✓"""
+    if not _PROF_PIN_RESERVE:
+        return
+    import torch
+    n = len(_PROF_PIN_RESERVE)
+    _PROF_PIN_RESERVE.clear()
+    try:
+        torch.cuda.empty_cache()
+    except Exception:  # noqa: BLE001
+        pass
+    print(f"[xtu-pin] profile 期占位已释放({n} 块)⇒ 交给真正的常驻池 ✓", flush=True)
+
+
 def build_layer_pool(engine, device, hidden: int, inter: int, group_k: int,
                      e_local: int, layer_idx: int, em_global_to_local, topk: int = 0,
                      layout: str = "mxfp4", table_path: str = None,
@@ -487,6 +558,9 @@ def build_layer_pool(engine, device, hidden: int, inter: int, group_k: int,
     """
     if require_pin and not pin_enabled():
         return None
+    # ⭐ 占位只活到"第一次真建池"为止：释放后由本层真池接走，净占用不变 ✓
+    if _PROF_PIN_RESERVE:
+        release_pin_reserve()
     path = table_path or os.environ.get(_ENV_TABLE, "")
     if not path or not os.path.exists(path):
         # ⛔ 2026-10-16 修:这一行原先**每层每次建池都打** ⇒ 实测在

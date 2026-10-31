@@ -1569,6 +1569,14 @@ def install_profile_guard() -> list[str]:
                 except Exception as _e:  # noqa: BLE001
                     print("[vllm-xtu-moe] ⛔ activation 占位失败(不掩盖): "
                           f"{type(_e).__name__}: {_e}", flush=True)
+                # ⭐⭐【2026-10-31 · 用户明令】热专家常驻池也必须进账：
+                #   实测它原先在 KV 预算**之后**才分配 ⇒ 5.1 GiB/worker 不被 vLLM 知道 ✗
+                try:
+                    from vllm_xiaotu_moe import expert_pool as _xp_res
+                    _xp_res.reserve_pin_for_profile()
+                except Exception as _e:  # noqa: BLE001
+                    print("[vllm-xtu-moe] ⛔ profile 期常驻池占位失败(不掩盖): "
+                          f"{type(_e).__name__}: {_e}", flush=True)
                 try:
                     _reserve_staging_from_model(getattr(self, "model_runner", None))
                 except Exception as _e:  # noqa: BLE001

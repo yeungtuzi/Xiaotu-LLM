@@ -150,6 +150,8 @@ def main():
     ap.add_argument("--model", default="DeepSeek-V4.1-Flash")
     ap.add_argument("--tag", default="")
     ap.add_argument("--dataset", default=DS)
+    ap.add_argument("--warmup", type=int, default=0,
+                    help="正式取数前先跑 N 条同样请求并丢弃（协议 §6.2/§9.5：≥2×C）")
     ap.add_argument("--cache-bust", type=int, default=0,
                     help="在 prompt 前插入 N 个随机字符以破前缀缓存（协议 §9.2 建议 400）")
     ap.add_argument("--jsonl", default="", help="把每条原始记录写到该文件(供事后分层)")
@@ -157,6 +159,15 @@ def main():
     recs = [json.loads(ln) for ln in open(a.dataset, encoding="utf-8") if ln.strip()]
     if a.limit:
         recs = recs[:a.limit]
+    # ⭐【2026-10-31】协议 §6.2/§9.5：正式取数前必须"充分预热"——先跑 ≥2×C 条同载荷请求并**丢弃**
+    #   （冷启时首条 15K 请求要触达几十 GB 权重页，实测能把 tok/s 压低 26%）
+    if a.warmup > 0:
+        print("预热 %d 条（同载荷同上限，结果丢弃）..." % a.warmup, flush=True)
+        for wi in range(a.warmup):
+            one(recs[wi % len(recs)]["prompt"], a.outlen, a.port, a.model,
+                {}, "warm%d" % wi, a.cache_bust)
+        print("预热完成，开始取数", flush=True)
+
     tasks = [(rd, i, r["prompt"]) for rd in range(a.rounds) for i, r in enumerate(recs)]
 
     q: queue.Queue = queue.Queue()

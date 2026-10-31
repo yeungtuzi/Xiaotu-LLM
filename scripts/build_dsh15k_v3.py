@@ -97,8 +97,12 @@ def main():
     ap.add_argument("--out", required=True)
     ap.add_argument("--rows", type=int, default=32)
     ap.add_argument("--target", type=int, default=15000)
-    ap.add_argument("--lo", type=int, default=14500)
-    ap.add_argument("--hi", type=int, default=15500)
+    # ⭐【2026-10-31 放宽】原 14500–15500 是"整段前缀必须恰好落在该区间"，
+    #   实测 203 个会话一条都凑不出（前缀 token 数是跳跃的）。改为：
+    #   "允许从最前面丢弃更早的回合"，只要最终 prompt 落在 [lo, hi] 且**以 user 回合结尾**。
+    #   上界 16,300 ≈ MBT=8192 × 2 ⇒ 预填正好两个 chunk。
+    ap.add_argument("--lo", type=int, default=10500)
+    ap.add_argument("--hi", type=int, default=16300)
     ap.add_argument("--per-session", type=int, default=2)
     a = ap.parse_args()
 
@@ -118,21 +122,36 @@ def main():
         for i, m in enumerate(msgs):
             if m["role"] != "user" or not looks_like_task(m["content"]):
                 continue
-            prefix = msgs[:i + 1]
-            try:
-                prompt = encode_messages(prefix, thinking_mode="thinking",
+            # ⭐ 从"最近的 user 回合"往回试不同起点（丢弃更早的回合），取最接近 target 的窗口
+            cand = None
+            starts = [j for j in range(0, i + 1)
+                      if msgs[j]["role"] == "user" or j == 0]
+            for st in reversed(starts):
+                sub = ([msgs[0]] if st > 0 else []) + msgs[st:i + 1]
+                try:
+                    pr = encode_messages(sub, thinking_mode="thinking",
                                          drop_thinking=True, reasoning_effort="high")
-            except Exception:
+                except Exception:
+                    continue
+                if not pr.endswith("<｜Assistant｜><think>"):
+                    continue
+                nn = len(tok(pr, add_special_tokens=False)["input_ids"])
+                if nn > a.hi:
+                    continue
+                if nn >= a.lo:
+                    cand = (abs(nn - a.target), nn, i, pr, len(m["content"]))
+                    break
+            if cand is None:
                 continue
-            if not prompt.endswith("<｜Assistant｜><think>"):
-                continue
-            n = len(tok(prompt, add_special_tokens=False)["input_ids"])
-            if a.lo <= n <= a.hi:
+            _, n, i, prompt, uc = cand
+            if True:
                 h = hashlib.sha1(prompt[-2000:].encode()).hexdigest()[:16]
                 if h not in seen:
-                    best.append((abs(n - a.target), n, i, prompt, h, len(m["content"])))
+                    # ⭐ 同时存下原始对话（供官方 API 生成参考回答做语义对照）
+                    best.append((abs(n - a.target), n, i, prompt, h,
+                                 len(m["content"]), sub))
         best.sort()
-        for _, n, i, prompt, h, uc in best[:a.per_session]:
+        for _, n, i, prompt, h, uc, sub in best[:a.per_session]:
             if len(rows) >= a.rows:
                 break
             if h in seen:
@@ -140,7 +159,9 @@ def main():
             seen.add(h)
             rows.append({"prompt": prompt, "tokens": n,
                          "source": os.path.basename(os.path.dirname(f)),
-                         "turn": i, "user_chars": uc})
+                         "turn": i, "user_chars": uc,
+                         "messages": sub,
+                         "final_user": sub[-1]["content"]})
         if (fi + 1) % 20 == 0:
             print(f"  扫描 {fi + 1}/{len(files)} ⇒ 已得 {len(rows)} 条", flush=True)
 

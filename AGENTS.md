@@ -556,3 +556,24 @@ nohup bash scripts/host_rss_watchdog.sh --tag <tag> --limit-gib <N> \
 and LLM use must at least be disclosed through an `Assisted-by:` line」；
 同仓 vLLM #60015 的提交当时**只写了 Signed-off-by、漏了 Assisted-by**（2026-10-29 核对）。
 台账：`dev-docs/USER_QA_LEDGER.md` #354。
+
+## ⛔⛔⛔ 【CED 默认必须开启】2026-10-31 用户明令
+
+> **用户原话**：「记一个纪律：除非测试需要，否则 CED 应该永远开启」
+
+### 事实
+
+* CED 由 `--swa-bounded-replay` 开启（上游 #56752 复用 `CacheConfig.swa_bounded_replay`，**没有独立旗标**）；
+* `scripts/serve_v41.sh` 的默认是 **`CED=1`（开）**，`CED=0` 才加 `--no-swa-bounded-replay`；
+* ⚠️ **直接用 `python -m vllm.entrypoints.openai.api_server` 起服务时不会自动带这个旗标** ⇒
+  CED 静默关闭（2026-10-31 实测：生产 k3 正是这样起的，prefill 只有 804 tok/s，而 CED 开启应≈1.1K+）。
+
+### 纪律
+
+1. ✅ **生产 / 长稳 / 基准，一律 CED=1**；只有**专门做 CED A/B** 时才允许 CED=0，且必须在报告里注明该臂是基线臂。
+2. ⛔ **起服务后必须验证生效**，不能只看"旗标传了"：
+   * 命令行含 `--swa-bounded-replay`（机械检查：`bash scripts/check_ced_on.sh`）；
+   * 日志**不得**出现 `SWA bounded replay needs model runner V2`（出现即 CED 未生效）；
+   * 开关在 `CacheConfig` 构造时读取 ⇒ **起来后改不了**，只能重启。
+3. ⛔ **不得用直接 `api_server` 命令行绕过 `serve_v41.sh`** 做"生产口径"测量；确实要绕过时，必须显式补 `--swa-bounded-replay`。
+4. ⭐ 报告里凡出现 prefill 数字，**必须标注 CED=1 / CED=0**，否则该数字不可比（历史 README 1,190 是 CED=1 口径）。

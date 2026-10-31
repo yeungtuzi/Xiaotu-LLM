@@ -109,7 +109,19 @@ fi  # NO_CUDA
 COMMON="-std=c++17 -shared -fPIC -O3 -ffast-math -fno-finite-math-only"
 # 【§629c】编译器可切(`CXX=g++-14` 或 conda 的
 # `x86_64-conda-linux-gnu-g++`)。用来对照 lk_moe 的 GCC 13.3.1 世代与 Clang。
-CXX_BIN="${CXX:-g++}"
+# 【2026-10-29 实测】GCC 16 在真实 decode batch（BS=6）上比 GCC 11 快 7-8%，
+# 且生成物与原 .so **逐字节相同**（sha 6578c321…）⇒ 零数值风险的免费收益。
+# 未显式指定 CXX 时，自动选可用的最新 g++；都没有则回落到 g++。
+if [[ -n "${CXX:-}" ]]; then
+  CXX_BIN="$CXX"
+else
+  CXX_BIN="g++"
+  for _c in g++-16 g++-15 g++-14; do
+    if command -v "$_c" >/dev/null 2>&1; then CXX_BIN="$_c"; break; fi
+  done
+  unset _c
+fi
+echo ">> CXX=$CXX_BIN"
 # 【§630b】`MTUNE=<cpu>`:`-mtune` 只影响**调度**,不改 ISA ⇒ 不会破坏 ISA 变体阶梯
 # (绝不能用 `-march=znver4`,那会把 AVX-512 塞进 scalar/avx2 兜底变体)。
 MTUNE="${MTUNE:-}"
@@ -139,6 +151,15 @@ VARIANTS=(
   # H1 距离扫描：4（1 条 line）/ 16（4 条 line），与 8 一起构成单窗口可跑完的三点
   "avx512_bf16_vbmi_pf4|-mavx512f -mavx512bw -mavx512vl -mavx512dq -mavx512bf16 -mavx512vbmi -mfma -DXIAOTU_MOE_PF_DIST=4"
   "avx512_bf16_vbmi_pf16|-mavx512f -mavx512bw -mavx512vl -mavx512dq -mavx512bf16 -mavx512vbmi -mfma -DXIAOTU_MOE_PF_DIST=16"
+  # 【2026-10-30 追加】更远的预取距离：行宽 2560 B（160 组），dist 只受 `g+dist<group_count` 限制。
+  #   动机：8 组=128 B 仅 2 条 cache line；若瓶颈是未命中并行度，32/64 组（512 B/1 KB）应更快。
+  #   只读提示、数值零影响；不进 `_LADDER`，用 `XIAOTU_MOE_VARIANT=` 显式选。
+  "avx512_bf16_vbmi_pf32|-mavx512f -mavx512bw -mavx512vl -mavx512dq -mavx512bf16 -mavx512vbmi -mfma -DXIAOTU_MOE_PF_DIST=32"
+  "avx512_bf16_vbmi_pf64|-mavx512f -mavx512bw -mavx512vl -mavx512dq -mavx512bf16 -mavx512vbmi -mfma -DXIAOTU_MOE_PF_DIST=64"
+  # 【2026-10-30 追加】tile 形状：MR=4 + NR=4（acc 16 + av 8 + 5 = 29 zmm，不溢出）。
+  #   动机：每 16 B 权重要载 12 条激活 zmm（MR=6 时），激活流量是权重的 ~24–48 倍；
+  #   提高 NR 让一次激活载入喂更多输出列。代价：M=6 被切成 4+2，权重读 1.5 次。
+  "avx512_bf16_vbmi_mr4nr4|-mavx512f -mavx512bw -mavx512vl -mavx512dq -mavx512bf16 -mavx512vbmi -mfma -DXIAOTU_MOE_GEMM_MR=4 -DXIAOTU_MOE_GEMM_NR_CT=4"
   # 【受控实验用·不用于生产】同样的旗标(含 -mavx512vnni)但**强制 base 实现** ⇒
   #   把"旗标对共享 bf16 路径 codegen 的影响"与"W4A8 源码的影响"分离 ✓（线③② 归因）
   "avx512_bf16_vbmi_vnni_base|-mavx512f -mavx512bw -mavx512vl -mavx512dq -mavx512bf16 -mavx512vbmi -mavx512vnni -mfma -DXIAOTU_MOE_FORCE_PACKED4_BASE=1"
@@ -156,6 +177,33 @@ for entry in "${VARIANTS[@]}"; do
     continue
   fi
   mod="_xiaotu_moe_C_${name}"
+  # 【2026-10-30】小 M 4-bit 分组 MoE 内核（moe4_smallm.cu）：
+  # .cu 必须用 nvcc 单独编译成 .o 再参与链接（$CXX_BIN 编不了 CUDA）。
+  # 默认**不编译**（BUILD_MOE4=1 才编）⇒ 缺 nvcc 的机器行为不变。
+  # 全变体共用同一个 .o（源码与 arch 与变体名无关），只编一次。
+  if [[ "$NO_CUDA" == "1" || "${BUILD_MOE4:-0}" != "1" ]]; then
+    OBJ4=""
+  else
+    if [[ -z "${OBJ4:-}" ]]; then
+      NVCC_BIN="${NVCC:-}"
+      if [[ -z "$NVCC_BIN" ]]; then
+        NVCC_BIN="$(command -v nvcc || true)"
+        [[ -z "$NVCC_BIN" && -x /usr/local/cuda/bin/nvcc ]] && NVCC_BIN=/usr/local/cuda/bin/nvcc
+        [[ -z "$NVCC_BIN" && -n "${CUDA_HOME:-}" && -x "$CUDA_HOME/bin/nvcc" ]] && NVCC_BIN="$CUDA_HOME/bin/nvcc"
+      fi
+      if [[ -z "$NVCC_BIN" ]]; then
+        echo "!! BUILD_MOE4=1 但找不到 nvcc（设 NVCC= 指定路径）" >&2
+        exit 4
+      fi
+      OBJ4="${TMPDIR:-/tmp}/moe4_smallm.o"
+      "$NVCC_BIN" -c -O3 -Xcompiler -fPIC \
+        -gencode "arch=compute_${NVCC_SM:-80},code=sm_${NVCC_SM:-80}" \
+        -gencode "arch=compute_${NVCC_SM:-80},code=compute_${NVCC_SM:-80}" \
+        "$ROOT/csrc/moe4_smallm.cu" -o "$OBJ4" \
+        || { echo "!! nvcc failed: moe4_smallm.cu" >&2; exit 4; }
+      echo ">> moe4_smallm.o built -> $OBJ4"
+    fi
+  fi
   OUT="$OUT_DIR/${mod}${PY_EXT}"
   echo ">> Building variant [$name] -> $OUT"
   # shellcheck disable=SC2086
@@ -163,8 +211,31 @@ for entry in "${VARIANTS[@]}"; do
       -DXIAOTU_MOE_MODULE_NAME="$mod" \
       -I"$PY_INC" -I"$PYBIND11_INC" -I"$ROOT/csrc" \
       "${CUDA_FLAGS[@]}" \
-      "$SRC" \
+      ${OBJ4:+-DXIAOTU_MOE_WITH_MOE4=1} \
+      "$SRC" ${OBJ4:+"$OBJ4"} \
       -o "$OUT"
+  # 【默认构建门】没编内核时，产物里**不能**出现 moe4 的未定义符号
+  #   （否则 `import xiaotu_moe` 会在 RTLD_NOW 下直接失败；R38 审计 P0-1）
+  if [[ -z "${OBJ4:-}" ]]; then
+    _nm_def="$(nm -D "$OUT" 2>/dev/null | grep -c "U moe4_smallm_" || true)"
+    if [[ "${_nm_def:-0}" != "0" ]]; then
+      echo "!! 默认构建产物含未定义 moe4 符号（BUILD_MOE4 未开却引用了内核）: $OUT" >&2
+      exit 6
+    fi
+    unset _nm_def
+  fi
+  if [[ -n "${OBJ4:-}" ]]; then
+    # 机械门：产物里真的带符号才算成功（教训：产物存在 ≠ 构建成功）
+    # 用 nm（不是 nm -D）：符号只被同 .so 内的 binding 引用时不会进动态符号表。
+    # ⚠️ 不能写成 `nm ... | grep -q`：`set -o pipefail` 下 grep -q 提前退出会让
+    #    nm 收到 SIGPIPE(141) ⇒ 管道整体判失败 ⇒ **符号明明存在也报缺失**（本轮实测踩到）。
+    _nm_out="$(nm "$OUT" 2>/dev/null || true)"
+    case "$_nm_out" in
+      *moe4_smallm_gu*) ;;
+      *) echo "!! 产物缺少 moe4_smallm 符号: $OUT" >&2; exit 5 ;;
+    esac
+    unset _nm_out
+  fi
 done
 
 echo ">> Done. Variants in $OUT_DIR:"

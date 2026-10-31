@@ -299,7 +299,7 @@ class LayerPool:
         if self._slot is None:
             ev = torch.cuda.Event()
             ev.record()   # 前面 _load_all 已 synchronize,这里只是保序凭证
-            self._slot = _ReadySlot(self.planes, ev)
+            self._slot = _ReadySlot(self.planes, ev, self.slotmap, self.n_local)
         return self._slot
 
     # ---- 【运行中自适应】两个入口:只改 plane 内容 + 表内容,不改图、不改池子大小 ----
@@ -537,9 +537,14 @@ build_layer_pool._warned = None  # noqa: SLF001  ⭐ 2026-10-16:"表缺失"提�
 
 
 class _ReadySlot:
-    __slots__ = ("bufs", "busy", "ready")
+    # 【2026-10-30】新增 slot_map/slot_base：小 M 4-bit 内核（XIAOTU_PIN_CUDA_MOE=1）
+    # 需要把**专家号**翻译成**池内 plane 行号**（池按槽位排布，不按专家号排布）。
+    # slot_map[e] = n_local + s（s 为槽位）表示专家 e 常驻在槽 s；< n_local 表示走 CPU 路径。
+    __slots__ = ("bufs", "busy", "ready", "slot_map", "slot_base")
 
-    def __init__(self, bufs, ready):
+    def __init__(self, bufs, ready, slot_map=None, slot_base=0):
         self.bufs = bufs
         self.busy = None
         self.ready = ready
+        self.slot_map = slot_map
+        self.slot_base = slot_base

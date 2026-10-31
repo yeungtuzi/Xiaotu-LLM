@@ -241,6 +241,8 @@ _DEFER_NODRAIN = (os.environ.get("XIAOTU_MOE_DEFER_NODRAIN", "") not in ("", "0"
 # ⛔ 只在**小 batch（decode）**下启用 defer：warmup/prefill 的 qlen 可达 8192，
 #   而 defer 会强制"逐层等 CPU 算完"（实测 qlen=8192 时每层约 1 s，看起来像卡死）。
 _DEFER_MAXQ = int(os.environ.get("XIAOTU_MOE_DEFER_MAXQ", "16"))
+# 参与 defer 的最大层号（主模型 0..39；draft 40+ 保持同步）
+_DEFER_MAXLAYER = int(os.environ.get("XIAOTU_MOE_DEFER_MAXLAYER", "39"))
 
 
 def _defer_mode(idx, qlen=0):
@@ -250,6 +252,12 @@ def _defer_mode(idx, qlen=0):
         return 0
     if qlen > _DEFER_MAXQ:      # 预填/warmup 的大 batch：绝不接管
         return 0
+    # 【D2-fix8】只 defer 主模型的层（默认 0..39）；draft 层（40+）同步执行，
+    #   保证每步在进入下一步之前一定把最后一层兑现掉，不会跨步遗留 pending。
+    #   步边界仍由 C++ 按层号回绕兜底（见 binding.cpp 的 D2-fix7/8）。
+    if idx > _DEFER_MAXLAYER:
+        return 0
+    return 1
     if st["prev"] >= 0 and idx <= st["prev"]:
         st["steps"] += 1          # 层号回绕 ⇒ 走完一个完整 forward
     st["prev"] = idx

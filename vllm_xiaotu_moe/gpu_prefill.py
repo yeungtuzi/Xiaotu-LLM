@@ -2543,6 +2543,26 @@ def prefetch_layer(w13, s13, w2, s2, device):
     return slot
 
 
+try:  # 【2026-10-30】小 M 4-bit 分组内核接入层（默认关闭，见 XIAOTU_PIN_CUDA_MOE）
+    from vllm_xiaotu_moe import moe4_smallm as _MOE4
+except Exception as _e4:  # noqa: BLE001
+    _MOE4 = None
+    print(f"[xtu-moe4] 接入层导入失败（不影响原路径）：{type(_e4).__name__}: {_e4}",
+          flush=True)
+
+
+def _moe4_in_capture() -> bool:
+    """捕获/预热期判定：本仓既有教训是 `is_current_stream_capturing()` 不够
+    （`gpu_prefill.py:1251` 注释），优先用 `in_warmup_or_capture()`。"""
+    try:
+        from vllm_xiaotu_moe.gpu_prefill import in_warmup_or_capture as _iwc
+        if _iwc():
+            return True
+    except Exception:  # noqa: BLE001
+        pass
+    return bool(torch.cuda.is_current_stream_capturing())
+
+
 def gpu_moe_layer(
     x, topk_ids, topk_weights,
     w13, s13, w2, s2,
@@ -2609,6 +2629,39 @@ def gpu_moe_layer(
                   f"capture={torch.cuda.is_current_stream_capturing()}", flush=True)
 
     _trp("A: 进入 gpu_moe_layer")
+    # 【2026-10-30】小 M 4-bit 分组内核（XIAOTU_PIN_CUDA_MOE=1 才生效；缺省完全不走）：
+    # 只走 **PIN 常驻槽位** 路径（slot.bufs 已是池内 K-major `[S, K/2, N]`，与本内核布局一致）。
+    # 条件不满足 ⇒ 返回 None 并继续走原 Triton 路径（fail-closed）。
+    # 【2026-10-30】小 M 4-bit 分组内核（XIAOTU_PIN_CUDA_MOE=1 才生效；缺省整段跳过）。
+    #   ⛔ 捕获期/预热期**必须先判**：available() 首次会做 cudaMemcpyToSymbol（同步、
+    #     走 legacy 流），在捕获中执行会作废整张图。因此捕获判定放在条件最前。
+    #   ⛔ slot 路径的 `topk_ids` 已经是**池内 plane 行号**（`mixed_experts.py:3130`
+    #      `part_ids = (_sl - n_local)`），不是专家号 ⇒ 不能再用 slot_map 二次映射。
+    #   条件不满足 ⇒ `moe_layer` 返回 None，继续走原 Triton 路径（fail-closed）。
+    _m4 = None
+    # 【2026-10-31】图安全改造：捕获期也走内核（前提是模块已加载，`ready()` 不触发加载）。
+    _moe4_ok = (_MOE4 is not None
+                and (_MOE4.ready() if _moe4_in_capture() else _MOE4.available()))
+    if slot is not None and _moe4_ok:
+        try:
+            _m4 = _MOE4.moe_layer(
+                slot.bufs, x, topk_ids, topk_weights, int(H), int(I),
+                out=out, out_dtype=out_dtype or torch.bfloat16,
+                num_experts=int(E), swiglu_limit=float(swiglu_limit or 0.0),
+                group_k=int(group_k) if group_k else 32,
+                scale_kind=scale_kind, s13_ts=s13_ts, s2_ts=s2_ts,
+            )
+        except Exception as _exc:  # noqa: BLE001
+            _MOE4.disable(f"调用失败：{type(_exc).__name__}: {_exc}")
+            _m4 = None
+        if _m4 is not None:
+            # ⚠️ 必须与常规出口一样记录 busy：预取侧流靠它确认"上一层已读完"，
+            #    提前 return 而不 record ⇒ 侧流可能覆盖仍在读的 plane（数据竞争）。
+            if not torch.cuda.is_current_stream_capturing():
+                if getattr(slot, "busy", None) is None:
+                    slot.busy = torch.cuda.Event()
+                slot.busy.record(torch.cuda.current_stream(device))
+            return _m4
     tok, wts, seg_start, A = _build_segmentation(topk_ids, topk_weights, E, device)
     _t1 = time.perf_counter() if _GP_TIMING else 0.0
     _trp("B: segmentation 完成")

@@ -21,7 +21,7 @@
 #   bash scripts/serve_v41.sh                 # dummy weights (fast bring-up)
 #   LOAD=auto bash scripts/serve_v41.sh       # real weights (~long load)
 #
-# Env: TAG PORT GPUS TP MAXLEN LOAD GPU_UTIL EXTRA_ENV MAXSEQS NO_CUSTOM_AR
+# Env: TAG PORT GPUS TP MAXLEN LOAD GPU_UTIL EXTRA_ENV MAXSEQS NO_CUSTOM_AR KV_OFFLOAD_GIB KV_OFFLOAD_BACKEND
 #      PIN_MAX_PER_LAYER(默认 0=不限;也可写 XIAOTU_PIN_MAX_PER_LAYER):热专家每层常驻上限，
 #        池在 KV profiling 前分配 ⇒ 每砍 1 槽 ≈ +9.1 MiB KV（用途：给 2×512K 腾地方）
 #      TOOL_PARSER / REASONING_PARSER(默认 deepseek_v41;置空关闭):DSH 工具调用与思考强度所需
@@ -188,6 +188,36 @@ GPU_UTIL="${GPU_UTIL:-0.80}"   # 【本机+V4.1 默认】生产值（2026-10-26 
 #   ⇒ 在 `set -u` 下,不设 KV_DTYPE 的调用者会打 `unbound variable`,并**静默丢掉 `--kv-cache-dtype`** ✗
 #   (生产 `bringup_prod_8070.sh` 设了它所以无感;`scripts/ab_config.py` 等没设 ⇒ 会中招)
 KV_DTYPE="${KV_DTYPE:-auto}"
+# 【2026-10-31】KV 分层/卸载（上游原生能力，缺省 **0 = 关闭 ⇒ 行为零变化**）。
+#   KV_OFFLOAD_GIB     CPU 侧 KV 卸载缓冲，单位 GiB，**总量**（TP>1 时由 vLLM 按 rank 分摊，
+#                      不是"每 rank 这么多"——写错会把宿主 pinned 内存翻 TP 倍）。
+#                      它是 **pinned host memory**，本脚本的 MEM_GATE_GIB 目前**没有**把它算进去。
+#   KV_OFFLOAD_BACKEND native（vLLM 原生 LRU/ARC）或 lmcache（**需要 5555 的独立服务端**，
+#                      动它要用户当次许可）。只设 backend 不设 size ⇒ 上游直接忽略、**静默 no-op**。
+#   ⛔ 缺省 ⇔ 不追加任何参数。非法值**当场退出**（否则要等 20–40 分钟权重加载完才报错）。
+KV_OFFLOAD_GIB="${KV_OFFLOAD_GIB:-0}"
+KV_OFFLOAD_BACKEND="${KV_OFFLOAD_BACKEND:-}"
+_KV_OFF_NORM=""
+case "$KV_OFFLOAD_GIB" in
+  ""|0|0.0|0.00|0.000) ;;
+  # 只接受纯正数（可带小数）：挡住 "-1 / nan / inf / 0e0 / 带空格 / '1 --port 9999' / '*'"
+  *) if [[ "$KV_OFFLOAD_GIB" =~ ^[0-9]+([.][0-9]+)?$ ]]; then
+       # 纯 bash 判"数值为零"：把数字和小数点都删掉后为空 ⇒ 形如 00 / 0.000（仍会被上游当 0 而晚失败）
+       _KV_ZERO="${KV_OFFLOAD_GIB//[0.]/}"
+       if [ -z "$_KV_ZERO" ]; then _KV_OFF_NORM=""; else _KV_OFF_NORM="$KV_OFFLOAD_GIB"; fi
+       unset _KV_ZERO
+     else echo "[v41] ⛔ KV_OFFLOAD_GIB='$KV_OFFLOAD_GIB' 非法（只允许正数，单位 GiB 总量）⇒ 不启动" >&2; exit 2; fi ;;
+esac
+case "$KV_OFFLOAD_BACKEND" in
+  ""|native|lmcache) ;;
+  *) echo "[v41] ⛔ KV_OFFLOAD_BACKEND='$KV_OFFLOAD_BACKEND' 非法（只允许 native|lmcache）⇒ 不启动" >&2; exit 2 ;;
+esac
+if [ -n "$KV_OFFLOAD_BACKEND" ] && [ -z "$_KV_OFF_NORM" ]; then
+  echo "[v41] ⚠️ 只设了 KV_OFFLOAD_BACKEND 而 KV_OFFLOAD_GIB=0 ⇒ 上游会忽略 backend，KV 卸载**不会**启用" >&2
+fi
+if [ -n "$_KV_OFF_NORM" ]; then
+  echo "[v41] kv_offload: size=${_KV_OFF_NORM}GiB(总量) backend=${KV_OFFLOAD_BACKEND:-native}"
+fi
 EXTRA_ENV="${EXTRA_ENV:-}"
 HF_OVERRIDES="${HF_OVERRIDES:-}"
 # 【DSH 兼容】工具调用与推理(思考强度)解析器:vLLM 必须显式开,否则 DSH 报
@@ -240,9 +270,43 @@ if [ -n "${TRITON_CACHE_DIR:-}" ]; then
   JIT_ENV="TRITON_CACHE_DIR=$TRITON_CACHE_DIR TORCHINDUCTOR_CACHE_DIR=$TORCHINDUCTOR_CACHE_DIR"
   [ -n "${TILELANG_CACHE_DIR:-}" ] && JIT_ENV="$JIT_ENV TILELANG_CACHE_DIR=$TILELANG_CACHE_DIR"
 fi
+# COMPILE_RANGES: 逗号分隔的正整数端点,把 Inductor 的编译区间**分档**
+#   (vLLM CompilationConfig.compile_ranges_endpoints)。默认空 = 不传 = 行为完全不变。
+#   设了以后 [1,a],[a+1,b],... 每档共用一张图 ⇒ 编译变体数量被**严格限制**为档数,
+#   从而给 cubin 数量一个上界(治"按形状特化导致的显存单调增长")。
+#   例:COMPILE_RANGES=4,64,512,8192 ⇒ 至多 4 档。
+COMPILE_RANGES="${COMPILE_RANGES:-}"
+CR_JSON=""
+if [ -n "$COMPILE_RANGES" ]; then
+  # ⭐ 先挡控制字符:`grep` 的 `^...$` 是**按行锚定**,而 `read -a` 只读第一行 ⇒
+  #    "1,2\n<任意>" 可绕过后面全部校验并 rc=0(复审实测)。这里显式拒绝 LF/CR/TAB。
+  case "$COMPILE_RANGES" in
+    *$'\n'*|*$'\r'*|*$'\t'*) echo "[v41] ⛔ COMPILE_RANGES 不得含换行/制表符" >&2; exit 2 ;;
+  esac
+  # ⭐ 必须在 **C locale** 下做字节级校验:glibc 排序规则下 `[0-9]` 会放行全角１/阿拉伯-印度١/带圈①
+  #    ⇒ 会生成 vLLM 解析不了的 JSON(R38 审计 #2)。
+  if ! printf '%s' "$COMPILE_RANGES" | LC_ALL=C grep -Eqz '^[1-9][0-9]*(,[1-9][0-9]*)*$'; then
+    echo "[v41] ⛔ COMPILE_RANGES='$COMPILE_RANGES' 非法(只允许 a,b,c 形式的正整数)" >&2; exit 2
+  fi
+  _CR_PREV=0
+  IFS=, read -r -a _CR_ARR <<< "$COMPILE_RANGES"
+  for _e in "${_CR_ARR[@]}"; do
+    # ⭐ 先限长再比较:`test` 的整数是 int64,超范围返回 2 ⇒ `&&` 不成立 ⇒ 递增校验被静默绕过(R38 审计 #4)
+    [ "${#_e}" -le 9 ] || { echo "[v41] ⛔ COMPILE_RANGES 端点过大 '$_e'(上限 999999999)" >&2; exit 2; }
+    [ "$_e" -le "$_CR_PREV" ] && { echo "[v41] ⛔ COMPILE_RANGES 必须严格递增('$_e' 在 '$_CR_PREV' 之后)" >&2; exit 2; }
+    _CR_PREV="$_e"
+  done
+  CR_JSON=",\"compile_ranges_endpoints\":[$COMPILE_RANGES]"
+  if [ "$COMPILE" = "1" ]; then
+    echo "[v41] compile_ranges_endpoints=[$COMPILE_RANGES] ⇒ 编译档数=$((${#_CR_ARR[@]}))（cubin 上界随档数封顶）"
+  else
+    echo "[v41] ⚠️ COMPILE_RANGES 已设但 COMPILE=$COMPILE ⇒ 不传 --compilation-config，compile_ranges_endpoints 静默无效" >&2
+  fi
+  unset _e _CR_PREV _CR_ARR
+fi
 CC_JSON=""
 if [ "$COMPILE" = "1" ]; then
-  CC_JSON="{\"cudagraph_mode\":\"FULL_DECODE_ONLY\",\"mode\":\"VLLM_COMPILE\"${JITCACHE_CC_EXTRA}}"
+  CC_JSON="{\"cudagraph_mode\":\"FULL_DECODE_ONLY\",\"mode\":\"VLLM_COMPILE\"${JITCACHE_CC_EXTRA}${CR_JSON}}"
 fi
 
 OUTDIR="$ROOT/dev-docs/report/tuning/logs"; mkdir -p "$OUTDIR"
@@ -294,30 +358,52 @@ export CUDA_VISIBLE_DEVICES="$GPUS"
 #                "greedy 文本 5/5 相同" ⇒ 关掉它等于白丢一个已验证的大收益;
 #   SPIN_IDLE_US 插件默认 300(hybrid_model.py setdefault),这里钉成 0;
 #   NSLICE_SMALL 引擎默认开启;=0 会**强制走 legacy 路径**;
-#   THREADS      ⛔ 2026-10-19 用户裁定:**60 就是最优解,不许用更多核**
-#                (旧文里"184 才是拐点、60 是错的"的说法**已删除且作废** ✗)。
+#   XIAOTU_MOE_THREADS / THREADS_DEFAULT
+#                **默认值按 SMT 状态门控**(2026-10-30 起):`smt/active=1` ⇒ **96/rank**,
+#                否则(含读不到)⇒ **60/rank**。历史:2026-10-19 曾无条件定 60。
+#                变更前提:引擎"轮 422"把 job 切分改成**按工作量正比**
+#                (`target=4×tpn`,每 job ≥32 行)后,更多线程有活可干,**8 核/CCD(96/rank)
+#                优于 5 核/CCD(60/rank)**。
+#                证据三条,口径分开写:
+#                  · 离线内核(REP=200、DEDUP=24):0.955 → 0.830 ms/层(SMT on);
+#                    SMT off 同为 0.965 → 0.870(同 SMT 状态的纯线程数对照)。
+#                  · 服务级 C=1×6 条 512 token:**tok/s 49.24 → 50.57(+2.7%)**,
+#                    步时 78.13 → 77.32 ms(**−1.04%**,小于同臂 IQR 1.35 ms)。
+#                    ⚠️ 该臂同时变了两个量(60 臂 SMT off、96 臂 SMT on),**不是纯线程对照**;
+#                    纯线程对照只有上面的离线行。
+#                  · **补充(SMT off + 96/rank,服务级):87.60 ms/步、tok/s 43.00(−12.7%)、
+#                    fwd 1.009(+15.8%,变差)** ⇒ 离线"96 更快"**没有传导到服务**:SMT 关时 96
+#                    占满物理核、没有余量(与历史"192 双峰"同因)。**故默认值按 SMT 状态门控**。
+#                判据 ≥2% 按 **tok/s** 口径;步时口径未过线,故这条属**边际采纳、可随时回退**。
+#                ⇒ 覆盖口是 `XIAOTU_MOE_THREADS`(或 `THREADS_DEFAULT`);裸 `THREADS=` 无效。
+#                数据:`docs/EXPERIMENTS.md` **B1081/B1082/B1085**;规则:`IRON_RULES.md` **R12(线程数与 SMT)**。
 # 一律写成 "${VAR:-<现值>}":**默认行为逐字不变**,但允许从外部覆盖做 A/B。
 # 调参时配合 dev-docs/report/tuning/NOTES.md §389。
 # ---- 环境变量文件桥 ----------------------------------------------------------
 # 实测:vLLM spawn EngineCore 时会**静默丢弃**部分 XIAOTU_* (THREADS/SPIN_IDLE_US/
 # GPU_RESIDENT_LAYERS/RELEASE_SOURCE 都丢过),于是"设了开关却没生效、且无日志"。
 # 插件在 __init__.py 里会从该文件补齐缺失项(真实环境优先)。见 NOTES §414。
-# XIAOTU_MOE_THREADS ⛔ **2026-10-19 用户裁定:60 即最优,不许上调核数**(旧的 184/192 建议作废 ✗):
+# XIAOTU_MOE_THREADS **默认按 SMT 状态门控:SMT=1 ⇒ 96/rank,否则 60/rank**
+#   (2026-10-30 起;此前的"60 即最优、不许上调"已按实测作废 ✗)。
+#   ⚠️ **下面到"引擎自身的默认(120)没有动"为止的整段,是 2026-09 的历史实测**:
+#   条件为 **SMT=off + 轮 422 之前的 job 切分**,保留仅作对照,**不能再用它否决 96**。
 #   【为什么留余量】SMT 关掉后,192 = **占满全部物理核**。单 token 解码的 B=1 延迟在
 #   192 下是**双峰**的(静默机器上连测:0.58 / 3.81 / 11.17 ms),而 176/184 稳定 ~0.5 ms
 #   —— 只要有一个 worker 被抢占(OS/vLLM/CUDA 线程),barrier 就要等它,而没有任何余核可去。
 #   prefill 侧 176 只比 192 慢 ~4-5%(B=4096: 355 vs 341 ms),用 4% 换解码尾延迟的稳定很划算。
-#   (SMT 开着时 192 曾是安全的,因为还有 192 个逻辑核当余量;现机器 SMT=off。)
+#   (SMT 开着时 192 曾是安全的,因为还有 192 个逻辑核当余量;当时测试机 SMT=off。)
 
 #   **实测线程数是 prefill 的头号旋钮**(NOTES §424,真权重单层微基准,B=1400):
-#     60  -> 386.8 ms/层(B=2048)   ← 旧默认,两头都亏
+#     60  -> 386.8 ms/层(B=2048)   ← 旧默认(⚠️ 仅 prefill 微基准;SMT off 的服务级里 60 仍优于 96)
 #     120 -> 219.2                  ← 引擎自身默认(为"解码带宽"调的,解码最优)
 #     192 -> 170.9   ⇒ 比 60 快 **2.26×**,比 120 快 1.28×
 #     384 -> 176.0   但**解码**从 0.45 掉到 8.88 ms(**17×**,SMT 在作业少时纯抢 L3/功耗)
 #   解码在 192 下**没有退化**(真权重服务实测:串行 27.53/27.78 tok/s,
 #   与历史最佳 27.5-28.5 一致;C=8 聚合 85.31→**92.34** tok/s,历史最好)。
-#   ⇒ 60 既不是引擎默认也不是任何一档的最优,是当初"先跑通"钉下的保守值,故改 192。
+#   ⇒ 60 既不是引擎默认也不是任何一档的最优,是当初"先跑通"钉下的保守值;
+#     当时曾据此改 192(**已废弃**,见本块开头:现行默认是 SMT 门控 96/60)。
 #   引擎自身的默认(120)**没有动** —— 那是别的模型的解码最优点(NOTES §424)。
+# ---- 历史段结束 ----
 XTU_ENV_FILE="${XIAOTU_ENV_FILE:-/tmp/xiaotu_env}"
 # ---- 【§504 修:内存+性能,都在我们自己的环境里实测出来的】-------------------
 # TP=2 时 **每个 rank 的线程数**必须按"本 rank 的 CCD 数 × 4-5"取,而不是按整机核数:
@@ -341,7 +427,22 @@ if [ "$VRAM_POLICY" = "1" ]; then
     echo "[v41] R-VRAM 规划(maxlen=$MAXLEN):gpu_prefill_min=${POLICY_GP_MIN:-?} resident='${POLICY_RESIDENT:-}' draft_on_gpu=${POLICY_DRAFT:-?}"
   fi
 fi
-THREADS_DEFAULT="${THREADS_DEFAULT:-60}"
+# 【2026-10-30 · **按 SMT 状态取默认**】96/rank 只有在 SMT 打开时才是好的:
+#   96/rank = 24/node = 该 node 的**全部物理核**(前提:192 物理核 / 8 NUMA node / NPS4 /
+#   TP=2 ⇒ 每 rank 4 node × 24;NPS1 时 24/node 这个折算不成立,门控假设也随之失效);SMT 关时没有余核给 OS/CUDA/vLLM 线程,
+#   barrier 要等被抢占的 worker(**与"192 双峰"同一机理**)⇒ 服务级实测**大幅退化**:
+#     · SMT on  + 96/rank:77.32 ms/步、50.57 tok/s、fwd 0.836
+#     · SMT off + 60/rank:78.13 ms/步、49.24 tok/s、fwd 0.871  ← 旧默认
+#     · SMT off + 96/rank:**87.60 ms/步、tok/s 43.00(−12.7%)、fwd 1.009(+15.8%)** ✗
+#   ⇒ 打开 SMT 时用 96,关闭时维持 60(读不到 `smt/active` 也回 60,保守侧)。
+#   数据:`docs/EXPERIMENTS.md` B1081/B1082/**B1085**;规则:`IRON_RULES.md` R12(线程数与 SMT)。
+THREADS_DEFAULT_ENV="${THREADS_DEFAULT:-}"
+_SMT_ACTIVE="0"
+if [ -r /sys/devices/system/cpu/smt/active ]; then
+  _SMT_ACTIVE="$(cat /sys/devices/system/cpu/smt/active 2>/dev/null || echo 0)"
+fi
+if [ "$_SMT_ACTIVE" = "1" ]; then THREADS_DEF=96; else THREADS_DEF=60; fi
+THREADS_DEFAULT="${THREADS_DEFAULT:-$THREADS_DEF}"
 # 【§557 更正】自旋默认从 **0 改成 300**(与插件 hybrid_model.py 的 setdefault 一致)。
 # 历史:§355 记录过 **5000 µs** 是正反馈灾难(48 层 × 3 相 × 5 ms ⇒ 池几乎永不停转),
 # 于是当时钉成 0 —— 但那是**过度推广**。两次实测(§526、§557,解码形状 M=1/DEDUP=6):
@@ -386,8 +487,17 @@ XTU_ENV_FILE="${XIAOTU_ENV_FILE:-/tmp/xiaotu_env}"
   #   **出现 0 次** ✗ ⇒ 池根本没建 ⇒ 动态换入恒不生效,**且无任何报错**(静默失效)✗
   # ⭐ 2026-10-19:新增 XIAOTU_ROUTING_DUMP(1017 换权重后必须**重新采路由**再生成 PIN 表;
   #   不写进本白名单会被 EngineCore 静默丢掉 ⇒ dump 文件 0 字节,和 QFN 那次同型)。
+  # 【2026-10-31】追加两个变量（小 M 4-bit 分组内核）：
+  #   XIAOTU_PIN_CUDA_MOE  外层总开关，**缺省 0 = 关**（不设 ⇒ 内核完全不跑，生产零变化）
+  #   XIAOTU_MOE4_FAST     变体选择器，**只有显式 =1 才是快路径（内核内 dispatch）**；
+  #                        代码是 `== "1"` ⇒ **未设 / 置空 / =0 / 其它值 一律走段表版**。
+  #                        ⚠️ 本白名单会丢弃空值 ⇒ "经本脚本置空" = 未设 = 段表版（与直连进程一致）
+  #   ⛔ 不加进本白名单 = 变量被 EngineCore 静默丢弃 ⇒ A/B 两臂完全一样、结论恒为"无收益"
+  #      （与本文件 :422-425 记录的 B600 事故同型）。
+  #   ⛔ 另一条静默 no-op：内核**只走 PIN 槽位路径**（`gpu_prefill.py` 的 `slot is not None`）
+  #      ⇒ A/B 必须同时 `XIAOTU_PIN=1` 且 PIN 表可用、T≤8、MXFP4，否则两臂仍然相同。
   for _pv in XIAOTU_PIN XIAOTU_PIN_TABLE XIAOTU_PIN_WINDOW XIAOTU_PIN_HYST XIAOTU_PIN_HITSTAT \
-             XIAOTU_PIN_MAXSWAP XIAOTU_ROUTING_DUMP; do
+             XIAOTU_PIN_MAXSWAP XIAOTU_ROUTING_DUMP XIAOTU_PIN_CUDA_MOE XIAOTU_MOE4_FAST; do
     if [ -n "${!_pv:-}" ]; then echo "$_pv=${!_pv}"; fi
   done
   # 【§565】**R11 的"Engram 最后加载"从本节起默认开启(=1)** —— §562d 的正确性疑虑已在 §563/§564 证伪并闭环:
@@ -432,6 +542,15 @@ XTU_ENV_FILE="${XIAOTU_ENV_FILE:-/tmp/xiaotu_env}"
   for kv in $EXTRA_ENV; do case "$kv" in *=*) echo "$kv";; esac; done
 } > "$XTU_ENV_FILE"
 export XIAOTU_ENV_FILE
+# 【2026-10-30 · R69】把**生效值**打出来:否则 A/B 时无法从日志确认线程数
+#   (审计意见:96 只能靠读 env 文件或子进程 env 验证)。
+if [ -n "${XIAOTU_MOE_THREADS:-}" ]; then
+  echo "[v41] XIAOTU_MOE_THREADS=$XIAOTU_MOE_THREADS(来源:外层 XIAOTU_MOE_THREADS;smt=$_SMT_ACTIVE)"
+elif [ -n "${THREADS_DEFAULT_ENV:-}" ]; then
+  echo "[v41] XIAOTU_MOE_THREADS=$THREADS_DEFAULT(来源:外层 THREADS_DEFAULT;smt=$_SMT_ACTIVE)"
+else
+  echo "[v41] XIAOTU_MOE_THREADS=$THREADS_DEFAULT(来源:SMT 门控 smt=$_SMT_ACTIVE ⇒ THREADS_DEF=$THREADS_DEF)"
+fi
 
 # 【本机+V4.1 默认,见 MODEL_GUIDES §0.1b-2 / EXPERIMENTS B155】
 #   GPU 预填门槛:1M 放不下 ⇒ 显式 0;要 256K + GPU 预填请传 384
@@ -528,12 +647,15 @@ fi
     $( [ -n "$REASONING_PARSER" ] && printf -- '--reasoning-parser %s' "$REASONING_PARSER" ) \
     $( [ -n "$DEFAULT_CHAT_KWARGS" ] && printf -- '--default-chat-template-kwargs %s' "${DEFAULT_CHAT_KWARGS// /}" ) \
     $( [ "$KV_DTYPE" != "auto" ] && printf -- '--kv-cache-dtype %s' "$KV_DTYPE" ) \
+    $( [ -n "$_KV_OFF_NORM" ] && printf -- '--kv-offloading-size %s' "$_KV_OFF_NORM" ) \
+    $( [ -n "$_KV_OFF_NORM" ] && [ -n "$KV_OFFLOAD_BACKEND" ] && printf -- '--kv-offloading-backend %s' "$KV_OFFLOAD_BACKEND" ) \
     $( [ "${PROMPT_TOKENS_DETAILS:-1}" = "1" ] && echo --enable-prompt-tokens-details ) \
     $( [ "${EAGER:-0}" = "1" ] && echo --enforce-eager )  \
     $( [ "${CED:-1}" = "0" ] && echo --no-swa-bounded-replay ) \
     $( [ "${NO_CUSTOM_AR:-0}" = "1" ] && echo --disable-custom-all-reduce ) \
     $( [ "${SPEC:-1}" = "1" ] && echo --speculative-config "$SPEC_CONFIG" )  \
     $( [ -n "$CC_JSON" ] && printf -- '--compilation-config %s' "$CC_JSON" ) \
+    $( [ -n "${PROFILER_CONFIG:-}" ] && printf -- '--profiler-config %s' "$PROFILER_CONFIG" ) \
     $( [ "${PREFIX_CACHE:-1}" = "1" ] || echo --no-enable-prefix-caching ) --trust-remote-code \
     $( [ "${MM:-1}" = "1" ] && printf -- '--limit-mm-per-prompt {"image":%s,"video":0}' "${MM_IMAGES:-1}" \
         || printf -- '--limit-mm-per-prompt {"image":0,"video":0}' ) \

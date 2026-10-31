@@ -616,14 +616,8 @@ def maybe_report(period_s: float = 60.0, tag: str = "steady") -> None:
     bump_step()
     vram_report(tag)
     if tag == "steady":                    # 启动期不动手（权重加载时 reserved 天然高）
-        # ⭐【2026-10-27 修正】守卫**必须由这条 60 s 遥测驱动**：实测把 tick 只挂在
-        #   清理线程上时，线程首轮 sleep 未到 ⇒ 守卫完全不工作（free 已 50 MiB 仍 guard=0）。
-        #   tick 里的硬限检查只是 `mem_get_info`（微秒级、不同步），可以安全放在这条路径上。
-        try:
-            from . import mem_guard
-            mem_guard.tick(sys.modules[__name__], tag=tag)
-        except Exception:                  # noqa: BLE001
-            pass
+        # 【2026-10-31】原显存守卫（`XIAOTU_MEM_GUARD`）已删除：它会在计算途中执行
+        #   `empty_cache()`，实测会让仍在执行的 kernel 访存错误；显存兜底交给 vLLM 自己处理。
         # ⭐【2026-10-27 · 用户要求】清理**不在 forward 路径上做**：`cudaFree` 会隐式同步设备，
         # 在计算线程上执行最坏可阻塞一个 32 s 的 prefill chunk（实测 prompt 吞吐 255 tok/s）。
         # ⇒ 改为独立后台线程：它自己等 sync，计算线程照常发起 kernel。
@@ -2524,12 +2518,6 @@ def prefetch_layer(w13, s13, w2, s2, device):
     except RuntimeError as e:  # includes torch.cuda.OutOfMemoryError
         if "out of memory" not in str(e).lower():
             raise
-        # 【2026-10-27】OOM 现场取证（不改变控制流：取证后仍走原来的降级路径）
-        try:
-            from . import mem_guard
-            mem_guard.on_oom(sys.modules[__name__], e, where="prefetch_slot.alloc")
-        except Exception:                     # noqa: BLE001
-            pass
         # vLLM sized the KV cache first; there is no room for ping-pong buffers.
         # Drop the (now useless) slots and disable overlap for this process.
         _SLOTS.pop(key, None)

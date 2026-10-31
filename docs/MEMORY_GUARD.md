@@ -273,3 +273,16 @@ NO_CUSTOM_AR=1 bash scripts/serve_v41.sh
 # 回到旧行为（custom AR + 不可回收的碎片）
 PYTORCH_CUDA_ALLOC_CONF=expandable_segments:False NO_CUSTOM_AR=0 bash scripts/serve_v41.sh
 ```
+
+## ⛔ 2026-10-31 勘误：显存守卫已**整体删除**
+
+本节以上所有关于"软限/硬限/淘汰空闲条目"的描述**已作废**，仅作历史留档。
+
+* **删除内容**：`vllm_xiaotu_moe/mem_guard.py`（整个模块）及其两处调用点
+  （`gpu_prefill.py` 的 60 s 遥测 tick、`prefetch_slot.alloc` 的 OOM 取证）；
+  `XIAOTU_MEM_GUARD` / `XIAOTU_MEM_SOFT_*` / `XIAOTU_MEM_HARD_*` / `XIAOTU_MEM_IDLE_STEPS` /
+  `XIAOTU_MEM_MIN_FRAG_GIB` / `XIAOTU_MEM_HARD_EXIT` 一并废弃，**不再读取**。
+* **原因**：守卫的兜底路径会调用 `torch.cuda.empty_cache()`，实测**会让仍在执行的 kernel 访存错误**；
+  显存兜底属于引擎职责，**由 vLLM 自己处理**，插件不再介入。
+* **影响**：`GPU_UTIL` 仍按原语义给 vLLM 划预算；启动期余量薄时**不再有插件侧 gc 兜底**，
+  若显存不足，表现为 vLLM 自己的 OOM 报错（信息量更大、不会污染正在执行的计算）。

@@ -244,6 +244,12 @@ _DEFER_MAXQ = int(os.environ.get("XIAOTU_MOE_DEFER_MAXQ", "16"))
 # 参与 defer 的最大层号（主模型 0..39；draft 40+ 保持同步）
 _DEFER_MAXLAYER = int(os.environ.get("XIAOTU_MOE_DEFER_MAXLAYER", "39"))
 
+# 【2026-10-31 用户定】prefill 跳过热专家：
+#   qlen 超过该阈值时**不走常驻池的就地计算**，全部交给 gpu_prefill（tile ring）批量路径；
+#   ⛔ 只跳"路由"，**权重仍常驻 GPU、不释放、不迁移**（用户 2026-10-31 明确）。
+#   实测（同一实例、96 线程、v3 载荷）：PIN 全开 804–895 tok/s，prefill 绕过 pin 后 862–903。
+_PIN_MAXQ = int(os.environ.get("XIAOTU_PIN_MAXQ", "16") or 16)
+
 
 def _defer_mode(idx, qlen=0):
     """返回 0=不变、1=延后本层、2=先兑现上一层再正常计算。"""
@@ -2785,7 +2791,8 @@ class _XiaotuExpertsMixin:
             if _pinp is False and not torch.cuda.is_current_stream_capturing():
                 from vllm_xiaotu_moe import expert_pool as _xp
                 _pinp = None
-                if _xp.pin_enabled():
+                # ⭐ prefill（qlen 大）跳过热专家；decode（qlen ≤ _PIN_MAXQ）照旧用常驻池
+                if _xp.pin_enabled() and qlen <= _PIN_MAXQ:
                     # ⛔⛔ 2026-10-15 实测教训:本块原先**裸奔** ⇒ 里面任何一个异常
                     #     (实测:`_is_fp8` 未绑定 ⇒ UnboundLocalError)**直接打死引擎** ✗
                     #     —— 而"建池失败"的正确后果只是【退化为无驻留】,不该让服务不可用 ✓

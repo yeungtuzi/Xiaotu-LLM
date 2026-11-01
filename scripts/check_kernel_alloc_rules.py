@@ -52,15 +52,15 @@ KNOWN_BOUNDED = {
     "_GP_BUF2_DENIED": "同上（按设备记录拒绝标记）",
     # ── mixed_experts：审计第 5 轮逐个读过，均按 device / 层号索引（原靠 MAX 子串蒙过，
     #    现显式登记，杜绝"巧合式放行"）──
-    "_GPF_INFO": "按 device 索引（mixed_experts.py:282/2252）",
+    "_GPF_INFO": "key = _dev.index（mixed_experts.py:2249/2252）",
     "_GP_EVENTS": "按 device 索引（:358/2649）",
     "_GP_PREFETCH_ON": "按 device 索引（:494）",
-    "_GP_READY": "按 device 索引（:495/2673）",
+    "_GP_READY": "key = (device_key, 下一槽位序号)（:495/2594/2673）",
     "_GP_SLOT": "key = (device, slot)，slot ∈ {0,1}（:496/2654）",
-    "_GP_SLOT_FREE": "同 _GP_SLOT（:497/2595/2653）",
-    "_PROFILE_PREALLOC_DONE": "标记集合，key = device（:509/2226）",
+    "_GP_SLOT_FREE": "同 _GP_SLOT：key = device（:497，经 setdefault 写入）",
+    "_PROFILE_PREALLOC_DONE": "集合，元素 = device key（:509/2226）",
     "_GP_PF_WARNED": "告警去重，key = device（:512/2366）",
-    "_PF_HB": "心跳时间戳，key = device（:514/2780）",
+    "_PF_HB": "心跳计数，key 是字符串字面量 \"t\"/\"n\"（:514/2475-2476）",
 
     "_LUT_CACHE": "key 是 device（gpu_prefill.py:57）",
     "_SEG_RETIRED": "由 2 幂扩容驱动，上界 ~17；释放会引发 UAF，故不 free（见审计 §19 反驳）",

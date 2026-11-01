@@ -595,3 +595,42 @@ and LLM use must at least be disclosed through an `Assisted-by:` line」；
 
 ⇒ 推论：**要做 CED A/B，基线臂必须显式传 `--no-swa-bounded-replay`**；
 "传了 `--swa-bounded-replay`"与"没传"在行为上**完全等价**。
+
+## ⛔⛔⛔ 【ds41f 只有一个启动入口】2026-11-01 用户明令
+
+> **用户原话**：「给 ds41 设立一个"单一"的启动脚本，所有的引用，不管是调试还什么的，都必须从这里开始」
+> 追加：「审计，并锁定为纪律不让别的 agent 乱来」
+
+### 唯一入口
+
+```bash
+bash scripts/serve_ds41.sh start   [NAME=VAL ...] [+额外参数 ...]
+bash scripts/serve_ds41.sh stop    [TAG=...]
+bash scripts/serve_ds41.sh status  [TAG=...]
+bash scripts/serve_ds41.sh restart [NAME=VAL ...]
+```
+
+* 生产默认值、参数白名单、编译档位翻译、就绪自检、形状预热，**全部在脚本内**；
+* 白名单外的参数**直接拒绝**（提示"新增参数请改本脚本"），杜绝"改了但没人知道"。
+
+### 硬规则
+
+1. ⛔ **禁止**再写 `python -m vllm.entrypoints.openai.api_server` 起 ds41f（任何脚本、任何调试）；
+2. ⛔ **禁止**新写第二套起停逻辑（`relaunch.py`、`launch_*.sh` 之类）；需要新能力 ⇒ 改 `serve_ds41.sh` 的白名单；
+3. ✅ 调试/实验也用同一入口：`GPU_UTIL=0.85 MAXSEQS=2 bash scripts/serve_ds41.sh start TAG=exp1`；
+4. ⛔ 停服务**只能** `serve_ds41.sh stop`（只按 PID 文件 / 端口归属，禁止按名字或命令行模式匹配）；
+5. ⭐ 起服务后跑一次机械检查：
+
+```bash
+bash scripts/check_ds41_entry.sh     # 退出码 0=合规；1=违规（绕过入口 / 缺 compile_ranges）；2=未运行
+```
+
+### 为什么必须唯一（三次真实事故）
+
+| 事故 | 绕过入口的后果 |
+|---|---|
+| 2026-10-31 | 直起 api_server ⇒ `COMPILE_RANGES` **从未**翻译进 `--compilation-config` ⇒ Inductor 按 token 数产出 **853,377 个**编译产物（86 GB）⇒ 显存随形状单调上涨 ⇒ OOM |
+| 2026-11-01 | 线程数在 60/96 间漂移（SMT 门控 + 脚本漏传）⇒ prefill/步时数据不可比 |
+| 2026-11-01 | CED 被误认为"传旗标才开"（树里 `swa_bounded_replay` **默认 True**）⇒ 一度把 prefill 差距误归因于 CED |
+
+⭐ 判据：**任何 ds41f 实例，都必须能用 `serve_ds41.sh status` 读出自洽的口径**；读不出 ⇒ 违规。

@@ -47,6 +47,7 @@ THREADS=60; IMAGE_MAX=128; COMPILE_RANGES="32,256,8192"
 PIN=1; PIN_SLOTS=15; PIN_MAXQ=16; CED=1; WARMUP=1
 PC=1; PC_GB=64; PC_BLOCKS=16; PC_ROOT="/home/user/.cache/prefix-cache"
 PC_FREE_MIN_MIB="${PC_FREE_MIN_MIB:-524288}"
+PC_WRITE_WAIT="${PC_WRITE_WAIT:-900}"
 ALLOC_CONF_EFFECTIVE=""
 KV_DTYPE="fp8_ds_mla"; SPEC=1; MODEL_DIR="$MODEL_DIR_DEFAULT"; EXPANDABLE=0
 EXTRA_ARGS=()
@@ -155,7 +156,7 @@ resolve_alloc_conf() {
                 die "环境把 expandable_segments 设为 True，但 EXPANDABLE=0；要开请显式传 EXPANDABLE=1" 2 ;;
             '')
                 ALLOC_CONF_EFFECTIVE="expandable_segments:False" ;;
-            *)  ALLOC_CONF_EFFECTIVE="$PYTORCH_CUDA_ALLOC_CONF" ;;
+            *)  ALLOC_CONF_EFFECTIVE="$PYTORCH_CUDA_ALLOC_CONF,expandable_segments:False" ;;
         esac
     fi
 }
@@ -468,6 +469,8 @@ start() {
     kvp="$(grep -a "Available KV cache memory" "$LOG_FILE" | tail -1 | grep -oE "[0-9.]+ GiB")"
     say "就绪 ✓  ${kvp:-?} 可用 KV  ${kvs:-?}"
 
+    local _pc_base=""
+    [ "$PC" = "1" ] && _pc_base="$(find "$PC_ROOT" -name '*.bin' 2>/dev/null | wc -l)"
     cc="$(eff_compilation_config "$pid")"
     if [ -n "$COMPILE_RANGES" ]; then
         printf '%s' "$cc" | grep -q '"compile_ranges_endpoints"' \
@@ -477,8 +480,9 @@ start() {
     if [ "$PC" = "1" ]; then
         local _ev=0
         grep -aqE 'Created secondary tier #[0-9]+ \(fs\)' "$LOG_FILE" && _ev=$((_ev+1))
-        curl -s --noproxy '*' --max-time 3 "http://127.0.0.1:$PORT/metrics" 2>/dev/null \
-            | grep -qE "kv_offloading_size=\"(${PC_GB}|$(printf '%.1f' "$PC_GB"))\"" && _ev=$((_ev+1))
+        local _mtr
+        _mtr="$(curl -s --noproxy '*' --max-time 3 "http://127.0.0.1:$PORT/metrics" 2>/dev/null || true)"
+        printf '%s' "$_mtr" | grep -qE "kv_offloading_size=\"(${PC_GB}|$(printf '%.1f' "$PC_GB"))\"" && _ev=$((_ev+1))
         [ "$_ev" -ge 1 ] \
             || die "PC=1 但日志与 /metrics 均无 fs 层证据 ⇒ 磁盘前缀缓存未生效（勿当成功，先查 $LOG_FILE）" 6
         say "磁盘前缀缓存已生效（证据 ${_ev}/2）✓"
@@ -497,7 +501,29 @@ start() {
             fi
             sleep 600
         done' < /dev/null > /dev/null 2>&1 &
+        local _gpid=$!
+        sleep 1
+        if pid_alive "$_gpid"; then
+            printf '%s\n' "$_gpid" > "$RUN_DIR/ds41_${TAG}.pcdisk.pid"
+        else
+            say "⚠️ PC 磁盘守护启动失败（pid=$_gpid 已退出）⇒ 磁盘无运行时保护，请检查 setsid/df"
+        fi
         say "PC 磁盘守护已起（每 600s，阈值 ${PC_FREE_MIN_MIB}MiB，日志 $RUN_DIR/ds41_${TAG}.pcdisk.log）"
+        # ⛔ 审计 M2：日志只能证明"层建好"，不证明"写成" ⇒ 必须在预热后实测块文件增量
+        PC_ROOT="$PC_ROOT" PC_BASE="$_pc_base" PC_LOG="$LOG_FILE" \
+        PC_WAIT="${PC_WRITE_WAIT:-900}" \
+        setsid bash -c 'base="${PC_BASE:-0}"; end=$(( SECONDS + PC_WAIT )); new=0
+            while [ "$SECONDS" -lt "$end" ]; do
+                new=$(find "$PC_ROOT" -name "*.bin" 2>/dev/null | wc -l)
+                [ "$new" -gt "$base" ] && break
+                sleep 15
+            done
+            if [ "$new" -gt "$base" ]; then
+                echo "[ds41] [PC写入] ✓ 新增块文件 $((new-base)) 个（基线 $base → 现 $new）⇒ 磁盘层确实在写" >> "$PC_LOG"
+            else
+                echo "[ds41] [PC写入] ⚠️ $PC_WAIT 秒内无新增块文件（基线 $base）⇒ 只有层构造函数成功、无写入证据；查 O_DIRECT/权限/余量" >> "$PC_LOG"
+            fi' < /dev/null > /dev/null 2>&1 &
+        say "PC 写入证据守护已起（最长 ${PC_WRITE_WAIT:-900}s，结果写 $LOG_FILE 的 [PC写入] 行）"
     fi
     if [ "$CED" = "1" ] && grep -aq "SWA bounded replay needs model runner V2" "$LOG_FILE"; then
         die "CED=1 但日志显示 CED 未生效（needs model runner V2）" 4
@@ -506,7 +532,7 @@ start() {
             | grep -qE 'enable-custom-all-reduce'; then
         die "EXPANDABLE=1 但生效命令行里出现 enable-custom-all-reduce ⇒ 绑定被破坏" 4
     fi
-    { echo "[ds41] [口径] EXPANDABLE=$EXPANDABLE PYTORCH_CUDA_ALLOC_CONF=${ALLOC_CONF_EFFECTIVE:-unset} custom-AR=$([ "$EXPANDABLE" = "1" ] && echo off || echo on) PC=$PC PC_GB=$PC_GB PC_BLOCKS=$PC_BLOCKS PC_ROOT=$PC_ROOT GPU_UTIL=$GPU_UTIL"; } >> "$LOG_FILE"
+    { echo "[ds41] [口径] EXPANDABLE=$EXPANDABLE PYTORCH_CUDA_ALLOC_CONF=${ALLOC_CONF_EFFECTIVE:-unset} custom-AR=$([ "$EXPANDABLE" = "1" ] && echo off || echo on) PC=$PC PC_GB=$PC_GB PC_BLOCKS=$PC_BLOCKS PC_ROOT=$PC_ROOT GPU_UTIL=$GPU_UTIL PC_FILES_BASE=${_pc_base:-na}"; } >> "$LOG_FILE"
     say "显存: $(nvidia-smi --query-gpu=index,memory.used --format=csv,noheader | tr '\n' ' ')"
 
     if [ "$WARMUP" = "1" ]; then
@@ -562,6 +588,13 @@ stop() {
         *) die "stop 未完成：端口 $PORT 仍被 $(port_state "$PORT") 持有" 4 ;;
     esac
 
+    local _gpid
+    if [ -f "$RUN_DIR/ds41_${TAG}.pcdisk.pid" ]; then
+        _gpid="$(tr -dc '0-9' < "$RUN_DIR/ds41_${TAG}.pcdisk.pid" 2>/dev/null || true)"
+        if pid_alive "$_gpid"; then kill -TERM "$_gpid" 2>/dev/null || true; fi
+        rm -f "$RUN_DIR/ds41_${TAG}.pcdisk.pid"
+        say "已回收 PC 磁盘守护 pid=${_gpid:-?}"
+    fi
     rm -f "$PID_FILE"
     say "等待显存释放 20s…"
     sleep 20
@@ -589,7 +622,7 @@ status() {
     cc="$(eff_compilation_config "$pid")"
     say "    [生效] --compilation-config $cc"
     local _kvo _pcdir
-    _kvo="$(tr '\0' '\n' < "/proc/$pid/cmdline" | grep -oE -- '--kv-offloading-size [0-9]+' | head -1)"
+    _kvo="$(tr '\0' ' ' < "/proc/$pid/cmdline" | grep -oE -- '--kv-offloading-size [0-9]+' | head -1)"
     if [ -n "$_kvo" ]; then
         _pcdir="$(find "$PC_ROOT" -maxdepth 1 -type d -name 'engine-*' 2>/dev/null | tail -1)"
         say "    PC: ${_kvo} 目录=${_pcdir:-?} 占用=$(du -sh "$PC_ROOT" 2>/dev/null | awk '{print $1}') 块文件=$(find "$PC_ROOT" -name '*.bin' 2>/dev/null | wc -l)"

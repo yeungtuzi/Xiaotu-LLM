@@ -71,5 +71,34 @@ else
     echo "⚠️ XIAOTU_MOE_THREADS=${threads:-未设}（非 60，性能数据须标注口径）"
 fi
 
+# ⑤ 碎片/分配器口径（2026-11-01 新增轴：EXPANDABLE 与 custom AR 必须成对出现）
+alloc="$(tr '\0' '\n' < "/proc/$owner/environ" 2>/dev/null | grep '^PYTORCH_CUDA_ALLOC_CONF=' | cut -d= -f2-)"
+exp_flag="$(printf '%s' "$cmdline" | grep -o -- '--disable-custom-all-reduce' | head -1)"
+case "${alloc:-}" in
+    *expandable_segments:True*)
+        if [ -n "$exp_flag" ]; then
+            echo "✓ expandable_segments:True + custom-AR 已关（VMM/IPC 绑定完整）"
+        else
+            echo "✗ expandable_segments:True 但命令行缺 --disable-custom-all-reduce ⇒ 必然在 KV profiling 崩（2026-10-27 事故）" >&2
+            rc=1
+        fi ;;
+    *expandable_segments:False*) echo "  expandable_segments:False（碎片不回收，frag 会累积）" ;;
+    *) echo "  PYTORCH_CUDA_ALLOC_CONF=${alloc:-未设}" ;;
+esac
+
+# ⑥ 磁盘前缀缓存口径（PC=1 时命令行必须带 L1 大小与 transfer-config）
+kvoff="$(printf '%s' "$cmdline" | grep -oE -- '--kv-offloading-size [0-9]+' | head -1)"
+if [ -n "$kvoff" ]; then
+    if printf '%s' "$cmdline" | grep -q -- 'TieringOffloadingSpec'; then
+        echo "✓ 前缀缓存已接线（$kvoff，tiering offload）"
+    else
+        echo "✗ 有 --kv-offloading-size 但缺 TieringOffloadingSpec ⇒ 磁盘层不会生效" >&2
+        rc=1
+    fi
+else
+    echo "  前缀缓存未开（无 --kv-offloading-size）"
+fi
+
+
 [ "$rc" = "0" ] && echo "合规：ds41f 由唯一入口启动" || echo "违规：存在不受控启动" >&2
 exit "$rc"

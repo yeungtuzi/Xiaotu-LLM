@@ -352,7 +352,7 @@ start() {
         export XIAOTU_MOE_ASYNC="${XIAOTU_MOE_ASYNC:-0}"
         export XIAOTU_MOE_SPIN_IDLE_US="${XIAOTU_MOE_SPIN_IDLE_US:-300}"
         export XIAOTU_GPF_STAGE_TILE_E="${XIAOTU_GPF_STAGE_TILE_E:-48}"
-        export XIAOTU_MOE_MBT="${XIAOTU_MOE_MBT:-8192}"
+        export XIAOTU_MOE_MBT="$MBT"   # 必须跟随 --max-num-batched-tokens，否则 staging 预分配错配
         export PYTORCH_CUDA_ALLOC_CONF="${PYTORCH_CUDA_ALLOC_CONF:-expandable_segments:False}"
         exec setsid "${ARGS[@]}"
     ) >> "$LOG_FILE" 2>&1 < /dev/null &
@@ -407,12 +407,9 @@ start() {
         grep -aqE 'Created secondary tier #[0-9]+ \(fs\)' "$LOG_FILE" && _ev=$((_ev+1))
         curl -s --noproxy '*' --max-time 3 "http://127.0.0.1:$PORT/metrics" 2>/dev/null \
             | grep -q "kv_offloading_size=\"$PC_GB\"" && _ev=$((_ev+1))
-        ls -d "$PC_ROOT"/engine-*/*_* >/dev/null 2>&1 && _ev=$((_ev+1))
-        if [ "$_ev" -eq 0 ]; then
-            say "⚠️ PC=1 但三条证据全无（日志/metrics/目录）⇒ 磁盘缓存可能未生效，先查 $LOG_FILE"
-        else
-            say "磁盘前缀缓存证据 ${_ev}/3 ✓"
-        fi
+        [ "$_ev" -ge 1 ] \
+            || die "PC=1 但日志与 /metrics 均无 fs 层证据 ⇒ 磁盘前缀缓存未生效（勿当成功，先查 $LOG_FILE）" 6
+        say "磁盘前缀缓存已生效（证据 ${_ev}/2）✓"
     fi
     if [ "$CED" = "1" ] && grep -aq "SWA bounded replay needs model runner V2" "$LOG_FILE"; then
         die "CED=1 但日志显示 CED 未生效（needs model runner V2）" 4

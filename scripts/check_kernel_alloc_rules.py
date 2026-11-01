@@ -156,6 +156,17 @@ _VOL_TENSOR_NAMES = ("block_table", "block_tables", "out", "topk_indices", "slot
                      "acc", "max_score", "cu_seqlens", "logits", "q", "kv", "slot_mapping")
 
 
+def _find_kernel(tree, name: str):
+    """在**本文件** AST 里按名字找内核 def（跨文件发射仍不支持，见已知缺口）。"""
+    for n in ast.walk(tree):
+        if isinstance(n, (ast.FunctionDef, ast.AsyncFunctionDef)) and n.name == name:
+            return n
+    return None
+
+
+_CLAMP = re.compile(r"mask\s*=|tl\.minimum|tl\.maximum|[<>]=?")
+
+
 def _check_call_sites(tree, fname: str, pnames: list, target_param: str) -> bool:
     """该内核的**任一调用点**把 target_param 传成了"随请求维张量的 .shape[ / .stride(0)"吗？
 
@@ -461,7 +472,9 @@ def check_file(path: str):
             argtxt = " ".join(ast.unparse(a) for a in c.args) + " " + " ".join(
                 f"{k.arg}={ast.unparse(k.value)}" for k in c.keywords if k.arg)
             if any(re.search(rf"\b{a}\b", argtxt) for a in ADDR_ARGS):
-                launches.append((c.lineno, argtxt))
+                # ⚠️ 必须把**内核名**也放进去：否则"找内核体核验界是否被真用"永远找不到内核
+                #    （第11轮 N4 加固时就栽在这：argtxt 只有参数，没有 fname）
+                launches.append((c.lineno, fname + "[" + argtxt))
         if not launches:
             continue
         body_src = ast.unparse(node)
@@ -507,7 +520,30 @@ def check_file(path: str):
                     for _a in ADDR_ARGS:
                         if re.search(rf"\b{re.escape(_a)}\b", _rhs):
                             _delegated_addrs.add(_a)
-        _addrs_missing = _addrs_passed - _addrs_covered - _delegated_addrs
+        # ⛔ 第11轮 N4：`_delegated_addrs` 曾只看"宿主传了个 .shape 值" ⇒ 内核完全不看该界也算覆盖
+        #    （审计实测：`num_table_rows=block_table.shape[0]` + 内核无视它 ⇒ 假绿）。
+        #    ⇒ 要求该界在内核体里**真的被用作钳位/掩码**。
+        _delegated_ok = set()
+        for _a in _delegated_addrs:
+            _bound_param = None
+            for _l, _t in launches:
+                for _m in re.finditer(rf"(\w+)\s*=\s*[^,\)]{{0,120}}?\b{re.escape(_a)}\b[^,\)]{{0,60}}", _t):
+                    _bound_param = _m.group(1)
+                    break
+                if _bound_param:
+                    break
+            if not _bound_param:
+                continue
+            for _kn in {x for _l, _t in launches for x in re.findall(r"([A-Za-z_]\w*)\s*\[", _t)}:
+                _kfn = _find_kernel(tree, _kn)
+                if _kfn is None:
+                    continue
+                _body = ast.unparse(_kfn)
+                if re.search(rf"\b{re.escape(_bound_param)}\b", _body) and (
+                        "tl.minimum" in _body or "tl.maximum" in _body or "mask=" in _body):
+                    _delegated_ok.add(_a)
+                    break
+        _addrs_missing = _addrs_passed - _addrs_covered - _delegated_ok
         # 边界可能由内核内校验：宿主把行数/块数显式传给内核 ⇒ 不算漏
         # ⛔ 第9轮 §4：旧版只要实参文本里**出现** `num_blocks` 这类名字就整体豁免
         #    （scope 内 23 处命中，而 num_blocks 极常见）⇒ 要求右值真的来自 .shape/numel
@@ -522,9 +558,33 @@ def check_file(path: str):
                 break
         # 已人工复核：内核内部对块表/slot 的访问自带 mask ⇒ 用源码切片白标
         _slice = "\n".join(lines[node.lineno - 1:(node.end_lineno or node.lineno)])
-        # 两种白标：内核内自带 mask / 上界由调用方保证（后者必须写明依据）
-        if ("alloc-audit: masked-in-kernel" in _slice
-                or "alloc-audit: bound-in-caller" in _slice):
+        # ⛔ 第11轮 N4/N7：旧判据是**子串匹配** ⇒ 我在注释里写"原先写 alloc-audit: masked-in-kernel"
+        #    这句话本身就又把该宿主白标掉了（"删除白标"实际没生效）。
+        #    ⇒ 必须**行首锚定**：`# alloc-audit: <kind>` 且必须是独立注释行。
+        _label = re.search(
+            r"^\s*#\s*alloc-audit:\s*(masked-in-kernel|bound-in-caller)\s*(.*)$",
+            _slice, re.M)
+        if _label:
+            # ⛔ 第11轮 N4：白标是**自由文本** ⇒ 纯自证（删掉注释立刻报 C4）。
+            #    ⇒ 要求它给出 `文件:行号`，且该行必须落在**被启动内核的函数体内**、
+            #      且含 mask=/tl.minimum/tl.maximum 之类的钳位证据。
+            _ev = re.search(r"([A-Za-z0-9_./]+\.py):(\d+)", _label.group(2))
+            _ok = False
+            if _ev:
+                _evfile = next((x for x in targets if x.endswith(_ev.group(1))), None)
+                _evline = int(_ev.group(2))
+                if _evfile:
+                    for _kn in {x for _l, _t in launches for x in re.findall(r"([A-Za-z_]\w*)\s*\[", _t)}:
+                        _kfn = _find_kernel(_evfile and ast.parse(open(_evfile, encoding="utf-8", errors="replace").read()), _kn)
+                        if _kfn and _kfn.lineno <= _evline <= (_kfn.end_lineno or _kfn.lineno):
+                            _txt = open(_evfile, encoding="utf-8", errors="replace").read().splitlines()[_evline - 1]
+                            if _CLAMP.search(_txt):
+                                _ok = True
+                            break
+            if not _ok:
+                out.append((path, node.lineno, "C4",
+                            "白标缺少可核验证据：必须写 `# alloc-audit: <kind> 文件:行号`，"
+                            "且该行须在被启动内核体内、含 mask=/tl.minimum/tl.maximum 钳位"))
             continue
         # 恒真比较已被剔除 ⇒ 1 条真实上界/跨距断言即视为已声明契约
         if not _addrs_missing and (n_assert >= 1 or delegated):

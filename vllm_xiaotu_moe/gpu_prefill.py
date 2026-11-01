@@ -1321,6 +1321,13 @@ def release_staging_reserve() -> None:
     except Exception as _e:  # noqa: BLE001
         print(f"[xtu-kv-diag] 释放前取显存失败(不掩盖): {type(_e).__name__}: {_e}", flush=True)
     if _PROF_RESERVE:
+        # ⛔ [xtu 2026-11-01 第三方审计 A2-6] 顺序应为「同步 → clear → empty_cache」，
+        #    且同步必须指定**占位所属的设备**（原为无参，是"当前设备"隐式）。
+        try:
+            import torch as _ts
+            _ts.cuda.synchronize(device)
+        except Exception:  # noqa: BLE001
+            pass
         _PROF_RESERVE.clear()
         # ⭐ A69：`clear()` 只是丢掉活引用，段仍留在 torch 缓存分配器里 ⇒
         #   记账以为已归还，实际没还 ⇒ **必须** empty_cache 才真正还给驱动 ✓

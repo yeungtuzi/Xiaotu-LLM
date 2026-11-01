@@ -104,12 +104,18 @@ class PinMaskFused:
     def _buf(self, name: str, n: int, dtype: torch.dtype) -> torch.Tensor:
         """按 (语义名, 长度, dtype) 复用；**必须带 name** —— 否则 cpu_ids 与 part_ids
         都是 int32 同长，会拿到同一块内存，后被 part 覆盖（实测踩过）。"""
-        key = (name, n, dtype)
+        # ⛔ [xtu 2026-11-01 第三方审计 A2-1] 旧 key 含**精确长度 n**，而 n = decode
+        #    batch 宽度（逐请求变化）⇒ 每个新宽度永久留下 3 块张量，实例挂在 MoE 模块上、
+        #    进程级常驻且**无淘汰**（`_MAX_ELEMS` 只限宽度、不限条目数）。
+        #    改为：容量按 2 的幂上行，返回 `t[:n]` 视图。
+        key = (name, dtype)
         t = self._bufs.get(key)
-        if t is None:
-            t = torch.empty(n, dtype=dtype, device=self.device)
+        if t is None or int(t.numel()) < n:
+            cap = n if t is None else max(n, int(t.numel()))
+            cap = 1 << max(0, (cap - 1).bit_length())      # 2 的幂上行
+            t = torch.empty(cap, dtype=dtype, device=self.device)
             self._bufs[key] = t
-        return t
+        return t[:n]
 
     @property
     def enabled(self) -> bool:

@@ -519,9 +519,9 @@ def gpu_moe_layer_fp8(x, topk_ids, topk_weights, w13t, s13t, w2t, s2t,
     if s2t.dtype == torch.uint8:
         s2t = s2t.view(torch.float32)
     # ⛔ MUSA 的 Triton 没有 fp8e4nv 类型：位运算要求权重以 uint8 呈现
-    if w13t.dtype == torch.float8_e4m3fn:
+    if w13t.dtype != torch.uint8 and w13t.element_size() == 1:
         w13t = w13t.view(torch.uint8)
-    if w2t.dtype == torch.float8_e4m3fn:
+    if w2t.dtype != torch.uint8 and w2t.element_size() == 1:
         w2t = w2t.view(torch.uint8)
     T = x.shape[0]
     E = int(w13t.shape[0])
@@ -670,9 +670,9 @@ def _fp8_kmajor_tiled_impl(engine, device, hidden: int, inter: int, n_experts: i
     if s2t.dtype == torch.uint8:
         s2t = s2t.view(torch.float32)
     # ⛔ MUSA 的 Triton 没有 fp8e4nv 类型：位运算要求权重以 uint8 呈现
-    if w13t.dtype == torch.float8_e4m3fn:
+    if w13t.dtype != torch.uint8 and w13t.element_size() == 1:
         w13t = w13t.view(torch.uint8)
-    if w2t.dtype == torch.float8_e4m3fn:
+    if w2t.dtype != torch.uint8 and w2t.element_size() == 1:
         w2t = w2t.view(torch.uint8)
 
     # 入口事件：用于量出 "入口 → 第一次 DMA 结束" 这段（台账 §157 发现它才是大头）

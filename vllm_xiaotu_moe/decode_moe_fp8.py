@@ -119,10 +119,17 @@ def gpu_moe_decode_fp8(x, topk_ids, topk_weights, w13t, s13t, w2t, s2t,
     # ⛔ [同审计] 权重必须显式 `view(torch.uint8)`：若直接传 float8_e4m3fn，
     #    Triton 会推断 fp8e4nv 指针类型 ⇒ SM80/MUSA 编译失败
     #    （对比 gpu_prefill_fp8.py 的显式 view）。
-    if w13t.dtype == torch.float8_e4m3fn:
-        w13t = w13t.view(torch.uint8)
-    if w2t.dtype == torch.float8_e4m3fn:
-        w2t = w2t.view(torch.uint8)
+    # ⛔ [xtu 2026-11-01 第三方审计 F8] 原来只白名单 `float8_e4m3fn`（OCP）。若权重是
+    #    `float8_e4m3fnuz`（gfx942 归一化后）或其它 1 字节 fp8，指针仍是 fp8 类型，
+    #    而内核里 `_e4m3_uint8_to_f32(x)` 的 `x.to(tl.int32)` 是**数值转换**而非位重解释
+    #    ⇒ 静默垃圾数。改为：任何非 uint8 的 1 字节类型一律按位重解释成 uint8。
+    for _n in ("w13t", "w2t"):
+        _t = locals()[_n]
+        if _t.dtype != torch.uint8 and _t.element_size() == 1:
+            if _n == "w13t":
+                w13t = _t.view(torch.uint8)
+            else:
+                w2t = _t.view(torch.uint8)
     if s13t.dtype == torch.uint8:
         s13t = s13t.view(torch.float32)
     if s2t.dtype == torch.uint8:

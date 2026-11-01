@@ -230,6 +230,7 @@ _TARGETS: list = []
 # ══════════════════════════════════════════════════════════════════════════
 
 _KERNEL_INDEX: dict = {}   # name -> (file, [param names], [constexpr param names])
+_AMBIGUOUS: set = set()    # 同名内核（无法消歧）⇒ 跨文件检查跳过并记录
 
 
 def build_kernel_index(files: list) -> None:
@@ -248,7 +249,10 @@ def build_kernel_index(files: list) -> None:
             params = [a.arg for a in n.args.args] + [a.arg for a in n.args.kwonlyargs]
             cx = [a.arg for a in n.args.args + n.args.kwonlyargs
                   if a.annotation and "constexpr" in ast.unparse(a.annotation)]
-            _KERNEL_INDEX[n.name] = (f, params, cx)
+            # ⛔ 第13轮：按**名字**建索引时同名内核 last-wins ⇒ 后者（无 constexpr）覆盖前者，
+            #    索引遮蔽。改为同时按 (文件, 名字) 与名字建：名字键只在**唯一**时才用于跨文件解析。
+            _KERNEL_INDEX[(f, n.name)] = (f, params, cx)
+            _KERNEL_INDEX.setdefault(n.name, []).append((f, params, cx))
 
 
 def check_cross_file_launches(files: list):
@@ -267,7 +271,16 @@ def check_cross_file_launches(files: list):
             name = v.id if isinstance(v, ast.Name) else (v.attr if isinstance(v, ast.Attribute) else None)
             if not name or name not in _KERNEL_INDEX:
                 continue
-            def_file, params, cx = _KERNEL_INDEX[name]
+            _cands = _KERNEL_INDEX[name]
+            if not isinstance(_cands, list) or not _cands:
+                continue
+            # ⛔ 同名内核（`kernel` 这种通用名在 13 个文件里都有）⇒ **歧义即跳过**，
+            #    不能瞎猜一个（猜错会产生假 finding，比不报更糟）。
+            _files = {c[0] for c in _cands}
+            if len(_files) > 1:
+                _AMBIGUOUS.add(name)
+                continue
+            def_file, params, cx = _cands[0]
             if os.path.abspath(def_file) == os.path.abspath(f):
                 continue      # 同文件已由 C2 主检查覆盖
             if not cx:
@@ -816,6 +829,9 @@ def main():
     for p in targets:
         all_findings.extend(check_file(p))
     all_findings.extend(check_cross_file_launches(targets))
+    if _AMBIGUOUS:
+        print(f"  ⚠️ 跨文件检查跳过 {len(_AMBIGUOUS)} 个歧义内核名（同名定义在多个文件）："
+              f"{sorted(_AMBIGUOUS)[:5]}")
 
     # ⛔ 第6轮 #9：白名单里出现过**不存在的名字**（`_BND_PIN`）、重复项、类别错。
     #    改为：每个白名单名字必须在被扫文件的源码里**出现过**，否则报错（退出码 3）。

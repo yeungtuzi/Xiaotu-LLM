@@ -254,6 +254,7 @@ REQUIRED_SHAPES = [
     ("^\\s*#\\s*alloc-audit:\\s*bounded", "C1 bounded 白标必须行首锚定"),
     ("elif isinstance(_v, ast.Attribute)", "C2 支持 `mod.kernel[...]` 属性限定调用"),
     ("def check_cross_file_launches(files: list):", "跨文件发射检查仍存在（内核定义/宿主异文件）"),
+    ("_AMBIGUOUS.add(name)", "同名内核必须跳过而非瞎猜（歧义即跳过）"),
 ]
 
 

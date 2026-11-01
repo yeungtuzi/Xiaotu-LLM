@@ -35,12 +35,10 @@ MODULE_LEVEL_CTORS = ("set(", "list(", "dict(", "OrderedDict(", "defaultdict(", 
 #    判据：值 = 分页 KV 缓存的**最外层跨距**（页大小/页行数），与 num_blocks 无关，
 #    进程内恒定 ⇒ 变体数有界，不随每请求变化。
 CONSTEXPR_PAGE_STRIDES = {
-    "RAW_STRIDE": "= kv_score.stride(0)，且有显式断言 == 512*compress_ratio（fused_compress_quant_cache.py:76-83）",
-    "CACHE_STRIDE": "= kv_cache.stride(0)，分页 KV 的页跨距",
-    "KV_BLOCK_STRIDE": "= k_cache.stride(0)，分页 KV 的页跨距",
-    "stride_sb": "= kv_scale.stride(0)，分页 KV 的页跨距",
-    "stride_kvb": "= kv_values.stride(0)，分页 KV 的页跨距",
-    "TAIL_BLOCK_ELEMS": "= tail_kv_cache.stride(0)，分页 KV 的页跨距",
+    "RAW_STRIDE": "deepseek_v41/common/ops/fused_compress_quant_cache.py:119 = kv_score.stride(0)",
+    "CACHE_STRIDE": "deepseek_v41/common/ops/fused_compress_quant_cache.py:298 = kv_cache.stride(0)",
+    "KV_BLOCK_STRIDE": "deepseek_v4/common/ops/fused_compress_quant_cache.py:145 = kv_cache.stride(0)",
+    "TAIL_BLOCK_ELEMS": "glm5next/nvidia/ops/kpool_compress.py:464 = tail_kv_cache.stride(0)",
 }
 _DUMMY_PAGE_STRIDES = {
 }
@@ -258,7 +256,8 @@ def check_file(path: str):
                 #    ⇒ 位置映射只能对"非 constexpr"形参按顺序进行。
                 # ⚠️ Triton **允许** constexpr 形参按位置传（也可省略/关键字传）
                 #    ⇒ 位置映射覆盖全部形参（审计样本 C2_positional 就是这种）。
-                _pnames = [x.arg for x in node.args.args]
+                # ⛔ 第10轮 N2：只取位置形参 ⇒ keyword-only constexpr 永久盲区
+                _pnames = [x.arg for x in node.args.args] + [x.arg for x in node.args.kwonlyargs]
                 _shapey = _check_call_sites(tree, node.name, _pnames, a.arg)
                 _v = ""
                 if not _shapey:
@@ -478,7 +477,9 @@ def check_file(path: str):
             _has_cmp = any(op in t for op in ("<=", ">=", "<", ">"))
             if not _has_cmp:
                 return False
-            _tauto = bool(re.search(r"[<>]=?\s*\d+\s*$", t.strip())) or bool(
+            # ⛔ 第10轮 N6：旧版把 `<= 4096` 也算恒真 ⇒ 最自然的容量写法被判"没有断言"
+            #    （反向误报压力，只会逼人加白名单）。只把**对 0 的比较**当恒真。
+            _tauto = bool(re.search(r"[<>]=?\s*0\s*$", t.strip())) or bool(
                 re.search(r"[<>]=?\s*0\b", t))
             if _tauto:
                 return False
@@ -487,7 +488,15 @@ def check_file(path: str):
             _refs = any(re.search(rf"\b{x}\b", t) for x in ADDR_ARGS)
             return _refs
 
-        n_assert = len([x for x in ast.walk(node) if isinstance(x, ast.Assert) and _is_bound(x)])
+        _basserts = [x for x in ast.walk(node) if isinstance(x, ast.Assert) and _is_bound(x)]
+        n_assert = len(_basserts)
+        # ⛔ 第10轮 N9：旧判据 `n_assert >= 1` ⇒ 一条 slot 断言把同一次启动里的**块表**也担保了
+        #    （sink 函数就是活例）。改为：内核实参里出现的**每种** ADDR_ARG 都需要被某条断言引用。
+        _addrs_passed = {a for _l, _t in launches for a in ADDR_ARGS
+                         if re.search(rf"\b{re.escape(a)}\b", _t)}
+        _addrs_covered = {a for x in _basserts for a in ADDR_ARGS
+                          if re.search(rf"\b{re.escape(a)}\b", ast.unparse(x.test))}
+        _addrs_missing = _addrs_passed - _addrs_covered
         # 边界可能由内核内校验：宿主把行数/块数显式传给内核 ⇒ 不算漏
         # ⛔ 第9轮 §4：旧版只要实参文本里**出现** `num_blocks` 这类名字就整体豁免
         #    （scope 内 23 处命中，而 num_blocks 极常见）⇒ 要求右值真的来自 .shape/numel
@@ -507,11 +516,12 @@ def check_file(path: str):
                 or "alloc-audit: bound-in-caller" in _slice):
             continue
         # 恒真比较已被剔除 ⇒ 1 条真实上界/跨距断言即视为已声明契约
-        if n_assert >= 1 or delegated:
+        if not _addrs_missing and (n_assert >= 1 or delegated):
             continue
         out.append((path, launches[0][0], "C4",
                     f"宿主 `{node.name}` 把块表/slot 作为**内核实参**传入（无 mask 寻址），"
-                    f"但**没有**非恒真的上界/跨距断言（{n_assert} 条）"))
+                    f"但**没有**非恒真的上界/跨距断言（{n_assert} 条）；"
+                            f"未覆盖的内核实参：{sorted(_addrs_missing) or '无'}"))
     return out
 
 
@@ -643,6 +653,30 @@ def main():
     # ⛔ 第9轮 §2：旧守卫只查"名字是否是某函数形参"，把真正易变的 `stride_slot_t`
     #    加进白名单就能全绿（已实测）。⇒ 追加语义校验：白名单里的 constexpr 名
     #    若在某个调用点被 `.stride(0)`/`.shape[0]` 派生值喂过 ⇒ 白名单与证据矛盾，报错。
+    # ⛔ 第10轮 N1：`CONSTEXPR_PAGE_STRIDES` 曾是**无守卫的万能消音口**（加一行即全绿）。
+    #    现在要求：①证据串里必须含真实存在的 `文件:行号`；②该名字的调用点只能由 `.stride(0)` 供给
+    #    （不能是 `.shape[0]` —— 那是请求维的典型形态）。
+    _ps_bad = []
+    for _n3, _ev in CONSTEXPR_PAGE_STRIDES.items():
+        _m = re.search(r"([A-Za-z0-9_./]+\.py):(\d+)", _ev)
+        if not _m:
+            _ps_bad.append((_n3, "证据里没有 文件:行号")); continue
+        _fp = next((p for p in targets if p.endswith(_m.group(1))), None)
+        if _fp is None or not os.path.exists(_fp):
+            _ps_bad.append((_n3, f"证据文件不存在 {_m.group(1)}")); continue
+        try:
+            _ln = int(_m.group(2))
+            _txt = open(_fp, encoding="utf-8", errors="replace").read().splitlines()[_ln - 1]
+        except (OSError, IndexError):
+            _ps_bad.append((_n3, "证据行号越界")); continue
+        if ".stride(0)" not in _txt:
+            _ps_bad.append((_n3, f"证据行不含 .stride(0)：{_txt.strip()[:60]}"))
+    if not a.no_whitelist_check and _ps_bad:
+        print("❌ CONSTEXPR_PAGE_STRIDES 条目缺少可核验的 .stride(0) 证据：")
+        for _n3, _why in _ps_bad:
+            print(f"   {_n3}: {_why}")
+        return 3
+
     _volatile_wl = []
     for _p in targets:
         try:

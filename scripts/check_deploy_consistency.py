@@ -22,9 +22,12 @@ SSH = ["ssh", "-F", "/root/lvllm/tmp/sshcfg", "-o", "BatchMode=yes", "-o", "Conn
 SCP = ["scp", "-F", "/root/lvllm/tmp/sshcfg", "-o", "BatchMode=yes", "-o", "ConnectTimeout=10"]
 
 # (本地相对路径, 远端目录)
+# (本地根, 远端根, 是否全量比对)
+# ⚠️ vLLM 本地镜像**只维护我们改过的那批文件**（不是全量副本）⇒ 只比 scope；
+#    插件树是**我们自己的完整源码** ⇒ 全量比对（第10轮实测 hybrid_model.py 曾漂移）。
 ROOTS = [
-    ("/root/lvllm/data/repos/vllm-mainline", "/home/user/lvllm/process_data/ref/repos/vllm-mainline"),
-    ("/root/lvllm/repos/xiaotu-llm/vllm_xiaotu_moe", "/home/user/lvllm/vllm-xiaotu-moe/vllm_xiaotu_moe"),
+    ("/root/lvllm/data/repos/vllm-mainline", "/home/user/lvllm/process_data/ref/repos/vllm-mainline", False),
+    ("/root/lvllm/repos/xiaotu-llm/vllm_xiaotu_moe", "/home/user/lvllm/vllm-xiaotu-moe/vllm_xiaotu_moe", True),
 ]
 
 
@@ -45,7 +48,7 @@ def _resolve(rel: str):
         # scope 里写成 `plugin:vllm_xiaotu_moe/xxx.py`，而 ROOTS[1] 已指向该包目录
         if rel.startswith("vllm_xiaotu_moe/"):
             rel = rel[len("vllm_xiaotu_moe/"):]
-    for local, remote in ROOTS:
+    for local, remote, _full in ROOTS:
         lp = os.path.join(local, rel)
         if os.path.exists(lp):
             return lp, os.path.join(remote, rel)
@@ -58,12 +61,35 @@ def main() -> int:
     a = ap.parse_args()
 
     pairs = []
+    unresolved = []
     for rel in _scope():
         lp, rp = _resolve(rel)
         if lp is None:
-            print(f"⚠️ 本地找不到：{rel}")
+            # ⛔ 第10轮：**解析不到的条目不许静默跳过**（旧版会打印 "✅ 一致：N/N"，分母悄悄变小）
+            unresolved.append(rel)
             continue
         pairs.append((lp, rp))
+    if unresolved:
+        print(f"❌ scope 里有 {len(unresolved)} 个条目解析不到本地文件（分母不能悄悄变小）：")
+        for rel in unresolved[:10]:
+            print(f"   {rel}")
+        return 1
+
+    # ⛔ 第10轮：只比 scope 的 32 个文件不够 —— `hybrid_model.py` 已实测漂移而门禁报绿。
+    #    ⇒ 额外对**整棵树**（两侧都存在的 *.py）做一次全量比对。
+    whole = []
+    for local, remote, full in ROOTS:
+        if not full:
+            continue   # vLLM 镜像不是全量副本 ⇒ 只比 scope（见 ROOTS 注释）
+        for dirpath, _dirs, files in os.walk(local):
+            for fn in files:
+                if not fn.endswith(".py"):
+                    continue
+                lp = os.path.join(dirpath, fn)
+                rel = os.path.relpath(lp, local)
+                rp = os.path.join(remote, rel)
+                whole.append((lp, rp))
+    whole_pairs = [(lp, rp) for lp, rp in whole if lp not in {p[0] for p in pairs}]
 
     if a.deploy:
         bad = 0
@@ -77,24 +103,28 @@ def main() -> int:
         if bad:
             return 1
 
-    cmd = "md5sum " + " ".join(f'"{rp}"' for _, rp in pairs)
-    try:
-        r = subprocess.run(SSH + [cmd], capture_output=True, text=True, timeout=60)
-    except subprocess.TimeoutExpired:
-        print("❌ ssh 超时")
-        return 2
-    if r.returncode != 0:
-        print(f"❌ ssh 失败: {r.stderr.strip()[:120]}")
-        return 2
-
+    allpairs = pairs + whole_pairs
     remote = {}
-    for line in r.stdout.splitlines():
-        parts = line.split(maxsplit=1)
-        if len(parts) == 2:
-            remote[parts[1].strip()] = parts[0]
+    # ⛔ 命令行有长度上限 ⇒ 分批（每批 150 个）
+    BATCH = 150
+    for i in range(0, len(allpairs), BATCH):
+        chunk = allpairs[i:i + BATCH]
+        cmd = "md5sum " + " ".join(f'"{rp}"' for _, rp in chunk)
+        try:
+            r = subprocess.run(SSH + [cmd], capture_output=True, text=True, timeout=60)
+        except subprocess.TimeoutExpired:
+            print("❌ ssh 超时")
+            return 2
+        if r.returncode != 0 and not r.stdout:
+            print(f"❌ ssh 失败: {r.stderr.strip()[:120]}")
+            return 2
+        for line in r.stdout.splitlines():
+            parts = line.split(maxsplit=1)
+            if len(parts) == 2:
+                remote[parts[1].strip()] = parts[0]
 
     mismatch = []
-    for lp, rp in pairs:
+    for lp, rp in allpairs:
         lm = hashlib.md5(open(lp, "rb").read()).hexdigest()
         rm = remote.get(rp)
         if rm is None:
@@ -103,13 +133,14 @@ def main() -> int:
             mismatch.append((os.path.basename(lp), lm[:8], rm[:8]))
 
     if mismatch:
-        print(f"❌ 本地镜像与远端部署树**不一致**：{len(mismatch)}/{len(pairs)}")
+        print(f"❌ 本地镜像与远端部署树**不一致**：{len(mismatch)}/{len(allpairs)}")
         for name, lm, rm in mismatch[:15]:
             print(f"   {name}: 本地={lm} 远端={rm}")
         print("\n⇒ 任何门禁结论在被审对象上**不可信**。先跑 --deploy 再重跑门禁。")
         return 1
 
-    print(f"✅ 一致：{len(pairs)}/{len(pairs)} 文件 md5 相同")
+    print(f"✅ 一致：{len(allpairs)}/{len(allpairs)} 文件 md5 相同"
+          f"（scope {len(pairs)} + 全树其余 {len(whole_pairs)}）")
     return 0
 
 

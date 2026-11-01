@@ -682,3 +682,31 @@ grep -c '^GPU_UTIL=' scripts/serve_ds41.sh     # 必须为 1
 
 ⭐ 判据一句话：**别人看 `git log -- scripts/serve_ds41.sh`，就能看出「谁在什么时候改了哪条口径」**；
 做不到 ⇒ 违规。
+
+### ⚠️ 2026-11-01 勘误：前缀缓存与 `expandable_segments` **在 vLLM 里硬互斥**
+
+> 用户决断：「我需要持久缓存，但是我更需要控制显存乱飞，所以还是要选放弃 fc」
+
+**事实**（`vllm/config/vllm.py:1214-1258`，`_verify_kv_transfer_compat()`）：
+
+```text
+KV connector OffloadingConnector is incompatible with
+PYTORCH_CUDA_ALLOC_CONF=expandable_segments:True
+unless enable_cumem_allocator is also enabled
+```
+
+判定条件是「**是否配置了任何 KV connector**」（`kv_transfer_config.kv_connector is not None`），
+**与谁实现的缓存无关** ⇒ 内置磁盘 tiering、LMCache、NIXL、Mooncake **一律被拒**；
+代码注释明确写「we can't enumerate every in-tree and out-of-tree connector that pins memory,
+so we conservatively reject the combination».
+
+机制原因：connector 会**注册/钉住** KV 显存（NIXL 用 `ibv_reg_mr`），注册表记的是物理页；
+而 `expandable_segments` 用 CUDA VMM，原理就是**重映射物理页** ⇒ 注册失效、DMA 写错页。
+`cumem` 虽豁免，但它会在自己的池里**把 expandable_segments 关掉**，等于没开。
+
+**抉择（2026-11-01 用户定）**：优先控制显存增长 ⇒ **`PC=0` + `EXPANDABLE=1`**；
+放弃磁盘前缀缓存（跨重启持久化），保留 vLLM **内置**前缀缓存（`--enable-prefix-caching`，
+无 connector，进程内有效，与 expandable 不冲突）。
+
+⭐ 推论（写进判据）：**“进程内免重算 prefill”和“重启后仍免 prefill”是两件事**——
+前者不需要 connector，后者需要，而后者与碎片治理不可兼得。

@@ -60,6 +60,8 @@ KNOWN_BOUNDED = {
     "_BT_WIDTHS": "显式 _BT_WIDTHS_MAX=8",
     "_BOUND_CHECKED": "显式 _BOUND_CHECKED_MAX=16（第6轮审计 N4 引入的 capture/热路径 gate）",
     "_BOUND_RECHECK": "显式上限：键集合与 _BOUND_CHECKED 同域（≤16），值只是复检计数器",
+    "_BT_BOUND_SEEN": "显式上限 16（sparse_mla_kernels.py 的 capture/热路径 gate）",
+    "_BT_BOUND_CALLS": "键集合与 _BT_BOUND_SEEN 同域（≤16），值只是复检计数器",
     # ── 第39轮：KV 缓存布局常量（调用点实测：kv_cache.stride(0) / kv_score.stride(0)）──
     #    进程内恒定（由 KV 缓存分配决定），跨重启可能变 ⇒ 变体数有界，**不随每请求变化**。
     # ── 第6轮绕过①③（非空字面量初始化 / AugAssign）生效后浮出的一批 ──

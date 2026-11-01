@@ -161,6 +161,24 @@ def host(block_table, n):
 """, "C4"),
 
 
+    # 第12轮最大盲区：内核定义在 a.py、宿主在 b.py ⇒ 跨文件发射
+    "C2_cross_file": {
+        "files": {
+            "kern.py": """
+import triton, triton.language as tl
+@triton.jit
+def _shared_kernel(x_ptr, stride_slot_t: tl.constexpr):
+    tl.store(x_ptr, stride_slot_t)
+""",
+            "host2.py": """
+from kern import _shared_kernel
+def run(slot_ids, x):
+    _shared_kernel[(1,)](x, slot_ids.stride(0))
+""",
+        },
+        "expect": "C2",
+    },
+
     # ── 合法样本：必须零告警（防判据收紧后变误报机器）─────────────
     "OK_clean": ("""
 import triton, triton.language as tl
@@ -221,6 +239,7 @@ REQUIRED_SHAPES = [
     ("^\\s*#\\s*alloc-audit:\\s*init-time", "C3 init-time 白标必须行首锚定"),
     ("^\\s*#\\s*alloc-audit:\\s*bounded", "C1 bounded 白标必须行首锚定"),
     ("elif isinstance(_v, ast.Attribute)", "C2 支持 `mod.kernel[...]` 属性限定调用"),
+    ("def check_cross_file_launches(files: list):", "跨文件发射检查仍存在（内核定义/宿主异文件）"),
 ]
 
 
@@ -278,11 +297,22 @@ def run_gate(path: str) -> tuple[int, str]:
 def main() -> int:
     tmp = tempfile.mkdtemp(prefix="gate_self_")
     problems = []
-    for name, (code, expect) in SAMPLES.items():
-        path = os.path.join(tmp, "sample.py")
-        open(path, "w").write(textwrap.dedent(code))
-        scope = os.path.join(tmp, "scope.txt")
-        open(scope, "w").write(path + "\n")
+    for name, spec in SAMPLES.items():
+        if isinstance(spec, dict):        # 多文件样本（跨文件发射）
+            code, expect, files = None, spec["expect"], spec["files"]
+            paths = []
+            for fn, fc in files.items():
+                fp = os.path.join(tmp, fn)
+                open(fp, "w").write(textwrap.dedent(fc))
+                paths.append(fp)
+            scope = os.path.join(tmp, "scope.txt")
+            open(scope, "w").write("\n".join(paths) + "\n")
+        else:
+            code, expect = spec
+            path = os.path.join(tmp, "sample.py")
+            open(path, "w").write(textwrap.dedent(code))
+            scope = os.path.join(tmp, "scope.txt")
+            open(scope, "w").write(path + "\n")
         rc, out = run_gate(scope)
         hit = [c for c in ("C1", "C2", "C3", "C4") if f"[{c}]" in out]
         if expect is None:

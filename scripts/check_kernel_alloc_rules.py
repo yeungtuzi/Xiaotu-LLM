@@ -219,6 +219,80 @@ def _check_call_sites(tree, fname: str, pnames: list, target_param: str) -> bool
 _TARGETS: list = []
 
 
+# ══════════════════════════════════════════════════════════════════════════
+# 跨文件启动检查（第12轮列出的最大盲区）
+#
+#   `_check_call_sites` 只在**内核定义所在文件**里找调用点 ⇒
+#   内核定义在 a.py、宿主在 b.py 时**完全失明**（真实树里有这种：v41/attention.py 定义、
+#   v4/attention.py 发射）。这里做第二遍：建**全局内核索引**，再按调用点反查形参表。
+# ══════════════════════════════════════════════════════════════════════════
+
+_KERNEL_INDEX: dict = {}   # name -> (file, [param names], [constexpr param names])
+
+
+def build_kernel_index(files: list) -> None:
+    _KERNEL_INDEX.clear()
+    for f in files:
+        try:
+            tree = ast.parse(open(f, encoding="utf-8", errors="replace").read())
+        except SyntaxError:
+            continue
+        for n in ast.walk(tree):
+            if not isinstance(n, (ast.FunctionDef, ast.AsyncFunctionDef)):
+                continue
+            decs = " ".join(ast.unparse(d) for d in n.decorator_list)
+            if "triton.jit" not in decs:
+                continue
+            params = [a.arg for a in n.args.args] + [a.arg for a in n.args.kwonlyargs]
+            cx = [a.arg for a in n.args.args + n.args.kwonlyargs
+                  if a.annotation and "constexpr" in ast.unparse(a.annotation)]
+            _KERNEL_INDEX[n.name] = (f, params, cx)
+
+
+def check_cross_file_launches(files: list):
+    """找出**跨文件**发射，并检查 constexpr 形参是否被 `.stride(0)`/`.shape[0]` 派生值喂。"""
+    out = []
+    for f in files:
+        try:
+            src = open(f, encoding="utf-8", errors="replace").read()
+            tree = ast.parse(src)
+        except SyntaxError:
+            continue
+        for c in ast.walk(tree):
+            if not isinstance(c, ast.Call) or not isinstance(c.func, ast.Subscript):
+                continue
+            v = c.func.value
+            name = v.id if isinstance(v, ast.Name) else (v.attr if isinstance(v, ast.Attribute) else None)
+            if not name or name not in _KERNEL_INDEX:
+                continue
+            def_file, params, cx = _KERNEL_INDEX[name]
+            if os.path.abspath(def_file) == os.path.abspath(f):
+                continue      # 同文件已由 C2 主检查覆盖
+            if not cx:
+                continue
+            for p in cx:
+                if p in KNOWN_BOUNDED_CONSTEXPR or p in CONSTEXPR_PAGE_STRIDES:
+                    continue
+                expr = None
+                for kw in c.keywords:
+                    if kw.arg == p:
+                        expr = ast.unparse(kw.value)
+                        break
+                if expr is None and p in params:
+                    idx = params.index(p)
+                    if idx < len(c.args):
+                        expr = ast.unparse(c.args[idx])
+                if expr is None:
+                    continue
+                if ".shape[-1]" in expr:
+                    continue
+                if re.search(r"\.stride\(\s*0\s*\)", expr) or re.search(r"\.shape\[\s*0\s*\]", expr):
+                    out.append((f, c.lineno, "C2",
+                                f"**跨文件**发射：内核 `{name}`（定义于 {os.path.basename(def_file)}）"
+                                f"的 constexpr 形参 `{p}` 收到形状派生值 `{expr[:60]}` ⇒ 一个形状一份 cubin"))
+    return out
+
+
 def check_file(path: str):
     try:
         src = open(path, encoding="utf-8", errors="replace").read()
@@ -707,9 +781,12 @@ def main():
         print(f"  {_name}: {_d}  (该 root 下被扫文件 {len(_ft)} 个，最新 mtime "
               f"{_fmt(max(_ft)) if _ft else 'N/A'})")
 
+    build_kernel_index(targets)
+
     all_findings = []
     for p in targets:
         all_findings.extend(check_file(p))
+    all_findings.extend(check_cross_file_launches(targets))
 
     # ⛔ 第6轮 #9：白名单里出现过**不存在的名字**（`_BND_PIN`）、重复项、类别错。
     #    改为：每个白名单名字必须在被扫文件的源码里**出现过**，否则报错（退出码 3）。

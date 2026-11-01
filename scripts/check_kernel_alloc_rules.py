@@ -496,7 +496,16 @@ def check_file(path: str):
                          if re.search(rf"\b{re.escape(a)}\b", _t)}
         _addrs_covered = {a for x in _basserts for a in ADDR_ARGS
                           if re.search(rf"\b{re.escape(a)}\b", ast.unparse(x.test))}
-        _addrs_missing = _addrs_passed - _addrs_covered
+        # 委派：宿主把 `num_table_rows=block_table.shape[0]` 这类界传给内核 ⇒ 该实参算已覆盖
+        _delegated_addrs = set()
+        for _l, _t in launches:
+            for _m in re.finditer(r"\w+\s*=\s*([^,\)]{0,160})", _t):
+                _rhs = _m.group(1)
+                if ".shape" in _rhs or "numel" in _rhs:
+                    for _a in ADDR_ARGS:
+                        if re.search(rf"\b{re.escape(_a)}\b", _rhs):
+                            _delegated_addrs.add(_a)
+        _addrs_missing = _addrs_passed - _addrs_covered - _delegated_addrs
         # 边界可能由内核内校验：宿主把行数/块数显式传给内核 ⇒ 不算漏
         # ⛔ 第9轮 §4：旧版只要实参文本里**出现** `num_blocks` 这类名字就整体豁免
         #    （scope 内 23 处命中，而 num_blocks 极常见）⇒ 要求右值真的来自 .shape/numel

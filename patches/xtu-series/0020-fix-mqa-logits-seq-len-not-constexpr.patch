@@ -1,0 +1,38 @@
+From: Xiaotu-LLM <xiaotu@local>
+Subject: [PATCH 0020] fix: _fp8_mqa_logits_kernel 的 seq_len_kv 不应是 constexpr（形状爆炸根因）
+
+实测（2026-11-01，A100 生产实例，稳态 prefill 期间）：
+  Triton 缓存最近 5 分钟新增 464 个文件（≈1.5/秒），按内核名去重后
+  **`_fp8_mqa_logits_kernel` 出现 20 次**；同一时刻 Inductor 15 分钟新增 0。
+
+而 `_fp8_mqa_logits_kernel` 正是崩溃 1（2026-10-31 16:56）的现场：
+  Triton Error [CUDA]: out of memory ← _fp8_mqa_logits_kernel[grid] →
+  kernel.launch_metadata → _init_handles → driver.load_binary
+
+根因：`seq_len_kv: tl.constexpr`。内核体内它**只用于掩码**：
+    valid_n = offs_n < seq_len_kv
+grid 在宿主侧算（`cdiv(seq_len_kv, 128)`），并不需要编译期常量。
+⇒ 每个不同的 KV 长度各编一份 cubin，模块常驻 GPU 代码段（不在 torch 分配器内）
+⇒ 显存随"见过的长度"单调上涨，最终在装载新模块时 OOM。
+
+修复：去掉 `tl.constexpr`，改为运行时标量 ⇒ 一份内核服务所有长度；
+掩码天然跳过未用尾部 ⇒ **无需 padding，零浪费**。
+
+---
+--- a/vllm/models/deepseek_v4/nvidia/ops/sm12x_mqa.py
++++ b/vllm/models/deepseek_v4/nvidia/ops/sm12x_mqa.py
+@@ -63,7 +63,13 @@
+     cu_seqlen_ke_ptr,
+     logits_ptr,
+     num_q: tl.constexpr,
+-    seq_len_kv: tl.constexpr,
++    # ⛔ [xtu] seq_len_kv 在内核里只用于掩码 `valid_n = offs_n < seq_len_kv`，
++    #    grid 由宿主侧 `cdiv(seq_len_kv, 128)` 决定 ⇒ **不需要 constexpr**。
++    #    原实现把它当 constexpr ⇒ 每个不同的 KV 长度都编译一份新 cubin，
++    #    这些模块常驻 GPU 代码段（不归 torch 分配器管）⇒ 显存单调上涨，
++    #    最终在 driver.load_binary 处 OOM（2026-10-31 崩溃 1）。
++    #    改为运行时标量 ⇒ 一份内核服务所有长度，且掩码天然跳过未用尾部（零浪费）。
++    seq_len_kv,
+     num_heads: tl.constexpr,
+     head_dim: tl.constexpr,
+     stride_qm: tl.constexpr,

@@ -1,0 +1,33 @@
+From: Xiaotu-LLM <xiaotu@local>
+Subject: [PATCH 0021] fix: fp8_einsum 的 num_tokens 不应是 constexpr（每层每步都触发特化）
+
+同 0020 的同一类缺陷，但影响面更大：`fp8_einsum` 在**每一层的每一次前向**都会调用，
+而 `num_tokens` 被声明为 `tl.constexpr`：
+
+    内核体内 3 处仅用于掩码：
+        a_mask = (token_offsets[:, None] < num_tokens) & ...
+        mask=token_offsets < num_tokens
+        mask=(token_offsets[:, None] < num_tokens) & ...
+    宿主侧：grid = (triton.cdiv(num_tokens, block_tokens), ...)
+
+⇒ 每个不同的 chunk 长度（MBT=8192 下即 1..8192 的每个取值）都会编一份新 cubin，
+且随层数放大访问频率。这与 0020 一起解释了"稳态 Triton 仍以 ~1.5 个/秒增长"。
+
+修复：去掉 `tl.constexpr`，改为运行时标量。
+
+---
+--- a/vllm/models/deepseek_v4/nvidia/ops/fp8_einsum.py
++++ b/vllm/models/deepseek_v4/nvidia/ops/fp8_einsum.py
+@@ -21,7 +21,11 @@
+     b_ptr,
+     b_scale_ptr,
+     out_ptr,
+-    num_tokens: tl.constexpr,
++    # ⛔ [xtu] num_tokens 在内核里只用于掩码（3 处 `token_offsets < num_tokens`），
++    #    grid 由宿主侧 `cdiv(num_tokens, block_tokens)` 决定 ⇒ 不需要 constexpr。
++    #    原实现 ⇒ 每个不同 chunk 长度编一份 cubin（每层每步都会遇到），
++    #    这些模块常驻 GPU 代码段、不归 torch 分配器 ⇒ 显存随形状单调上涨。
++    num_tokens,
+     num_groups: tl.constexpr,
+     out_rank: tl.constexpr,
+     hidden_size: tl.constexpr,

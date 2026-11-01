@@ -40,7 +40,7 @@ MEM_GATE="${MEM_GATE:-$REPO_DIR/scripts/prelaunch_mem_gate.sh}"
 # 本机实际部署树（REPO_DIR/vllm 不存在；跨树校验按真实位置比对，不按名字猜）
 VLLM_DIR="${VLLM_DIR:-/home/user/lvllm/process_data/ref/repos/vllm-mainline/vllm}"   # 注意：vpath 是包目录 dirname(vllm.__file__)
 
-TAG="prod"; PORT=8700; TP=2; GPU_UTIL=0.90; MAXSEQS=4; MBT=8192; MAXLEN=524288
+TAG="prod"; PORT=8700; TP=2; GPU_UTIL=0.85; MAXSEQS=4; MBT=8192; MAXLEN=524288
 THREADS=60; IMAGE_MAX=128; COMPILE_RANGES="32,256,8192"
 PIN=1; PIN_SLOTS=15; PIN_MAXQ=16; CED=1; WARMUP=1
 PC=1; PC_GB=64; PC_BLOCKS=16; PC_ROOT="/home/user/.cache/prefix-cache"

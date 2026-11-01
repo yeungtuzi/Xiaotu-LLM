@@ -1,0 +1,28 @@
+From: Xiaotu-LLM <xiaotu@local>
+Subject: [PATCH 0022] fix: SparseAttnIndexer 的 fp8 类型按能力门控（SM80 不再晦涩崩溃）
+
+背景（2026-11-01 内核资源审计 #5）：
+1. `SparseAttnIndexer.__init__` 预热注册用
+   `pack_dtype = torch.uint8 if use_fp4_cache else current_platform.fp8_dtype()`，
+   而 A100(SM80) 上 `fp8_dtype()` = `torch.float8_e4m3fn` ⇒ Triton 编译 PackSeq 时报
+   `ValueError: type fp8e4nv not supported in this architecture` ⇒ `enable_jit_warmup=true`
+   在 SM80 上整机起不来（0018 只是把这个异常吞掉，代价是该内核**从未真正预热**）。
+2. `fused_indexer_q_rope_quant` 内核用 `q_fp8.dtype.element_ty` 直接在 Triton 里构造 fp8，
+   SM80 上没有对应类型 ⇒ 编译期崩溃，且报错位置离根因很远。
+
+修复：
+* 预热 dtype 改为能力门控：无 fp8e4nv 的 CUDA 设备用 `torch.uint8` 按字节预热
+  （与 0003 的 e4m3 字节编码写法一致），使 SM80 也能真正完成预热；
+* 内核路径在入口 fail-fast 给出可诊断错误（明确"需要 SM89+"），而不是让 Triton 抛
+  晦涩的编译错误。该路径未提供 uint8 字节编码实现，属已知限制并已注明。
+
+注意：两处门控都加了 `current_platform.is_cuda()` 前置 —— ROCm 的
+`has_device_capability()` 语义是 gfx 版本号，不能用来判断 fp8e4nv。
+
+---
+--- a/vllm/model_executor/layers/sparse_attn_indexer.py
++++ b/vllm/model_executor/layers/sparse_attn_indexer.py
+@@
+ see source; two guarded edits:
+ - pack_dtype: gated by (is_cuda and not has_device_capability(89)) -> uint8
+ - fused_indexer_q_rope_quant: fail-fast RuntimeError on CUDA without fp8e4nv

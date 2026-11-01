@@ -131,6 +131,43 @@ def _slice_of(node) -> str:
 _LINES: list = []
 
 
+
+_VOL_TENSOR_NAMES = ("block_table", "block_tables", "out", "topk_indices", "slot_ids",
+                     "acc", "max_score", "cu_seqlens", "logits", "q", "kv", "slot_mapping")
+
+
+def _check_call_sites(tree, fname: str, pnames: list, target_param: str) -> bool:
+    """该内核的**任一调用点**把 target_param 传成了"随请求维张量的 .shape[ / .stride(0)"吗？
+
+    同时覆盖**关键字**与**位置**实参（第7轮审计阻断项①：旧版只认关键字）。
+    """
+    try:
+        idx = pnames.index(target_param)
+    except ValueError:
+        return False
+    for c in ast.walk(tree):
+        if not isinstance(c, ast.Call):
+            continue
+        f = c.func
+        if not (isinstance(f, ast.Subscript) and isinstance(f.value, ast.Name) and f.value.id == fname):
+            continue
+        expr = None
+        # 关键字优先
+        for kw in c.keywords:
+            if kw.arg == target_param:
+                expr = ast.unparse(kw.value)
+                break
+        if expr is None and idx < len(c.args):
+            expr = ast.unparse(c.args[idx])
+        if expr is None:
+            continue
+        if not any(re.search(rf"\b{t}\b", expr) for t in _VOL_TENSOR_NAMES):
+            continue
+        if ".shape[" in expr or ".stride(0)" in expr:
+            return True
+    return False
+
+
 def check_file(path: str):
     try:
         src = open(path, encoding="utf-8", errors="replace").read()
@@ -165,28 +202,38 @@ def check_file(path: str):
             #    ⇒ 该 constexpr 事实上随形状变化。
             _shapey = False
             if a.arg not in dns:
-                _pat = re.compile(rf"{re.escape(node.name)}\s*\[")
-                for _m in _pat.finditer(src):
-                    _seg = src[_m.end():_m.end() + 1200]
-                    _km = re.search(rf"\b{re.escape(a.arg)}\s*=\s*([^,\n]{{0,160}})", _seg)
-                    if not _km:
-                        continue
-                    _v = _km.group(1)
+                # ⛔ 第7轮阻断项①：上一版只在**关键字实参**里找 `arg=expr`，
+                #    而这些内核全部**位置传参** ⇒ 结构性失明（把 constexpr 改回去也照样绿）。
+                #    这里用 AST 取调用点，把位置实参按**形参顺序**映射到名字。
+                _pnames = [x.arg for x in node.args.args]
+                _shapey = _check_call_sites(tree, node.name, _pnames, a.arg)
+                _v = ""
+                if not _shapey:
+                    _pat = None
+                else:
+                    _v = ""
+            if False:
                     # ⚠️ 只认"**随请求变化的张量**上的 `.shape[`"：
                     #    `k_cache.stride(0)` / `out.stride(1)` 这类跨距在配置固定时是常量，
                     #    用 `.stride(` 当证据会 24/24 全误报（实测）。
                     _VOL_TENSORS = ("block_table", "block_tables", "out", "topk_indices",
                                     "slot_ids", "acc", "max_score", "cu_seqlens",
                                     "logits", "q", "kv")
-                    # ⛔ 第6轮 B2：上一版把 `.stride(` 完全排除 ⇒ 对"跨距当 constexpr"**结构性失明**，
-                    #    而本案根因（HEAD_BLOCK/stride_*_t）正是这一类。
-                    #    恢复识别，但要求**随请求维张量**上的 `.stride(0)` 作证据，
-                    #    否则 `k_cache.stride(0)`（配置常量）会全量误报。
-                    _vol_hit = any(re.search(rf"\b{t}\b", _v) for t in _VOL_TENSORS)
-                    if _vol_hit and (".shape[" in _v or ".stride(0)" in _v or ".stride( 0" in _v):
-                        _shapey = True
-                        break
-            if (a.arg in VOLATILE_NAMES or _shapey) and a.arg not in dns \
+
+            # ⛔ 第7轮 N4：`arg in dns` 曾当**豁免**用 —— 但 constexpr 形参进 do_not_specialize
+            #    是**空操作**（Triton 只对非 constexpr 生效）⇒ 这恰恰是 B1 的 bug 特征，
+            #    应当**额外报警**，而不是放行。
+            # ⚠️ 条件注解（`X: tl.constexpr if COND else None`）静态无法求值 ⇒ 跳过，不误报。
+            #    （engram.py:650 就是这种写法，且 dns 列表已按条件构造，本来就是对的）
+            if " if " in ann and " else " in ann:
+                continue
+            if a.arg in dns:
+                out.append((path, a.lineno, "C2",
+                            f"形参 `{a.arg}` 是 tl.constexpr 却出现在 do_not_specialize 里 —— "
+                            f"对 constexpr 是**空操作**（B1 根因），应降级为运行时标量"
+                            f"（该内核 {node.name}）"))
+                continue
+            if (a.arg in VOLATILE_NAMES or _shapey) \
                     and a.arg not in KNOWN_BOUNDED_CONSTEXPR:
                 out.append((path, a.lineno, "C2",
                             f"形参 `{a.arg}` 是 tl.constexpr 且名字像随请求变化，"
@@ -359,7 +406,11 @@ def check_file(path: str):
             # ⛔ 第6轮 #7：上一版只数 assert 个数且 `<`/`>=` 也算 ⇒ 两条无关断言即可放行。
             #    要求：①含上界/跨距语义 ②**引用了块表/slot 本身或其 shape/stride**。
             t = ast.unparse(a.test)
-            sem = any(k in t for k in ("max(", "min(", ".shape[", ".stride(", "numel"))
+            # ⛔ 第7轮阻断项⑤：旧版只要出现 `.shape[` + 变量名即计数 ⇒ 两条"下界/恒真"断言即可放行。
+            #    要求必须有**值域上界**（max( 或 .min( 或 与 numel 比较），或至少形如
+            #    `...max() <= ...` / `... <= ...shape[...] * ...` 的乘积上界。
+            sem = ("max(" in t or "min(" in t) or (
+                ".shape[" in t and ("<=" in t or "<" in t) and "*" in t)
             refs = any(re.search(rf"\b{x}\b", t) for x in ADDR_ARGS)
             return sem and refs
 

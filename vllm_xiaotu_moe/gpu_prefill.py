@@ -1386,6 +1386,13 @@ def release_staging_reserve() -> None:
     except Exception as _e:  # noqa: BLE001
         print(f"[xtu-kv-diag] 释放前取显存失败(不掩盖): {type(_e).__name__}: {_e}", flush=True)
     if _PROF_RESERVE:
+        # ⛔ [xtu 2026-11-01 第6轮审计 #15 残留] 下面在 `clear()` **之后**还取了
+        #    `_PROF_RESERVE[0].device` ⇒ 必然 IndexError ⇒ 每次都回落到 current_device，
+        #    定向同步从未真正执行。改为**先**把设备记下来。
+        try:
+            _prof_dev = _PROF_RESERVE[0].device
+        except Exception:  # noqa: BLE001
+            _prof_dev = None
         # ⛔ [xtu 2026-11-01 第三方审计 A2-6] 顺序应为「同步 → clear → empty_cache」，
         #    且同步必须指定**占位所属的设备**（原为无参，是"当前设备"隐式）。
         # ⚠️ [xtu 2026-11-01 再审计修正] 上一版写 `_ts.cuda.synchronize(device)`，但本
@@ -1394,7 +1401,7 @@ def release_staging_reserve() -> None:
         #    张量自身取设备，并且不再静默吞异常。
         try:
             import torch as _ts
-            _ts.cuda.synchronize(_PROF_RESERVE[0].device)
+            _ts.cuda.synchronize(_prof_dev if _prof_dev is not None else _ts.cuda.current_device())
         except Exception as _e:  # noqa: BLE001
             print(f"[xtu-kv-diag] 设备定向同步失败(不掩盖): {type(_e).__name__}: {_e}",
                   flush=True)
@@ -1414,7 +1421,9 @@ def release_staging_reserve() -> None:
             #    设备的默认流），而占位张量在 `_PROF_RESERVE[0].device` 上；两者不一致时
             #    等于没同步目标设备。改为对**占位所在设备**定向同步。
             try:
-                _dev = _PROF_RESERVE[0].device
+                # ⛔ [xtu 2026-11-01 第7轮审计阻断项④] 此处仍在 `clear()` **之后**取 [0] ⇒
+                #    必然 IndexError ⇒ 回落 current_device。改用前面已捕获的 `_prof_dev`。
+                _dev = _prof_dev if _prof_dev is not None else torch.cuda.current_device()
             except Exception:  # noqa: BLE001
                 _dev = torch.cuda.current_device()
             torch.cuda.synchronize(_dev)

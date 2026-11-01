@@ -306,7 +306,9 @@ def check_file(path: str):
         i = node.lineno - 1
         # 显式白标：`# alloc-audit: init-time`（仅允许用于**服务开始前**的路径）
         window_with_self = "\n".join(lines[max(0, i - 12):i + 1])
-        if "alloc-audit: init-time" in window_with_self:
+        # ⛔ 第12轮：子串匹配 ⇒ 注释里写一句"绝不能写 alloc-audit: init-time"即免检（自消音）。
+        #    改为**行首锚定** + 必须带非空理由。
+        if re.search(r"^\s*#\s*alloc-audit:\s*init-time\s*[:：]?\s*\S", window_with_self, re.M):
             continue
         # ⛔ 审计 #3：旧判据是**文本**匹配 ⇒ 注释里写一句 "synchronize" 就算通过。
         #    改为只看 AST 里的真实调用节点（注释天然不在 AST 中）。
@@ -401,7 +403,11 @@ def check_file(path: str):
                 scope_src = _slice_of(owner) if owner else ""
                 # ⛔ 第6轮绕过②：曾"函数里出现一句 # alloc-audit: bounded ⇒ 该函数内所有容器放行"。
                 #    改为白标必须**指名**该容器：`# alloc-audit: bounded <name>`
-                _lab = bool(re.search(rf"alloc-audit:\s*bounded[^\n]*\b{re.escape(name)}\b", scope_src))
+                # ⛔ 第12轮：子串匹配 ⇒ 注释里写"不需要 alloc-audit: bounded _C"即放行。
+                #    改为**行首锚定**（`^\s*#\s*alloc-audit: bounded ... <name>`）。
+                _lab = bool(re.search(
+                    rf"^\s*#\s*alloc-audit:\s*bounded[^\n]*\b{re.escape(name)}\b",
+                    scope_src, re.M))
                 labeled = _lab or (name in KNOWN_BOUNDED)
                 if not labeled:
                     out.append((path, node.lineno, "C1",
@@ -458,7 +464,11 @@ def check_file(path: str):
                 fname = f.attr
             if not fname:
                 continue
-            if not (fname.endswith("_kernel") or fname.endswith("_kernel_") or "kernel" in fname):
+            # ⛔ 第12轮：旧判据要求名字里含 "kernel" ⇒ 真实树 `fcc.py:609`
+            #    `_compress_gather_split_sparse_attn` 整段逃过 C4。
+            #    Triton 启动的标准形态是 `name[grid](...)`（Subscript 调用）⇒ 认形态，不认名字。
+            _is_launch = isinstance(f, ast.Subscript) or fname.endswith("_kernel") or "kernel" in fname
+            if not _is_launch:
                 continue
             argtxt = " ".join(ast.unparse(a) for a in c.args) + " " + " ".join(
                 f"{k.arg}={ast.unparse(k.value)}" for k in c.keywords if k.arg)

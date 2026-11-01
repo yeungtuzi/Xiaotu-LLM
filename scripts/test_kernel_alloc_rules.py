@@ -203,7 +203,6 @@ BUGGY_SHAPES = [
     # 第12轮：页跨距证据必须同时含名字
     # 第12轮：委派必须只看函数体（不含签名）
     # 第12轮：白标不能是纯子串（必须行首锚定）
-    (r"^\\s*#\\s*alloc-audit:", "白标必须行首锚定"),
 ]
 
 KERNEL_ANTI_PATTERNS = [
@@ -218,6 +217,9 @@ REQUIRED_SHAPES = [
     ('.stride(0)" in _txt and', "页跨距证据必须同时含名字"),
     ("for x in _kfn.body", "委派判据只看函数体语句（不含签名）"),
     ("alloc-audit", "白标机制仍存在（行首锚定）"),
+    ("_is_launch = isinstance(f, ast.Subscript)", "内核启动按**下标形态**识别（不靠名字含 kernel）"),
+    ("^\\s*#\\s*alloc-audit:\\s*init-time", "C3 init-time 白标必须行首锚定"),
+    ("^\\s*#\\s*alloc-audit:\\s*bounded", "C1 bounded 白标必须行首锚定"),
 ]
 
 

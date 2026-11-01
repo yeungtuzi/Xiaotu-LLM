@@ -3082,7 +3082,11 @@ class _XiaotuExpertsMixin:
                     _hitstat_print = _PIN_HITSTAT_ON   # 【R3】导入期物化
                     if _hitstat_print:
                         # ⭐ 只有统计开关打开时才累加(累加也是设备端算子,不影响图)✓
-                        _hacc.add_(_fz.hits().to(torch.float32))     # 命中数(设备端 ⇒ 可入图 ✓)
+                        # ⛔ 2026-11-01 修复:`_fz` 只在 `if _fused_on:` 分支里定义，
+                        #   本行在 **else(非 fused)分支** 里 ⇒ 默认(flag 关)必 UnboundLocalError
+                        #   （实测崩溃于首次请求: cannot access local variable '_fz'）。
+                        #   非 fused 分支的命中数就是 `_res.sum()`（bool 命中掩码）。
+                        _hacc.add_((_fz.hits() if _fused_on else _res.sum()).to(torch.float32))  # 命中数(设备端 ✓)
                         _tacc.add_(_res.numel())   # 分母(形状在捕获时定型 ✓)
                         _nacc.add_(1)              # 调用次数(含图重放 ✓)
                         if not _in_capture_window():

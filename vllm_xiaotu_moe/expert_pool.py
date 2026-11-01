@@ -548,14 +548,27 @@ def release_pin_reserve() -> None:
     #    注意：这与 `expandable_segments` 无关（cudaFree 本身即解映射），
     #    所以 0017 的 workspace sync 修不到这里。
     #    ⇒ 释放前必须先同步设备（一次性成本，只在本函数执行时付一次）。
-    try:
-        torch.cuda.synchronize()
-    except Exception:  # noqa: BLE001
-        pass
-    try:
-        torch.cuda.empty_cache()
-    except Exception:  # noqa: BLE001
-        pass
+    # ⛔ [xtu 2026-11-01 用户决断：碎片治理优先 ⇒ EXPANDABLE=1]
+    #    在 `expandable_segments:True` 下，`empty_cache()` 做的是**解映射虚拟页**，
+    #    而 expandable 的整个前提就是"物理页可随时换"⇒ 服务期任何一次 empty_cache
+    #    都是 Xid 31（FAULT_PDE）的引爆点。
+    #    ⭐ 关键判断：**这里根本不需要 empty_cache** ——
+    #    本函数在"第一次真建池"之前调用，紧随其后的 `torch.empty(...)` 会**直接复用**
+    #    刚被 `clear()` 掉的那块缓存，净占用不变；而 KV 池早已定容，
+    #    不需要把内存还给驱动。
+    #    ⇒ 默认不调用；确需归还驱动时显式设 `XIAOTU_PIN_RELEASE_EMPTY_CACHE=1`。
+    if os.environ.get("XIAOTU_PIN_RELEASE_EMPTY_CACHE", "0") == "1":
+        try:
+            torch.cuda.synchronize()
+        except Exception:  # noqa: BLE001
+            pass
+        try:
+            torch.cuda.empty_cache()
+        except Exception:  # noqa: BLE001
+            pass
+    else:
+        print("[xtu-pin] 跳过 empty_cache（expandable 下解映射会引爆 Xid31；"
+              "紧随其后的池分配会复用该块，净占用不变）", flush=True)
     print(f"[xtu-pin] profile 期占位已释放({n} 块)⇒ 交给真正的常驻池 ✓", flush=True)
 
 

@@ -441,7 +441,13 @@ _SMT_ACTIVE="0"
 if [ -r /sys/devices/system/cpu/smt/active ]; then
   _SMT_ACTIVE="$(cat /sys/devices/system/cpu/smt/active 2>/dev/null || echo 0)"
 fi
-if [ "$_SMT_ACTIVE" = "1" ]; then THREADS_DEF=96; else THREADS_DEF=60; fi
+# ⭐⭐【2026-11-01 用户明令】ds41 一律 60 线程，**不再按 SMT 门控到 96**。
+#   原逻辑：SMT 开 ⇒ 96 / 关 ⇒ 60。改为恒定 60 的理由：
+#     ① 用户选定 60 作为生产口径（prefill 略降、decode 略升的权衡）；
+#     ② 96 与 60 混跑会让所有 prefill/步时数据不可比（2026-11-01 实际发生过）；
+#     ③ 60 时 CPU 占用 123 逻辑核、96 时 192 核，60 给系统的余量更大。
+#   ⇒ 需要 96 时必须**显式** `XIAOTU_MOE_THREADS=96`，并在报告里注明口径。
+THREADS_DEF=60
 THREADS_DEFAULT="${THREADS_DEFAULT:-$THREADS_DEF}"
 # 【§557 更正】自旋默认从 **0 改成 300**(与插件 hybrid_model.py 的 setdefault 一致)。
 # 历史:§355 记录过 **5000 µs** 是正反馈灾难(48 层 × 3 相 × 5 ms ⇒ 池几乎永不停转),
@@ -549,7 +555,7 @@ if [ -n "${XIAOTU_MOE_THREADS:-}" ]; then
 elif [ -n "${THREADS_DEFAULT_ENV:-}" ]; then
   echo "[v41] XIAOTU_MOE_THREADS=$THREADS_DEFAULT(来源:外层 THREADS_DEFAULT;smt=$_SMT_ACTIVE)"
 else
-  echo "[v41] XIAOTU_MOE_THREADS=$THREADS_DEFAULT(来源:SMT 门控 smt=$_SMT_ACTIVE ⇒ THREADS_DEF=$THREADS_DEF)"
+  echo "[v41] XIAOTU_MOE_THREADS=$THREADS_DEFAULT(来源:恒定默认 THREADS_DEF=60;smt=$_SMT_ACTIVE 不再参与)"
 fi
 
 # 【本机+V4.1 默认,见 MODEL_GUIDES §0.1b-2 / EXPERIMENTS B155】

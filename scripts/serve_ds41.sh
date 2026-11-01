@@ -46,6 +46,8 @@ TAG="prod"; PORT=8700; TP=2; GPU_UTIL=0.85; MAXSEQS=4; MBT=8192; MAXLEN=524288
 THREADS=60; IMAGE_MAX=128; COMPILE_RANGES="32,256,8192"
 PIN=1; PIN_SLOTS=15; PIN_MAXQ=16; CED=1; WARMUP=1
 PC=1; PC_GB=64; PC_BLOCKS=16; PC_ROOT="/home/user/.cache/prefix-cache"
+PC_FREE_MIN_MIB="${PC_FREE_MIN_MIB:-524288}"
+ALLOC_CONF_EFFECTIVE=""
 KV_DTYPE="fp8_ds_mla"; SPEC=1; MODEL_DIR="$MODEL_DIR_DEFAULT"; EXPANDABLE=0
 EXTRA_ARGS=()
 
@@ -132,6 +134,32 @@ verify_owns() {   # pid 必须确实是本实例：端口归属，或【本入�
 
 is_uint() { case "${1:-}" in ''|*[!0-9]*) return 1 ;; esac; }
 
+# 碎片治理（2026-11-01 用户指示）：EXPANDABLE 与 expandable_segments 必须一致。
+# ⛔ 检查放在**父进程**里（子 shell 里 die 会让父空转 600s 才报"孤儿"，审计 N1）。
+resolve_alloc_conf() {
+    if [ "$EXPANDABLE" = "1" ]; then
+        case "${PYTORCH_CUDA_ALLOC_CONF:-}" in
+            *expandable_segments:False*)
+                die "环境把 expandable_segments 设为 False，与 EXPANDABLE=1 冲突；请去掉该环境变量" 2 ;;
+            *expandable_segments:True*)
+                ALLOC_CONF_EFFECTIVE="$PYTORCH_CUDA_ALLOC_CONF" ;;
+            '')
+                ALLOC_CONF_EFFECTIVE="expandable_segments:True" ;;
+            *)
+                # 调用者给了别的组合但没写 expandable ⇒ 补上，保证臂名与行为一致（审计 N5）
+                ALLOC_CONF_EFFECTIVE="$PYTORCH_CUDA_ALLOC_CONF,expandable_segments:True" ;;
+        esac
+    else
+        case "${PYTORCH_CUDA_ALLOC_CONF:-}" in
+            *expandable_segments:True*)
+                die "环境把 expandable_segments 设为 True，但 EXPANDABLE=0；要开请显式传 EXPANDABLE=1" 2 ;;
+            '')
+                ALLOC_CONF_EFFECTIVE="expandable_segments:False" ;;
+            *)  ALLOC_CONF_EFFECTIVE="$PYTORCH_CUDA_ALLOC_CONF" ;;
+        esac
+    fi
+}
+
 # ══ 校验（fail-closed） ═══════════════════════════════════════════════════════
 validate() {
     is_uint "$PORT" && [ "$PORT" -ge 1024 ] && [ "$PORT" -le 65535 ] || die "PORT 非法：'$PORT'"
@@ -158,9 +186,15 @@ validate() {
         :   # PC=0 时 PC_GB/PC_BLOCKS/PC_ROOT 一律不校验（不用的参数不该拦启动）
     else
     case "$PC_GB" in ''|0*|*[!0-9]*) die "PC_GB 必须是无前导零的正整数（得到 '$PC_GB'）" ;; esac
-    [ "$PC_GB" -ge 8 ] && [ "$PC_GB" -le 512 ] || die "PC_GB 超出 8..512（/dev/shm 实为 756 GiB）"
+    local _shm_gib
+    _shm_gib="$(df -Pm /dev/shm 2>/dev/null | awk 'NR==2{printf "%d", $2/1024}')"
+    case "${_shm_gib:-}" in ''|*[!0-9]*|0) die "读不到 /dev/shm 总量（df 失败）⇒ 拒绝（PC_GB 无从校验）" 3 ;; esac
+    [ "$PC_GB" -ge 8 ] || die "PC_GB 必须 >= 8（得到 $PC_GB）"
+    [ "$PC_GB" -le $(( _shm_gib - 8 )) ] \
+        || die "PC_GB=$PC_GB 超出 /dev/shm 可用总量（本机 ${_shm_gib}GiB，须留 8GiB）；内存门按 900+PC_GB 计" 3
     case "$PC_BLOCKS" in ''|0*|*[!0-9]*) die "PC_BLOCKS 必须是无前导零的正整数（得到 '$PC_BLOCKS'）" ;; esac
     [ "$PC_BLOCKS" -ge 1 ] && [ "$PC_BLOCKS" -le 256 ] || die "PC_BLOCKS 超出 1..256"
+    PC_ROOT="${PC_ROOT%/}"
     case "$PC_ROOT" in
         /*) ;;
         *) die "PC_ROOT 必须是绝对路径（得到 '$PC_ROOT'）" ;;
@@ -172,6 +206,8 @@ validate() {
         *[!A-Za-z0-9._/-]*) die "PC_ROOT 只允许 [A-Za-z0-9._/-]（要拼进 JSON，拒绝空白/引号/反斜杠/控制字符）：'$PC_ROOT'" ;;
     esac
     fi
+    # 冲突检查必须尽早（父进程侧、且在耗时/依赖文件系统的检查之前）⇒ 审计 N1
+    resolve_alloc_conf
     [ -d "$MODEL_DIR" ] || die "模型目录不存在：$MODEL_DIR"
     [ -x "$PYTHON" ] || die "python 不存在：$PYTHON"
     [ -d "$REPO_DIR" ] || die "仓库目录不存在：$REPO_DIR"
@@ -256,9 +292,11 @@ build_args() {
     if [ "$PC" = "1" ]; then
         # 引擎版本层（取编译缓存目录名末尾 hash）⇒ 升级引擎自动换目录；
         # 模型名/dtype/TP/KV 组等指纹由上游 FileMapper 自动追加在下一层。
-        local _ver _pcroot _pcjson
-        _ver="${CACHE_DIR##*/}"   # 保留 <vLLM commit>-<源码 sha1> 两段（尾段只是我们源码指纹）
-        _pcroot="$PC_ROOT/engine-$_ver"
+        local _ver _pcroot _pcjson _eng
+        _eng="$( cd "$VLLM_DIR/.." && git rev-parse --short=10 HEAD 2>/dev/null )"
+        [ -n "$_eng" ] || die "取不到在役 vLLM commit（$(dirname "$VLLM_DIR")）⇒ 无法保证 PC 目录随引擎换代，拒绝启动" 2
+        _ver="${CACHE_DIR##*/}"   # 编译缓存目录名（含 <vLLM commit>-<源码 sha1>）
+        _pcroot="$PC_ROOT/engine-${_ver}-vllm${_eng}"
         _pcjson='{"kv_role":"kv_both","kv_connector_extra_config":{"spec_name":"TieringOffloadingSpec","blocks_per_chunk":'"$PC_BLOCKS"',"secondary_tiers":[{"type":"fs","root_dir":"'"$_pcroot"'","n_read_threads":16,"n_write_threads":16}]}}'
         ARGS+=(--kv-offloading-size "$PC_GB" --kv-transfer-config "$_pcjson")
         say "prefix-cache=on root=$_pcroot L1=${PC_GB}GiB blocks/chunk=$PC_BLOCKS"
@@ -334,6 +372,7 @@ start() {
         say "EXPANDABLE=0：expandable_segments:False（历史设置；碎片靠其它手段）"
     fi
     [ "$CED" = "0" ] && say "⚠️ CED=0：这是基线臂，报告中必须标注"
+    [ "$PC" = "0" ] && say "⚠️ PC=0：本次不启用磁盘前缀缓存（非默认生产口径，报告须注明）"
 
     if [ "$PC" = "1" ]; then
         mkdir -p "$PC_ROOT" 2>/dev/null || die "PC_ROOT 无法创建：$PC_ROOT" 3
@@ -351,7 +390,10 @@ start() {
         case "${_pc_free:-}" in ''|*[!0-9]*) die "读不到 $PC_ROOT 所在盘余量 ⇒ 缺省拒绝" 3 ;; esac
         [ "$_pc_free" -ge 524288 ] \
             || die "PC_ROOT 所在盘余量 ${_pc_free}MiB < 512GiB（fs 层无配额，会写满）" 3
-        say "PC 预检 ✓ root=$PC_ROOT 可写、/dev/shm 余量 ${_shm_avail:-?}MiB"
+        local _pc_bins
+        _pc_bins="$(find "$PC_ROOT" -name '*.bin' 2>/dev/null | wc -l)"
+        say "PC 预检 ✓ root=$PC_ROOT 可写、/dev/shm 余量 ${_shm_avail:-?}MiB、已有块文件 ${_pc_bins} 个"
+        say "⚠️ fs 层无淘汰无配额（实测 ≈115 GB/日）⇒ 已挂运行时磁盘守护，阈值 ${PC_FREE_MIN_MIB}MiB"
     fi
     : > "$LOG_FILE" || die "日志不可写：$LOG_FILE" 4
     (
@@ -366,21 +408,9 @@ start() {
         #   expandable_segments 用 CUDA VMM 分配，VMM 显存**不能导出 IPC 句柄**
         #   ⇒ custom_all_reduce 会在 KV profiling 阶段报 invalid argument、Worker 被杀
         #   （2026-10-27 两次实测）。所以 EXPANDABLE=1 时**必须同时**关掉它。
-        if [ "$EXPANDABLE" = "1" ]; then
-            case "${PYTORCH_CUDA_ALLOC_CONF:-}" in
-                *expandable_segments:False*)
-                    echo "[ds41] ⛔ 环境把 expandable_segments 设为 False，与 EXPANDABLE=1 冲突" >&2
-                    exit 2 ;;
-            esac
-            export PYTORCH_CUDA_ALLOC_CONF="${PYTORCH_CUDA_ALLOC_CONF:-expandable_segments:True}"
-        else
-            case "${PYTORCH_CUDA_ALLOC_CONF:-}" in
-                *expandable_segments:True*)
-                    echo "[ds41] ⛔ 环境把 expandable_segments 设为 True，但 EXPANDABLE=0；要开请显式传 EXPANDABLE=1" >&2
-                    exit 2 ;;
-            esac
-            export PYTORCH_CUDA_ALLOC_CONF="${PYTORCH_CUDA_ALLOC_CONF:-expandable_segments:False}"
-        fi
+        export PYTORCH_CUDA_ALLOC_CONF="$ALLOC_CONF_EFFECTIVE"
+        export EXPANDABLE="$EXPANDABLE"      # status 靠它读口径（此前从未 export ⇒ status 恒缺）
+        export VLLM_LOGGING_LEVEL=INFO        # PC 生效断言依赖 INFO 级日志（tiering/spec.py:379）
         export VLLM_USE_SIMPLE_KV_OFFLOAD=0   # 防父环境漏入 ⇒ SimpleCPUOffloadConnector 会让 fs 层静默消失
         # ⛔ 生产 env 必须复刻：缺 VLLM_EXPERTS_LOAD_DEVICE=cpu 时缺省为 gpu ⇒ 476GB 专家上卡必 OOM
         export VLLM_EXPERTS_LOAD_DEVICE="${VLLM_EXPERTS_LOAD_DEVICE:-cpu}"
@@ -448,10 +478,26 @@ start() {
         local _ev=0
         grep -aqE 'Created secondary tier #[0-9]+ \(fs\)' "$LOG_FILE" && _ev=$((_ev+1))
         curl -s --noproxy '*' --max-time 3 "http://127.0.0.1:$PORT/metrics" 2>/dev/null \
-            | grep -q "kv_offloading_size=\"$PC_GB\"" && _ev=$((_ev+1))
+            | grep -qE "kv_offloading_size=\"(${PC_GB}|$(printf '%.1f' "$PC_GB"))\"" && _ev=$((_ev+1))
         [ "$_ev" -ge 1 ] \
             || die "PC=1 但日志与 /metrics 均无 fs 层证据 ⇒ 磁盘前缀缓存未生效（勿当成功，先查 $LOG_FILE）" 6
         say "磁盘前缀缓存已生效（证据 ${_ev}/2）✓"
+    fi
+    # B1：fs 层无淘汰/无配额（实测 45min 写 3.5GB ≈115GB/日）⇒ 必须有运行时磁盘守护；
+    #     ⛔ 只告警不删除（删 KV 缓存只造成 miss，但属破坏性动作，需用户当次点头）
+    if [ "$PC" = "1" ] && [ "${PC_DISK_GUARD:-1}" = "1" ]; then
+        PC_ROOT="$PC_ROOT" PC_GUARD_LOG="$RUN_DIR/ds41_${TAG}.pcdisk.log" \
+        PC_FREE_MIN_MIB="$PC_FREE_MIN_MIB" \
+        setsid bash -c 'while :; do
+            f=$(df -Pm "$PC_ROOT" 2>/dev/null | awk "NR==2{print \$4}")
+            case "${f:-}" in ""|*[!0-9]*) f=0;; esac
+            if [ "$f" -lt "$PC_FREE_MIN_MIB" ]; then
+                printf "%s PC_ROOT=%s free=%sMiB < %sMiB ⇒ 磁盘前缀缓存有写满风险（停 PC 或清理）\n" \
+                    "$(date -Is)" "$PC_ROOT" "$f" "$PC_FREE_MIN_MIB" >> "$PC_GUARD_LOG"
+            fi
+            sleep 600
+        done' < /dev/null > /dev/null 2>&1 &
+        say "PC 磁盘守护已起（每 600s，阈值 ${PC_FREE_MIN_MIB}MiB，日志 $RUN_DIR/ds41_${TAG}.pcdisk.log）"
     fi
     if [ "$CED" = "1" ] && grep -aq "SWA bounded replay needs model runner V2" "$LOG_FILE"; then
         die "CED=1 但日志显示 CED 未生效（needs model runner V2）" 4
@@ -460,13 +506,13 @@ start() {
             | grep -qE 'enable-custom-all-reduce'; then
         die "EXPANDABLE=1 但生效命令行里出现 enable-custom-all-reduce ⇒ 绑定被破坏" 4
     fi
-    { echo "[ds41] [口径] EXPANDABLE=$EXPANDABLE PYTORCH_CUDA_ALLOC_CONF=${PYTORCH_CUDA_ALLOC_CONF:-unset} custom-AR=$([ "$EXPANDABLE" = "1" ] && echo off || echo on)"; } >> "$LOG_FILE"
+    { echo "[ds41] [口径] EXPANDABLE=$EXPANDABLE PYTORCH_CUDA_ALLOC_CONF=${ALLOC_CONF_EFFECTIVE:-unset} custom-AR=$([ "$EXPANDABLE" = "1" ] && echo off || echo on) PC=$PC PC_GB=$PC_GB PC_BLOCKS=$PC_BLOCKS PC_ROOT=$PC_ROOT GPU_UTIL=$GPU_UTIL"; } >> "$LOG_FILE"
     say "显存: $(nvidia-smi --query-gpu=index,memory.used --format=csv,noheader | tr '\n' ' ')"
 
     if [ "$WARMUP" = "1" ]; then
         if [ -f "$WARMUP_SCRIPT" ]; then
             say "形状预热开始（文本多长度 + 1/4 图 + 并发 2）…"
-            ( cd "$(dirname "$WARMUP_SCRIPT")" && setsid "$PYTHON" -u "$WARMUP_SCRIPT" --port "$PORT" \
+            ( exec 9>&-; cd "$(dirname "$WARMUP_SCRIPT")" && setsid "$PYTHON" -u "$WARMUP_SCRIPT" --port "$PORT" \
                 >> "$RUN_DIR/ds41_${TAG}_warmup.log" 2>&1 < /dev/null & )
             say "预热在后台跑，日志 $RUN_DIR/ds41_${TAG}_warmup.log"
         else
@@ -542,6 +588,14 @@ status() {
         | sed 's/^/    /'
     cc="$(eff_compilation_config "$pid")"
     say "    [生效] --compilation-config $cc"
+    local _kvo _pcdir
+    _kvo="$(tr '\0' '\n' < "/proc/$pid/cmdline" | grep -oE -- '--kv-offloading-size [0-9]+' | head -1)"
+    if [ -n "$_kvo" ]; then
+        _pcdir="$(find "$PC_ROOT" -maxdepth 1 -type d -name 'engine-*' 2>/dev/null | tail -1)"
+        say "    PC: ${_kvo} 目录=${_pcdir:-?} 占用=$(du -sh "$PC_ROOT" 2>/dev/null | awk '{print $1}') 块文件=$(find "$PC_ROOT" -name '*.bin' 2>/dev/null | wc -l)"
+    else
+        say "    PC: 未开（无 --kv-offloading-size）"
+    fi
 }
 
 case "$CMD" in

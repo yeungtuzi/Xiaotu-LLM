@@ -96,7 +96,12 @@ if [ -n "$kvoff" ]; then
         rc=1
     fi
 else
-    echo "  前缀缓存未开（无 --kv-offloading-size）"
+    if [ "${ALLOW_PC0:-0}" = "1" ]; then
+        echo "  前缀缓存未开（PC=0，已用 ALLOW_PC0=1 显式放行；报告须注明）"
+    else
+        echo "✗ 前缀缓存未开（PC=1 是默认生产口径；实验臂请加 ALLOW_PC0=1）" >&2
+        rc=1
+    fi
 fi
 
 

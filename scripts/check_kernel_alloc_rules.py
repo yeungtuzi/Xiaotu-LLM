@@ -203,32 +203,56 @@ def check_file(path: str):
                                     f"（有界请加 `# alloc-audit: bounded` 并写明理由）"))
                     break
 
-    # ---------- C4: 把 `block_table`/`slot_ids` 交给内核的宿主函数必须有上界断言 ----------
-    #    判据（与第 4 轮审计一致）：这类内核按块表/槽位直接算裸地址且**无 mask**，
-    #    宿主若不校验 `stride(0)`/`max(seq_lens)`/`max(gather_lens)`/`max(slot_ids)`，
-    #    越界输入会变成非法访存（Xid31）。要求：函数体内至少 2 条 assert。
-    ADDR_ARGS = {"block_table", "block_tables", "slot_ids"}
+    # ---------- C4: kernel launch 的实参里出现块表/slot，且宿主无上界断言 ----------
+    #    ⚠️ 审计 #5 + 第27轮实测：旧版按"函数体内出现过 kernel 调用 + 出现过块表"匹配
+    #    ⇒ 把"把块表交给**已带断言的辅助函数**"也算漏检（indexer.build 就是这种）。
+    #    现改为：只认 **kernel 调用的实参里真的出现块表表达式**。
+    ADDR_ARGS = ("block_table", "block_tables", "slot_ids", "indexer_block_table")
     for node in ast.walk(tree):
         if not isinstance(node, ast.FunctionDef):
             continue
+        launches = []
+        for c in ast.walk(node):
+            if not isinstance(c, ast.Call):
+                continue
+            f = c.func
+            # 形如 name[...](...) 或 name(...) 且名字像内核
+            fname = ""
+            if isinstance(f, ast.Subscript):
+                fname = ast.unparse(f.value)
+            elif isinstance(f, ast.Name):
+                fname = f.id
+            elif isinstance(f, ast.Attribute):
+                fname = f.attr
+            if not fname:
+                continue
+            if not (fname.endswith("_kernel") or fname.endswith("_kernel_") or "kernel" in fname):
+                continue
+            argtxt = " ".join(ast.unparse(a) for a in c.args) + " " + " ".join(
+                f"{k.arg}={ast.unparse(k.value)}" for k in c.keywords if k.arg)
+            if any(re.search(rf"\b{a}\b", argtxt) for a in ADDR_ARGS):
+                launches.append((c.lineno, argtxt))
+        if not launches:
+            continue
         body_src = ast.unparse(node)
-        # 是否把地址类参数传给了某个 triton kernel 调用
-        passes_addr = any(re.search(rf"\b{a}\b", body_src) for a in ADDR_ARGS)
-        if not passes_addr:
-            continue
-        has_kernel_call = bool(re.search(r"_kernel\s*\[", body_src))
-        if not has_kernel_call:
-            continue
-        # ⛔ 审计 #5：旧判据只数 assert 个数 ⇒ 两条 `assert x.dim()==2` 就能过。
-        #    改为：断言表达式里必须出现上界/跨距语义（max(/min(/.shape[/stride(/numel）。
+
         def _is_bound(a: ast.Assert) -> bool:
             t = ast.unparse(a.test)
             return any(k in t for k in ("max(", "min(", ".shape[", ".stride(", "numel", ">=", "<"))
+
         n_assert = len([x for x in ast.walk(node) if isinstance(x, ast.Assert) and _is_bound(x)])
-        if n_assert < 2:
-            out.append((path, node.lineno, "C4",
-                        f"宿主 `{node.name}` 把 block_table/slot_ids 交给内核（无 mask 寻址），"
-                        f"但只有 {n_assert} 条 assert；至少需要上界 + 跨距两类校验"))
+        # 边界可能由内核内校验：宿主把行数/块数显式传给内核 ⇒ 不算漏
+        delegated = any(re.search(r"num_table_rows|max_blocks|num_blocks|max_blocks_per_seq|"
+                                  r"n_blocks|num_pages|table_rows|BLOCK_COLS", t) for _l, t in launches)
+        # 已人工复核：内核内部对块表/slot 的访问自带 mask ⇒ 用源码切片白标
+        _slice = "\n".join(lines[node.lineno - 1:(node.end_lineno or node.lineno)])
+        if "alloc-audit: masked-in-kernel" in _slice:
+            continue
+        if n_assert >= 2 or delegated:
+            continue
+        out.append((path, launches[0][0], "C4",
+                    f"宿主 `{node.name}` 把块表/slot 作为**内核实参**传入（无 mask 寻址），"
+                    f"但只有 {n_assert} 条上界/跨距断言"))
     return out
 
 

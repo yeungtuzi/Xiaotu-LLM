@@ -736,12 +736,21 @@ def _reuse_moe(key, shape, dtype, device):
     新实现：key 只含**列维**，行维按 2 的幂向上取整（MBT=8192/K=8 ⇒ 收敛到 65536），
     大于当前容量才扩容一次。`XIAOTU_MOE_BOUND_BUF=0` 回退旧行为。
     """
+    # ⛔ [xtu 2026-11-01 第5轮审计 #13] 旧回退分支把**完整 shape** 放进 key ⇒
+    #    每个新 chunk 长度都新建一块、永不淘汰 ⇒ 与"关闭桶化"同义，等于把已修的
+    #    缺陷留在开关后面。现改为：回退分支**同样桶化**，只保留"不做列维收敛"这一
+    #    点差异（诊断用），不再产生无界键。
     if os.environ.get("XIAOTU_MOE_BOUND_BUF", "1") != "1":
-        k = (str(device), key, tuple(int(v) for v in shape), dtype)
+        _r = int(shape[0]) if shape else 0
+        _bz = 1
+        while _bz < max(1, _r):
+            _bz <<= 1
+        _sh = (max(_bz, int(shape[0])),) + tuple(int(v) for v in shape[1:])
+        k = (str(device), key, dtype)          # ⬅ 不再含 shape
         t = _BUF_MOE.get(k)
-        if t is None or tuple(t.shape) != tuple(int(v) for v in shape):
+        if t is None or tuple(t.shape) != _sh:
             _retire(t)
-            t = torch.empty(tuple(int(v) for v in shape), dtype=dtype, device=device)
+            t = torch.empty(_sh, dtype=dtype, device=device)
             _BUF_MOE[k] = t
         return t
     rows = int(shape[0])
@@ -1313,6 +1322,55 @@ def reserve_staging_for_profile(need_bytes: int, device=None) -> bool:
     return True
 
 
+
+def _staging_need_bytes_snapshot() -> int:
+    """返回 profiling 期 staging 的**字节需求**（不分配）。"""
+    need = 0
+    try:
+        from vllm_xiaotu_moe import mixed_experts as _mx
+        cands = list(getattr(_mx, "_GP_PROFILE_LAYERS", []))
+        cands.extend(list(getattr(_mx, "_GP_LAYERS", {}).values()))
+    except Exception:  # noqa: BLE001
+        cands = []
+    seen = set()
+    for m in cands:
+        if id(m) in seen:
+            continue
+        seen.add(id(m))
+        f = getattr(m, "staging_need_bytes", None)
+        if callable(f):
+            try:
+                need = max(need, int(f()))
+            except Exception:  # noqa: BLE001
+                continue
+    return need
+
+
+def _realloc_staging_after_profile() -> None:
+    """削峰路径专用：profiling 结束、dummy 激活已释放后再补分配真 staging 缓冲。"""
+    try:
+        from vllm_xiaotu_moe import mixed_experts as _mx
+        cands = list(getattr(_mx, "_GP_PROFILE_LAYERS", []))
+        cands.extend(list(getattr(_mx, "_GP_LAYERS", {}).values()))
+    except Exception:  # noqa: BLE001
+        return
+    best, need = None, 0
+    for m in cands:
+        f = getattr(m, "staging_need_bytes", None)
+        if callable(f):
+            try:
+                v = int(f())
+            except Exception:  # noqa: BLE001
+                continue
+            if v > need:
+                best, need = m, v
+    pref = getattr(best, "prealloc_staging", None) if best is not None else None
+    if callable(pref):
+        ok = bool(pref())
+        print(f"[削峰] 事后补分配 staging {'成功' if ok else '未生效'}"
+              f" ~{need/2**30:.2f} GiB", flush=True)
+
+
 def release_staging_reserve() -> None:
     """profile 结束立刻释放占位 ⇒ 那块显存留给随后分配的 KV / 真正的 staging ✓
 
@@ -1637,7 +1695,39 @@ def install_profile_guard() -> list[str]:
                     print(f"[xtu-vram] 基线报告失败(不掩盖): {type(_e).__name__}: {_e}", flush=True)
                 # 【MUSA A71】staging 占位必须在 KV 定容前释放（否则运行期多占 1.76 GiB）
                 # 【主线 R34】长上下文激活记账在 orig_dam 期间占住，让 KV 据实少算同样多
+                # ⛔ [xtu 2026-11-01 削峰] profiling 峰值 = 权重 + staging 真缓冲 +
+                #    dummy forward 的激活峰值，三者**同时在场**。而 staging 是运行期
+                #    复用的持久缓冲，本身不能省 —— 能省的是"它与激活峰值同时在场"。
+                #    做法（opt-in，默认关）：profiling 期**不预分配** staging，
+                #    只取 `staging_need_bytes()` 的数值，从 `orig_dam` 的返回值里
+                #    **算术扣除**同样的字节 ⇒ KV 定容结果不变，但峰值少占 staging 那部分；
+                #    随后再把真缓冲补分配（此时 dummy 激活已释放）。
+                #    ⚠️ 默认关：此路径正是在 10:39 触发 Xid31 的地方，未经真机验证不默认开。
+                #    启用：XIAOTU_LC_STAGING_ARITH=1（需配合一次重启验证 KV 定容不变）。
                 _lc_res = _reserve_lc_activation()
+                _arith = os.environ.get("XIAOTU_LC_STAGING_ARITH", "0") == "1"
+                if _arith:
+                    try:
+                        _need_b = int(_staging_need_bytes_snapshot())
+                    except Exception as _e:  # noqa: BLE001
+                        print(f"[削峰] 取 staging need 失败(退回旧路径): {type(_e).__name__}: {_e}",
+                              flush=True)
+                        _arith, _need_b = False, 0
+                if _arith and _need_b > 0:
+                    try:
+                        _avail = orig_dam(self, *a, **kw)
+                    finally:
+                        _release_lc_activation(_lc_res)
+                    _out = max(0, int(_avail) - _need_b)
+                    print(f"[削峰] profiling 期不预分配 staging；"
+                          f"avail {int(_avail)/2**30:.2f} - staging {_need_b/2**30:.2f}"
+                          f" = {_out/2**30:.2f} GiB（KV 定容口径不变，峰值降低）", flush=True)
+                    try:
+                        _realloc_staging_after_profile()
+                    except Exception as _e:  # noqa: BLE001
+                        print(f"[削峰] 事后补分配 staging 失败(不掩盖): {type(_e).__name__}: {_e}",
+                              flush=True)
+                    return _out
                 try:
                     return orig_dam(self, *a, **kw)
                 finally:
@@ -1903,13 +1993,18 @@ def _reuse(key, shape, device):
     `XIAOTU_MOE_BOUND_BUF=0` 回退旧行为。
     """
     if os.environ.get("XIAOTU_MOE_BOUND_BUF", "1") != "1":
-        k = (str(device), int(shape[0]) if len(shape) == 1 else -1, tuple(shape))
+        # ⛔ [xtu 2026-11-01 第5轮审计 #13] 同上：key 不再含 shape，行维按 2 的幂桶化
+        _n = int(shape[0]) if len(shape) == 1 else int(__import__("math").prod(shape))
+        _bz = 1
+        while _bz < max(1, _n):
+            _bz <<= 1
+        k = (str(device), str(key), "flat")
         t = _BUF_CACHE.get(k)
-        if t is None or t.shape != tuple(shape) or t.device != torch.device(device):
+        if t is None or t.numel() < _n or t.device != torch.device(device):
             _retire(t)
-            t = torch.empty(tuple(shape), dtype=torch.uint8, device=device)
+            t = torch.empty(_bz, dtype=torch.uint8, device=device)
             _BUF_CACHE[k] = t
-        return t
+        return t[:] if len(shape) == 1 else t
     n = int(shape[0]) if len(shape) == 1 else int(__import__("math").prod(shape))
     k = (str(device), str(key))
     t = _BUF_CACHE.get(k)

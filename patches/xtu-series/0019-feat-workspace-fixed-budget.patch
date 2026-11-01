@@ -1,0 +1,60 @@
+From: Xiaotu-LLM <xiaotu@local>
+Subject: [PATCH 0019] feat: workspace 固定档一次性预分配（形状治理：共用缓冲，运行期禁止 resize）
+
+背景（用户 2026-11-01 定的政策）：不允许为每种请求分配独立的形状资源，
+能共用就共用；不能共用就驱逐最少用的。编译侧已用 compile_ranges_endpoints
+（3 档覆盖全域）落实，但 workspace 仍是"按 required_bytes 逐步扩容"：
+
+    if current_size < required_bytes:
+        self._current_workspaces[workspace_id] = None   # 释放旧 buffer
+        torch.accelerator.synchronize()                 # 0017 加的护栏
+        torch.accelerator.empty_cache()
+        ... torch.empty((required_bytes,), ...)
+
+`required_bytes` 由运行期形状决定 ⇒ 每个更大的形状都触发一次 resize + 释放旧 buffer，
+而 CUDA graph / 在飞 kernel 可能仍持有旧 buffer 的视图 ⇒ 悬空指针
+（Xid 31 / FAULT_PDE / cudaErrorIllegalAddress）。0017 的 synchronize 只是护栏，不是根治。
+
+修复：新增 env `XTU_WORKSPACE_FIXED_MB=<N>`：
+  * 首次分配即按该固定档给足，此后所有形状**共用同一份**，永不 resize；
+  * 若某形状超出该档 ⇒ **明确抛错**（fail-fast，可诊断），而不是偷偷释放旧 buffer。
+
+校准方法：先用 `VLLM_DEBUG_WORKSPACE=1` 跑一遍真实流量，观察
+`Resized workspace ... %.2f MB -> %.2f MB` 的峰值，取该峰值的 1.2 倍作为固定档。
+
+---
+--- a/vllm/v1/worker/workspace.py
++++ b/vllm/v1/worker/workspace.py
+@@ -221,6 +221,21 @@
+ 
+         if current_size < required_bytes:
+ 
++            # ⛔ [xtu] 形状治理政策（2026-11-01）：workspace 只允许**一次性按固定档预分配**，
++            #    运行期禁止 resize。理由：resize 会释放旧 buffer，而 CUDA graph / 在飞 kernel
++            #    可能仍持有其视图 ⇒ 悬空指针（Xid 31 / FAULT_PDE / cudaErrorIllegalAddress）。
++            #    这与 compile_ranges_endpoints 的"3 档覆盖全域"是同一套政策：
++            #    **共用一份缓冲，不为每种形状各分配一份**。
++            #    设置 XTU_WORKSPACE_FIXED_MB=<N> 生效；未设置则维持上游行为。
++            _fixed_mb = int(os.environ.get("XTU_WORKSPACE_FIXED_MB", "0") or 0)
++            if _fixed_mb > 0 and current_size > 0:
++                raise RuntimeError(
++                    f"workspace 固定档 {_fixed_mb} MB 覆盖不了本次形状："
++                    f"需要 {required_bytes / _MB:.2f} MB，当前 {current_size / _MB:.2f} MB。"
++                    "按形状治理政策运行期禁止 resize（避免释放仍在被引用的 buffer）；"
++                    "请调大 XTU_WORKSPACE_FIXED_MB 后重启。"
++                )
++
+             def get_caller_info() -> str:
+                 """Find first frame outside WorkspaceManager."""
+                 curr_frame = inspect.currentframe()
+@@ -251,6 +266,10 @@
+                     "Workspace growth is not allowed after locking."
+                 )
+ 
++            if _fixed_mb > 0:
++                # 首次分配即按固定档给足，之后所有形状共用同一份，永不 resize。
++                required_bytes = max(required_bytes, _fixed_mb * _MB)
++
+             # Only resize the requesting ubatch/lane workspace. Other slots
+             # resize lazily on their next get_simultaneous call.
+             # Resizing all ubatches here would orphan the other ubatch's

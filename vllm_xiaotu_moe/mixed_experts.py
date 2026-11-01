@@ -3086,7 +3086,10 @@ class _XiaotuExpertsMixin:
                         #   本行在 **else(非 fused)分支** 里 ⇒ 默认(flag 关)必 UnboundLocalError
                         #   （实测崩溃于首次请求: cannot access local variable '_fz'）。
                         #   非 fused 分支的命中数就是 `_res.sum()`（bool 命中掩码）。
-                        _hacc.add_((_fz.hits() if _fused_on else _res.sum()).to(torch.float32))  # 命中数(设备端 ✓)
+                        # ⛔ 累加器 `_hacc` 是 **int64**（:3071），不能 `.to(torch.float32)`
+                        #   （原写法在 fused 分支同样会崩："result type Float can't be cast to Long"）。
+                        #   `_fz.hits()` 文档为 int64 标量；非 fused 分支 `_res.sum()` 亦 int64 ⇒ 直接相加。
+                        _hacc.add_(_fz.hits() if _fused_on else _res.sum())  # 命中数(设备端 ✓,int64)
                         _tacc.add_(_res.numel())   # 分母(形状在捕获时定型 ✓)
                         _nacc.add_(1)              # 调用次数(含图重放 ✓)
                         if not _in_capture_window():

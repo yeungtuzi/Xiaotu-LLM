@@ -20,6 +20,7 @@
 #   THREADS=60 IMAGE_MAX=128 COMPILE_RANGES=32,256,8192
 #   PIN=1 PIN_SLOTS=15 PIN_MAXQ=16 CED=1 WARMUP=1 KV_DTYPE=fp8_ds_mla
 #   SPEC=1 MODEL_DIR=<路径>
+#   EXPANDABLE=0   1=开 expandable_segments（治碎片），**自动同时** NO_CUSTOM_AR=1
 #
 # +额外参数：只允许**白名单之外**的 `--flag` / `--flag=值`；
 #   会覆盖本脚本保证口径的旗标（--port/--compilation-config/--no-swa-bounded-replay…）一律拒绝。
@@ -44,7 +45,7 @@ TAG="prod"; PORT=8700; TP=2; GPU_UTIL=0.85; MAXSEQS=4; MBT=8192; MAXLEN=524288
 THREADS=60; IMAGE_MAX=128; COMPILE_RANGES="32,256,8192"
 PIN=1; PIN_SLOTS=15; PIN_MAXQ=16; CED=1; WARMUP=1
 PC=1; PC_GB=64; PC_BLOCKS=16; PC_ROOT="/home/user/.cache/prefix-cache"
-KV_DTYPE="fp8_ds_mla"; SPEC=1; MODEL_DIR="$MODEL_DIR_DEFAULT"
+KV_DTYPE="fp8_ds_mla"; SPEC=1; MODEL_DIR="$MODEL_DIR_DEFAULT"; EXPANDABLE=0
 EXTRA_ARGS=()
 
 die() { printf '[ds41] ⛔ %s\n' "$1" >&2; exit "${2:-2}"; }
@@ -83,6 +84,7 @@ while [ $# -gt 0 ]; do
                 KV_DTYPE) KV_DTYPE="$v" ;;
                 SPEC) SPEC="$v" ;;
                 MODEL_DIR) MODEL_DIR="$v" ;;
+                EXPANDABLE) EXPANDABLE="$v" ;;
                 *) die "未知参数 '$k'（可用项见文件头；新增参数请改本脚本，不要绕过入口）" ;;
             esac
             shift ;;
@@ -142,6 +144,7 @@ validate() {
     case "$PIN" in 0|1) ;; *) die "PIN 只能是 0/1" ;; esac
     case "$SPEC" in 0|1) ;; *) die "SPEC 只能是 0/1" ;; esac
     case "$WARMUP" in 0|1) ;; *) die "WARMUP 只能是 0/1（得到 '$WARMUP'）" ;; esac
+    case "$EXPANDABLE" in 0|1) ;; *) die "EXPANDABLE 只能是 0/1" ;; esac
     case "$PC" in 0|1) ;; *) die "PC 只能是 0/1（得到 '$PC'）" ;; esac
     if [ "$PC" = "0" ]; then
         :   # PC=0 时 PC_GB/PC_BLOCKS/PC_ROOT 一律不校验（不用的参数不该拦启动）
@@ -246,6 +249,7 @@ build_args() {
         ARGS+=(--kv-offloading-size "$PC_GB" --kv-transfer-config "$_pcjson")
         say "prefix-cache=on root=$_pcroot L1=${PC_GB}GiB blocks/chunk=$PC_BLOCKS"
     fi
+    [ "$EXPANDABLE" = "1" ] && ARGS+=(--disable-custom-all-reduce)
     [ "$CED" = "0" ] && ARGS+=(--no-swa-bounded-replay)
     if [ ${#EXTRA_ARGS[@]} -gt 0 ]; then ARGS+=("${EXTRA_ARGS[@]}"); fi
     return 0
@@ -310,6 +314,11 @@ start() {
     else
         say "compile_ranges=空（本次不传端点；这是非生产口径，报告中必须注明）"
     fi
+    if [ "$EXPANDABLE" = "1" ]; then
+        say "EXPANDABLE=1：expandable_segments:True + NO_CUSTOM_AR=1（custom allreduce 退回 NCCL，用于治碎片）"
+    else
+        say "EXPANDABLE=0：expandable_segments:False（历史设置；碎片靠其它手段）"
+    fi
     [ "$CED" = "0" ] && say "⚠️ CED=0：这是基线臂，报告中必须标注"
 
     if [ "$PC" = "1" ]; then
@@ -339,6 +348,16 @@ start() {
         export XIAOTU_PIN_CUDA_MOE=0 XIAOTU_ENGRAM_LAST=1
         export GPU_UTIL="$GPU_UTIL" MAXSEQS="$MAXSEQS" MBT="$MBT" MAXLEN="$MAXLEN"
         export COMPILE_RANGES="$COMPILE_RANGES"
+        # 碎片治理（2026-11-01 用户指示，默认关、显式开）：
+        #   expandable_segments 用 CUDA VMM 分配，VMM 显存**不能导出 IPC 句柄**
+        #   ⇒ custom_all_reduce 会在 KV profiling 阶段报 invalid argument、Worker 被杀
+        #   （2026-10-27 两次实测）。所以 EXPANDABLE=1 时**必须同时**关掉它。
+        if [ "$EXPANDABLE" = "1" ]; then
+            export PYTORCH_CUDA_ALLOC_CONF=expandable_segments:True
+            export NO_CUSTOM_AR=1
+        else
+            export PYTORCH_CUDA_ALLOC_CONF=expandable_segments:False
+        fi
         export VLLM_USE_SIMPLE_KV_OFFLOAD=0   # 防父环境漏入 ⇒ SimpleCPUOffloadConnector 会让 fs 层静默消失
         # ⛔ 生产 env 必须复刻：缺 VLLM_EXPERTS_LOAD_DEVICE=cpu 时缺省为 gpu ⇒ 476GB 专家上卡必 OOM
         export VLLM_EXPERTS_LOAD_DEVICE="${VLLM_EXPERTS_LOAD_DEVICE:-cpu}"

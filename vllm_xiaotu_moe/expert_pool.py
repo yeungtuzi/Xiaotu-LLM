@@ -540,6 +540,18 @@ def release_pin_reserve() -> None:
     import torch
     n = len(_PROF_PIN_RESERVE)
     _PROF_PIN_RESERVE.clear()
+    # ⛔ [xtu 2026-11-01] 本函数在**服务期**被调用：`build_layer_pool()` 由
+    #    `mixed_experts.apply()` 在第一次真实 forward 途中懒建池时触发，此时前面
+    #    若干层的预填 kernel / 侧流 DMA 仍在飞。
+    #    `empty_cache()` 会把缓存块 cudaFree ⇒ **解映射虚拟页**；而 CUDA graph /
+    #    在飞 kernel 仍持有这些地址 ⇒ `FAULT_PDE ACCESS_TYPE_VIRT_READ`（Xid 31）。
+    #    注意：这与 `expandable_segments` 无关（cudaFree 本身即解映射），
+    #    所以 0017 的 workspace sync 修不到这里。
+    #    ⇒ 释放前必须先同步设备（一次性成本，只在本函数执行时付一次）。
+    try:
+        torch.cuda.synchronize()
+    except Exception:  # noqa: BLE001
+        pass
     try:
         torch.cuda.empty_cache()
     except Exception:  # noqa: BLE001

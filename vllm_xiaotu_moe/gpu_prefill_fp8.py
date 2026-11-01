@@ -74,6 +74,9 @@ FP8_BLOCK = 128
 # in-place transpose that corrupts itself. (w2 escaped it only because
 # [E, H, I] != [E, I, H].) Names keep the buffers distinct.
 _FP8_BUF: dict = {}
+# ⛔ 扩容时**绝不 free 旧缓冲**：CUDA graph / 在飞 kernel 可能仍烘焙着旧指针。
+#    保留引用直到进程结束（同 gpu_prefill.py 的 _retire 语义）。
+_FP8_RETIRED: list = []
 
 
 def _dma2d_available(engine) -> bool:
@@ -87,14 +90,38 @@ def _dma2d_available(engine) -> bool:
     return os.environ.get("XIAOTU_GPF_DMA2D", "1") != "0"
 
 
-def _buf(name: str, shape, device, dtype=torch.uint8):
+def _buf(name: str, shape, device, dtype=torch.uint8, bucket_rows: bool = False):
+    """定长缓冲。`bucket_rows=True` 时**行维按 2 的幂向上取整**并返回切片。
+
+    ⛔ [xtu 2026-11-01 审计] 旧实现把**完整 shape**（含行维 `A = T*K`）放进 key ⇒
+    每个新的 chunk 长度都新建一块、模块级 dict 无淘汰 ⇒ 宿主内存随流量只增不减
+    （A=65536、I=2048 时单块 **256 MiB**）。这与 `gpu_prefill._reuse_moe` 修过的
+    是同一个 bug，本支当时漏改。
+    现在：行维按 2 的幂桶化（MBT=8192、K=8 ⇒ 收敛到 65536，最多 13 档），
+    只有列维（模型常量）进 key；扩容只增不换（旧块进 `_FP8_RETIRED` 绝不 free）。
+    """
     sh = tuple(int(v) for v in shape)
-    k = (str(device), str(name), sh, dtype)
+    if not bucket_rows:
+        k = (str(device), str(name), sh, dtype)
+        t = _FP8_BUF.get(k)
+        if t is None:
+            t = torch.empty(sh, dtype=dtype, device=device)
+            _FP8_BUF[k] = t
+        return t
+    rows, tail = sh[0], sh[1:]
+    k = (str(device), str(name), tail, dtype)
     t = _FP8_BUF.get(k)
-    if t is None:
-        t = torch.empty(sh, dtype=dtype, device=device)
+    if t is None or int(t.shape[0]) < rows:
+        cap = rows if t is None else max(rows, int(t.shape[0]))
+        cap = 1 << max(0, (cap - 1).bit_length())      # 2 的幂
+        old = t
+        t = torch.empty((cap,) + tail, dtype=dtype, device=device)
         _FP8_BUF[k] = t
-    return t
+        if old is not None:
+            _FP8_RETIRED.append(old)
+        print(f"[xtu-bound] fp8 {name}: 定长缓冲 {cap}x{tail} "
+              f"({t.numel() * t.element_size() / 2**20:.0f} MiB, 2 的幂上行)", flush=True)
+    return t[:rows]
 
 
 @triton.jit
@@ -502,7 +529,7 @@ def gpu_moe_layer_fp8(x, topk_ids, topk_weights, w13t, s13t, w2t, s2t,
     out = torch.zeros((T, H), dtype=torch.float32, device=device)
     if T == 0 or K == 0:
         return out
-    inter = _buf("inter", (A, 2 * I), device, torch.bfloat16)
+    inter = _buf("inter", (A, 2 * I), device, torch.bfloat16, bucket_rows=True)
     gate_up_kernel_fp8[(E, triton.cdiv(2 * I, bn))](
         x, x.stride(0), tok, seg_start,
         w13t, w13t.stride(1), s13t, s13t.stride(1),
@@ -1479,7 +1506,7 @@ def _gmlet_impl(engine, x, topk_ids, topk_weights,
         out = torch.zeros((T, H), dtype=torch.float32, device=device)
     if T == 0 or int(K) == 0:
         return out
-    inter = _buf("inter", (A, 2 * I), device, torch.bfloat16)
+    inter = _buf("inter", (A, 2 * I), device, torch.bfloat16, bucket_rows=True)
 
     BM = int(os.environ.get("XIAOTU_GPF_GEMM_BM", 64))
     BN = int(os.environ.get("XIAOTU_GPF_GEMM_BN", 64))

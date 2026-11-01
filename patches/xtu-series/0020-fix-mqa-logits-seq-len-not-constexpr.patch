@@ -21,18 +21,59 @@ grid 在宿主侧算（`cdiv(seq_len_kv, 128)`），并不需要编译期常量�
 ---
 --- a/vllm/models/deepseek_v4/nvidia/ops/sm12x_mqa.py
 +++ b/vllm/models/deepseek_v4/nvidia/ops/sm12x_mqa.py
-@@ -63,7 +63,13 @@
+@@ -62,8 +62,8 @@
+     cu_seqlen_ks_ptr,
      cu_seqlen_ke_ptr,
      logits_ptr,
-     num_q: tl.constexpr,
+-    num_q: tl.constexpr,
 -    seq_len_kv: tl.constexpr,
-+    # ⛔ [xtu] seq_len_kv 在内核里只用于掩码 `valid_n = offs_n < seq_len_kv`，
-+    #    grid 由宿主侧 `cdiv(seq_len_kv, 128)` 决定 ⇒ **不需要 constexpr**。
-+    #    原实现把它当 constexpr ⇒ 每个不同的 KV 长度都编译一份新 cubin，
-+    #    这些模块常驻 GPU 代码段（不归 torch 分配器管）⇒ 显存单调上涨，
-+    #    最终在 driver.load_binary 处 OOM（2026-10-31 崩溃 1）。
-+    #    改为运行时标量 ⇒ 一份内核服务所有长度，且掩码天然跳过未用尾部（零浪费）。
++    num_q,
 +    seq_len_kv,
      num_heads: tl.constexpr,
      head_dim: tl.constexpr,
      stride_qm: tl.constexpr,
+@@ -73,7 +73,7 @@
+     stride_kd: tl.constexpr,
+     stride_wm: tl.constexpr,
+     stride_wh: tl.constexpr,
+-    stride_lm: tl.constexpr,
++    stride_lm,
+     stride_ln: tl.constexpr,
+     BLOCK_M: tl.constexpr,
+     BLOCK_N: tl.constexpr,
+@@ -227,7 +227,7 @@
+     block_tables_ptr,
+     logits_ptr,
+     token_start,
+-    num_rows: tl.constexpr,
++    num_rows,
+     logits_width: tl.constexpr,
+     next_n: tl.constexpr,
+     num_heads: tl.constexpr,
+@@ -248,7 +248,7 @@
+     stride_cln: tl.constexpr,
+     stride_btb: tl.constexpr,
+     stride_btk: tl.constexpr,
+-    stride_lm: tl.constexpr,
++    stride_lm,
+     stride_ln: tl.constexpr,
+     BLOCK_M: tl.constexpr,
+     BLOCK_N: tl.constexpr,
+@@ -341,7 +341,7 @@
+     block_tables_ptr,
+     logits_ptr,
+     token_start,
+-    num_rows: tl.constexpr,
++    num_rows,
+     logits_width: tl.constexpr,
+     next_n: tl.constexpr,
+     num_heads: tl.constexpr,
+@@ -362,7 +362,7 @@
+     stride_cln: tl.constexpr,
+     stride_btb: tl.constexpr,
+     stride_btk: tl.constexpr,
+-    stride_lm: tl.constexpr,
++    stride_lm,
+     stride_ln: tl.constexpr,
+     BLOCK_N: tl.constexpr,
+     BLOCK_D: tl.constexpr,

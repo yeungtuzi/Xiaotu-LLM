@@ -34,6 +34,12 @@ MODULE_LEVEL_CTORS = ("set(", "list(", "dict(", "OrderedDict(", "defaultdict(", 
 KNOWN_BOUNDED_CONSTEXPR = {
     "PADDED_TOP_K": "2 的幂桶化（审计第 5 轮已核：combine_topk 的 CompileKey 字段均有界）",
     "topk": "topk 宽度（= topk_indices.shape[-1]，配置常量），**不是** token 数",
+    "RAW_STRIDE": "= kv_score.stride(0)（fused_compress_quant_cache.py:119）⇒ KV 布局常量",
+    "CACHE_STRIDE": "= kv_cache.stride(0)（:298/:321）⇒ KV 布局常量",
+    "KV_BLOCK_STRIDE": "= kv_cache.stride(0)（deepseek_v4/...:145/:616/:1309）⇒ KV 布局常量",
+    "stride_sb": "= KV 缓存的 block 维跨距（进程内恒定）",
+    "stride_kvb": "= KV 缓存的 block 内跨距（进程内恒定）",
+    "TAIL_BLOCK_ELEMS": "每 block 元素数（配置常量）",
 }
 
 KNOWN_BOUNDED = {
@@ -46,6 +52,8 @@ KNOWN_BOUNDED = {
     "_BT_WIDTHS": "显式 _BT_WIDTHS_MAX=8",
     "_BOUND_CHECKED": "显式 _BOUND_CHECKED_MAX=16（第6轮审计 N4 引入的 capture/热路径 gate）",
     "_BOUND_RECHECK": "显式上限：键集合与 _BOUND_CHECKED 同域（≤16），值只是复检计数器",
+    # ── 第39轮：KV 缓存布局常量（调用点实测：kv_cache.stride(0) / kv_score.stride(0)）──
+    #    进程内恒定（由 KV 缓存分配决定），跨重启可能变 ⇒ 变体数有界，**不随每请求变化**。
     # ── 第6轮绕过①③（非空字面量初始化 / AugAssign）生效后浮出的一批 ──
     #    全部逐条读过定义与写入点：均为**固定字符串 key 的统计/标志**，键集合由字面量决定。
     "_PH": "固定字符串 key 的统计字典（gpu_prefill_fp8.py:996，键为 'decode'/'gather'/'dma_k' 等字面量）",

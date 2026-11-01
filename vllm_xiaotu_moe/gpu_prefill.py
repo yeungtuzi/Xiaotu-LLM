@@ -1027,6 +1027,13 @@ def _install_capture_watch() -> None:
             try:
                 return _begin(self, *a, **k)
             except BaseException:
+                # ⛔ [xtu 2026-11-01 第5轮审计 #14] 异常路径只 push 不 pop ⇒
+                #    capture 反复失败时 _CAP_FREE 会无界增长（且与 capture_end 无法配对）。
+                if os.environ.get("XIAOTU_CAP_MEM") == "1" and _CAP_FREE:
+                    try:
+                        _CAP_FREE.pop()
+                    except Exception:  # noqa: BLE001
+                        pass
                 with _CAPTURE_GUARD:
                     _CAPTURE_DEPTH = max(0, _CAPTURE_DEPTH - 1)
                 raise
@@ -1345,7 +1352,14 @@ def release_staging_reserve() -> None:
             #    `empty_cache()` ⇒ cudaFree ⇒ **解映射虚拟页**；若此刻仍有在飞
             #    kernel / 侧流 DMA 引用这些页 ⇒ FAULT_PDE ACCESS_TYPE_VIRT_READ（Xid 31）。
             #    那次只修了 expert_pool 那一支，这里漏改 ⇒ 释放前先同步设备。
-            torch.cuda.synchronize()
+            # ⛔ [xtu 2026-11-01 第5轮审计 #15] 原为裸 `torch.cuda.synchronize()`（同步当前
+            #    设备的默认流），而占位张量在 `_PROF_RESERVE[0].device` 上；两者不一致时
+            #    等于没同步目标设备。改为对**占位所在设备**定向同步。
+            try:
+                _dev = _PROF_RESERVE[0].device
+            except Exception:  # noqa: BLE001
+                _dev = torch.cuda.current_device()
+            torch.cuda.synchronize(_dev)
             _t2.cuda.empty_cache()
             _f1, _tot1 = _t2.cuda.mem_get_info(_t2.cuda.current_device())
             print("[xtu-kv-diag] 释放 staging 占位: free %.2f GiB（已 empty_cache）"

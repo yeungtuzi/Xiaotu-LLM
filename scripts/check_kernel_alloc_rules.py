@@ -31,15 +31,23 @@ MODULE_LEVEL_CTORS = ("set(", "list(", "dict(", "OrderedDict(", "defaultdict(", 
 
 # 已由第三方审计核定"有界"的模块级容器 → 理由（未登记的新容器仍会被告警）
 # 已核"有界"的 constexpr 形参（值会变，但取值集合有限）→ 理由
+# ⛔ 第9轮：与"随请求维派生"的 constexpr 白名单**分开**的、可审计的页跨距豁免集。
+#    判据：值 = 分页 KV 缓存的**最外层跨距**（页大小/页行数），与 num_blocks 无关，
+#    进程内恒定 ⇒ 变体数有界，不随每请求变化。
+CONSTEXPR_PAGE_STRIDES = {
+    "RAW_STRIDE": "= kv_score.stride(0)，且有显式断言 == 512*compress_ratio（fused_compress_quant_cache.py:76-83）",
+    "CACHE_STRIDE": "= kv_cache.stride(0)，分页 KV 的页跨距",
+    "KV_BLOCK_STRIDE": "= k_cache.stride(0)，分页 KV 的页跨距",
+    "stride_sb": "= kv_scale.stride(0)，分页 KV 的页跨距",
+    "stride_kvb": "= kv_values.stride(0)，分页 KV 的页跨距",
+    "TAIL_BLOCK_ELEMS": "= tail_kv_cache.stride(0)，分页 KV 的页跨距",
+}
+_DUMMY_PAGE_STRIDES = {
+}
+
 KNOWN_BOUNDED_CONSTEXPR = {
     "PADDED_TOP_K": "2 的幂桶化（审计第 5 轮已核：combine_topk 的 CompileKey 字段均有界）",
     "topk": "topk 宽度（= topk_indices.shape[-1]，配置常量），**不是** token 数",
-    "RAW_STRIDE": "= kv_score.stride(0)（fused_compress_quant_cache.py:119）⇒ KV 布局常量",
-    "CACHE_STRIDE": "= kv_cache.stride(0)（:298/:321）⇒ KV 布局常量",
-    "KV_BLOCK_STRIDE": "= kv_cache.stride(0)（deepseek_v4/...:145/:616/:1309）⇒ KV 布局常量",
-    "stride_sb": "= KV 缓存的 block 维跨距（进程内恒定）",
-    "stride_kvb": "= KV 缓存的 block 内跨距（进程内恒定）",
-    "TAIL_BLOCK_ELEMS": "每 block 元素数（配置常量）",
 }
 
 KNOWN_BOUNDED = {
@@ -180,13 +188,9 @@ def _check_call_sites(tree, fname: str, pnames: list, target_param: str) -> bool
             continue
         # 名字匹配**容忍前后缀**：`compressed_slot_ids` / `kv_cache_out` 都应命中
         # （这正是第8轮阻断项A漏掉 `compressed_slot_ids.stride(0)` 的原因）
-        _hit = False
-        for _t in _VOL_TENSOR_NAMES:
-            if re.search(rf"(^|[^A-Za-z0-9])[A-Za-z0-9_]*{re.escape(_t)}[A-Za-z0-9_]*\s*\.", expr):
-                _hit = True
-                break
-        if not _hit:
-            continue
+        # ⛔ 第9轮 §3-2：旧版用"12 个张量名"子串过滤 ⇒ `dst/lse/k_cache/scores/indices`
+        #    等全失明（全库仍有 60 处 dim-0 跨距喂 constexpr）。判据与文档自相矛盾。
+        #    ⇒ 不再按名字过滤：任何 `.stride(0)` / `.shape[0]` 派生值传给 constexpr 形参都报。
         if re.search(r"\.stride\(\s*0\s*\)", expr) or re.search(r"\.shape\[\s*0\s*\]", expr):
             return True
     return False
@@ -259,7 +263,7 @@ def check_file(path: str):
                     _pat = None
                 else:
                     _v = ""
-            if False:  # noqa: SIM223  (保留占位，勿删)
+            if False:  # noqa: SIM223
                     # ⚠️ 只认"**随请求变化的张量**上的 `.shape[`"：
                     #    `k_cache.stride(0)` / `out.stride(1)` 这类跨距在配置固定时是常量，
                     #    用 `.stride(` 当证据会 24/24 全误报（实测）。
@@ -281,7 +285,8 @@ def check_file(path: str):
                             f"（该内核 {node.name}）"))
                 continue
             if (a.arg in VOLATILE_NAMES or _shapey) \
-                    and a.arg not in KNOWN_BOUNDED_CONSTEXPR:
+                    and a.arg not in KNOWN_BOUNDED_CONSTEXPR \
+                    and a.arg not in CONSTEXPR_PAGE_STRIDES:
                 out.append((path, a.lineno, "C2",
                             f"形参 `{a.arg}` 是 tl.constexpr 且名字像随请求变化，"
                             f"但不在 do_not_specialize 名单里（该内核 {node.name}）"))
@@ -473,14 +478,26 @@ def check_file(path: str):
                 return False
             _tauto = bool(re.search(r"[<>]=?\s*\d+\s*$", t.strip())) or bool(
                 re.search(r"[<>]=?\s*0\b", t))
-            return not _tauto
-            refs = any(re.search(rf"\b{x}\b", t) for x in ADDR_ARGS)
-            return sem and refs
+            if _tauto:
+                return False
+            # ⛔ 第9轮 §3-1：旧版在这里提前 return，导致下面"必须引用块表"的要求**永不可达**
+            #    ⇒ 换成一条与块表无关的诱饵断言也能全绿。现在真正生效。
+            _refs = any(re.search(rf"\b{x}\b", t) for x in ADDR_ARGS)
+            return _refs
 
         n_assert = len([x for x in ast.walk(node) if isinstance(x, ast.Assert) and _is_bound(x)])
         # 边界可能由内核内校验：宿主把行数/块数显式传给内核 ⇒ 不算漏
-        delegated = any(re.search(r"num_table_rows|max_blocks|num_blocks|max_blocks_per_seq|"
-                                  r"n_blocks|num_pages|table_rows|BLOCK_COLS", t) for _l, t in launches)
+        # ⛔ 第9轮 §4：旧版只要实参文本里**出现** `num_blocks` 这类名字就整体豁免
+        #    （scope 内 23 处命中，而 num_blocks 极常见）⇒ 要求右值真的来自 .shape/numel
+        delegated = False
+        for _l, _t in launches:
+            for _m in re.finditer(r"(num_table_rows|max_blocks|num_blocks|max_blocks_per_seq|"
+                                  r"n_blocks|num_pages|table_rows|BLOCK_COLS)\s*=\s*([^,\)]{0,120})", _t):
+                if ".shape" in _m.group(2) or "numel" in _m.group(2):
+                    delegated = True
+                    break
+            if delegated:
+                break
         # 已人工复核：内核内部对块表/slot 的访问自带 mask ⇒ 用源码切片白标
         _slice = "\n".join(lines[node.lineno - 1:(node.end_lineno or node.lineno)])
         if "alloc-audit: masked-in-kernel" in _slice:
@@ -619,6 +636,30 @@ def main():
                 _assigned |= {t.id for t in _n.targets if isinstance(t, ast.Name)}
             elif isinstance(_n, ast.AnnAssign) and isinstance(_n.target, ast.Name):
                 _assigned.add(_n.target.id)
+    # ⛔ 第9轮 §2：旧守卫只查"名字是否是某函数形参"，把真正易变的 `stride_slot_t`
+    #    加进白名单就能全绿（已实测）。⇒ 追加语义校验：白名单里的 constexpr 名
+    #    若在某个调用点被 `.stride(0)`/`.shape[0]` 派生值喂过 ⇒ 白名单与证据矛盾，报错。
+    _volatile_wl = []
+    for _p in targets:
+        try:
+            _t2 = ast.parse(open(_p, encoding="utf-8", errors="replace").read())
+        except SyntaxError:
+            continue
+        for _n2 in ast.walk(_t2):
+            if not isinstance(_n2, (ast.FunctionDef, ast.AsyncFunctionDef)):
+                continue
+            _pn = [a.arg for a in _n2.args.args]
+            for _w in (set(KNOWN_BOUNDED_CONSTEXPR) | set(CONSTEXPR_PAGE_STRIDES)):
+                if _w in CONSTEXPR_PAGE_STRIDES:
+                    continue   # 页跨距：已在 CONSTEXPR_PAGE_STRIDES 显式登记并有证据
+                if _w in _pn and _check_call_sites(_t2, _n2.name, _pn, _w):
+                    _volatile_wl.append((_p, _n2.name, _w))
+    if _volatile_wl:
+        print("❌ 白名单与调用点证据矛盾（这些 constexpr 名被 `.stride(0)`/`.shape[0]` 派生值喂过）：")
+        for _p, _k, _w in _volatile_wl[:10]:
+            print(f"   {_p} {_k} ← {_w}")
+        return 3
+
     _wrong_ctor = [n for n in KNOWN_BOUNDED if n not in _assigned]
     _wrong_cx = [n for n in KNOWN_BOUNDED_CONSTEXPR if n not in _param_names]
     if _wrong_ctor or _wrong_cx:

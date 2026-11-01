@@ -328,6 +328,15 @@ def _pin_inplace(t: torch.Tensor) -> torch.Tensor:
             return t
     except Exception:  # noqa: BLE001 - driver/cudart 不可用时退回旧路径
         pass
+    # ⛔ [xtu 2026-11-01 内核资源审计] 退回 `pin_memory()` 时 pinned 分配器会把请求
+    #    向上取整到 2 的幂，再叠加整块锁页驻留 ⇒ 实测一张 45.78 GiB 的表会驻留 64 GiB
+    #    （白扔 18.2 GiB；V4.1 每 rank 2 张 ⇒ 每 rank 多 36 GiB）。这条回退路径无法
+    #    避免取整（分配器内部行为），但**必须让运维看见它发生了**，否则宿主内存
+    #    悄悄多出几十 GiB 而无人知晓。
+    _gib = t.numel() * t.element_size() / 2**30
+    _log(f"⚠️ cudaHostRegister 失败 ⇒ 退回 pin_memory()："
+         f"精确 {_gib:.1f} GiB 将被向上取整到 2 的幂并整块锁页驻留"
+         f"（实测可多占 ~1.4×；若反复出现请检查 ulimit -l / 驱动）")
     return t.pin_memory()
 
 

@@ -1329,6 +1329,11 @@ def release_staging_reserve() -> None:
         #    ⛔ 运行期（有请求在飞）一律不许这么做 —— 那才是 `Xid 31 / FAULT_PDE` 的来源。
         try:
             import torch as _t2
+            # ⛔ [xtu 2026-11-01 第三方审计] 与 expert_pool.release_pin_reserve 同族：
+            #    `empty_cache()` ⇒ cudaFree ⇒ **解映射虚拟页**；若此刻仍有在飞
+            #    kernel / 侧流 DMA 引用这些页 ⇒ FAULT_PDE ACCESS_TYPE_VIRT_READ（Xid 31）。
+            #    那次只修了 expert_pool 那一支，这里漏改 ⇒ 释放前先同步设备。
+            torch.cuda.synchronize()
             _t2.cuda.empty_cache()
             _f1, _tot1 = _t2.cuda.mem_get_info(_t2.cuda.current_device())
             print("[xtu-kv-diag] 释放 staging 占位: free %.2f GiB（已 empty_cache）"
@@ -2458,6 +2463,17 @@ class PrefetchSlot:
     def alloc_shapes(self, shapes, device):
         shapes = tuple(tuple(int(v) for v in sh) for sh in shapes)
         if self.bufs is None or tuple(tuple(b.shape) for b in self.bufs) != shapes:
+            # ⛔ [xtu 2026-11-01 第三方审计] 形状变化时**直接替换** self.bufs，
+            #    而 `prefetch_layer` 里 `st.wait_event(slot.busy)` 排在这次 alloc
+            #    **之后** ⇒ 旧缓冲可能仍被侧流的 `copy_(non_blocking=True)` 写着
+            #    就被丢弃/复用 ⇒ 与 Xid 31 同族。
+            #    用 `record_stream` 把旧缓冲"钉"在侧流上，由分配器延后复用（不阻塞主机）。
+            try:
+                _st = _prefetch_stream(torch.device(device))
+                for _b in getattr(self, "bufs", ()) or ():
+                    _b.record_stream(_st)
+            except Exception:  # noqa: BLE001
+                pass
             self.bufs = tuple(
                 torch.empty(s, dtype=torch.uint8, device=device) for s in shapes
             )
@@ -2543,6 +2559,12 @@ def prefetch_layer(w13, s13, w2, s2, device):
             raise
         # vLLM sized the KV cache first; there is no room for ping-pong buffers.
         # Drop the (now useless) slots and disable overlap for this process.
+        # ⛔ [xtu 2026-11-01 第三方审计] 这里直接丢弃整组 slot（其中可能有侧流仍在
+        #    写入的 bufs）。OOM 之后紧跟一次 Xid 31 的可疑桥梁正是它 ⇒ 丢弃前等侧流排空。
+        try:
+            _prefetch_stream(dev).synchronize()
+        except Exception:  # noqa: BLE001
+            pass
         _SLOTS.pop(key, None)
         _PREFETCH_DISABLED = True
         print("[xiaotu] GPU prefill: no VRAM for ping-pong slots, "

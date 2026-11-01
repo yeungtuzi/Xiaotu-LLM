@@ -1367,17 +1367,32 @@ _BMM_BUF: dict = {}
 # 做法：把 seg_start 的 D2H 拷到**侧流**上的锁页缓冲，等这个拷贝时主流的 DMA 照常跑；
 #       拿到 host 值后 `.tolist()` 是纯主机操作（零设备同步）。
 _PIN_BND: dict = {}
+_PIN_BND_RETIRED: list = []   # 扩容时旧锁页块只挪不退（DMA 可能仍在用）
 _D2H_STREAM: dict = {}
 
 
 def _bnd_pin_like(seg_start):
-    """按 (长度, dtype) 缓存锁页缓冲；必须保持引用，否则悬空。"""
-    key = (int(seg_start.numel()), str(seg_start.dtype))
+    """取锁页缓冲；容量按 **2 的幂**桶化，只增不减，必须保持引用（否则悬空）。
+
+    ⛔ [xtu 2026-11-01 第三方审计] 旧实现以 `(numel, dtype)` 为键、**无上限无淘汰**，
+    而 `numel` = `A = T*K` 随 chunk 长度变化 ⇒ 每个新长度都新建一块**常驻锁页**内存，
+    与 `_FP8_BUF` 修掉的是同一个 bug（该支漏改）。
+    现在：容量 2 的幂上行、只有 dtype 进 key；返回 `buf[:n]` 视图。
+    """
+    n = int(seg_start.numel())
+    key = str(seg_start.dtype)
     b = _PIN_BND.get(key)
-    if b is None:
-        b = _t.empty(int(seg_start.numel()), dtype=seg_start.dtype, pin_memory=True)
+    if b is None or int(b.numel()) < n:
+        cap = n if b is None else max(n, int(b.numel()))
+        cap = 1 << max(0, (cap - 1).bit_length())      # 2 的幂上行
+        old = b
+        b = _t.empty(cap, dtype=seg_start.dtype, pin_memory=True)
         _PIN_BND[key] = b
-    return b
+        if old is not None:
+            _PIN_BND_RETIRED.append(old)               # 绝不 free：可能在飞
+        print(f"[xtu-bound] bnd pin: {cap} 元素 ({b.numel()*b.element_size()/2**20:.2f} MiB, 2 的幂)",
+              flush=True)
+    return b[:n]
 
 
 def _d2h_stream(device):

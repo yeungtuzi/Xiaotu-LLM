@@ -26,7 +26,6 @@ VOLATILE_NAMES = {
     "stride_lm", "stride_clb", "stride_qb", "stride_outs", "stride_sqs",
     "stride_group", "stride_hidden",
 }
-VOLATILE = re.compile(r"$^")   # 保留占位，实际用集合判断
 MODULE_LEVEL_CTORS = ("set(", "list(", "dict(", "OrderedDict(", "defaultdict(", "fromkeys(")
 
 # 已由第三方审计核定"有界"的模块级容器 → 理由（未登记的新容器仍会被告警）
@@ -40,9 +39,6 @@ CONSTEXPR_PAGE_STRIDES = {
     "KV_BLOCK_STRIDE": "deepseek_v4/common/ops/fused_compress_quant_cache.py:145 = kv_cache.stride(0)",
     "TAIL_BLOCK_ELEMS": "glm5next/nvidia/ops/kpool_compress.py:464 = tail_kv_cache.stride(0)",
 }
-_DUMMY_PAGE_STRIDES = {
-}
-
 KNOWN_BOUNDED_CONSTEXPR = {
     "PADDED_TOP_K": "2 的幂桶化（审计第 5 轮已核：combine_topk 的 CompileKey 字段均有界）",
     "topk": "topk 宽度（= topk_indices.shape[-1]，配置常量），**不是** token 数",
@@ -152,9 +148,6 @@ _LINES: list = []
 
 
 
-_VOL_TENSOR_NAMES = ("block_table", "block_tables", "out", "topk_indices", "slot_ids",
-                     "acc", "max_score", "cu_seqlens", "logits", "q", "kv", "slot_mapping")
-
 
 def _find_kernel(tree, name: str):
     """在**本文件** AST 里按名字找内核 def（跨文件发射仍不支持，见已知缺口）。"""
@@ -249,9 +242,6 @@ def check_file(path: str):
                 elif isinstance(_v, ast.Constant) and isinstance(_v.value, str):
                     dns.add(_v.value)
         args = [a.arg for a in node.args.args] + [a.arg for a in node.args.kwonlyargs]
-        for kw in node.args.kwonlyargs:
-            if kw.arg in args and kw.arg in dns:
-                dns.add(kw.arg)
         # 只挑"声明为 constexpr 且在末尾常量区"的：Triton 习惯用注释界，改为看默认值/注解
         for a in node.args.args + node.args.kwonlyargs:
             ann = ast.unparse(a.annotation) if a.annotation else ""
@@ -277,13 +267,6 @@ def check_file(path: str):
                     _pat = None
                 else:
                     _v = ""
-            if False:  # noqa: SIM223
-                    # ⚠️ 只认"**随请求变化的张量**上的 `.shape[`"：
-                    #    `k_cache.stride(0)` / `out.stride(1)` 这类跨距在配置固定时是常量，
-                    #    用 `.stride(` 当证据会 24/24 全误报（实测）。
-                    _VOL_TENSORS = ("block_table", "block_tables", "out", "topk_indices",
-                                    "slot_ids", "acc", "max_score", "cu_seqlens",
-                                    "logits", "q", "kv")
 
             # ⛔ 第7轮 N4：`arg in dns` 曾当**豁免**用 —— 但 constexpr 形参进 do_not_specialize
             #    是**空操作**（Triton 只对非 constexpr 生效）⇒ 这恰恰是 B1 的 bug 特征，

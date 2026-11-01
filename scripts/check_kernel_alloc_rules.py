@@ -625,6 +625,9 @@ def main():
         _here,
     ]))
     ap.add_argument("--quiet", action="store_true")
+    ap.add_argument("--skip-wl-definition", action="store_true",
+                    help="只跳过'依赖真实树'的白名单检查（名字存在性/字典归属/语义矛盾），"
+                         "**保留**可作用于任意树的内容校验（页跨距证据等）——供变异测试用")
     ap.add_argument("--no-whitelist-check", action="store_true",
                     help="跳过'白名单名字必须能在被扫文件里找到定义'的检查（供变异测试用）")
     ap.add_argument("--scope-file", default=os.path.join(
@@ -702,7 +705,7 @@ def main():
     # ⚠️ 逐名判断（用集合会很脆弱：`X = {}` 与 `X: T = {}` 混在一起时容易漏）
     def _has_def(n: str) -> bool:
         return _re.search(rf"^\s*{_re.escape(n)}\s*(?::|=)", _blob, _re.M) is not None
-    _missing = [] if a.no_whitelist_check else [
+    _missing = [] if (a.no_whitelist_check or a.skip_wl_definition) else [
         n for n in list(KNOWN_BOUNDED) + list(KNOWN_BOUNDED_CONSTEXPR) if not _has_def(n)]
     # ⛔ 第39轮教训：白名单有**两个字典**（容器 vs constexpr 形参），放错等于没放，
     #    而门禁不会提示。这里做机械校验：容器名必须能作为模块级容器找到，
@@ -773,16 +776,16 @@ def main():
                     continue   # 页跨距：已在 CONSTEXPR_PAGE_STRIDES 显式登记并有证据
                 if _w in _pn and _check_call_sites(_t2, _n2.name, _pn, _w):
                     _volatile_wl.append((_p, _n2.name, _w))
-    if not a.no_whitelist_check and _volatile_wl:
+    if not (a.no_whitelist_check or a.skip_wl_definition) and _volatile_wl:
         print("❌ 白名单与调用点证据矛盾（这些 constexpr 名被 `.stride(0)`/`.shape[0]` 派生值喂过）：")
         for _p, _k, _w in _volatile_wl[:10]:
             print(f"   {_p} {_k} ← {_w}")
         return 3
 
-    _wrong_ctor = [] if a.no_whitelist_check else [n for n in KNOWN_BOUNDED if n not in _assigned]
-    _wrong_cx = [] if a.no_whitelist_check else [
+    _wrong_ctor = [] if (a.no_whitelist_check or a.skip_wl_definition) else [n for n in KNOWN_BOUNDED if n not in _assigned]
+    _wrong_cx = [] if (a.no_whitelist_check or a.skip_wl_definition) else [
         n for n in KNOWN_BOUNDED_CONSTEXPR if n not in _param_names]
-    if not a.no_whitelist_check and (_wrong_ctor or _wrong_cx):
+    if not (a.no_whitelist_check or a.skip_wl_definition) and (_wrong_ctor or _wrong_cx):
         print("❌ 白名单放错了字典（容器名必须能在模块级找到；constexpr 名必须是函数形参）：")
         for n in _wrong_ctor:
             print(f"   {n}: 在 KNOWN_BOUNDED 里，但找不到模块级赋值")

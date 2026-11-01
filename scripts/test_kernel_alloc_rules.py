@@ -134,6 +134,33 @@ def host(slot_ids, block_table, cap):
     _kernel[(1,)](slot_ids, block_table)
 """, "C4"),
 
+
+    # ── 第12轮新增机制的反向样本（此前 0 覆盖）────────────────────
+    # 白标必须给「内核体内的、引用该实参的」钳位证据；无关 `if pid < n:` 不算
+    "C4_whitelabel_unrelated_clamp": ("""
+import triton, triton.language as tl
+@triton.jit
+def _my_kernel(block_table_ptr, n):
+    pid = tl.program_id(0)
+    if pid < n:
+        tl.store(block_table_ptr + pid, 1)
+def host(block_table, n):
+    # alloc-audit: masked-in-kernel sample.py:5
+    _my_kernel[(1,)](block_table, n)
+""", "C4"),
+
+    # 白标必须给出 文件:行号
+    "C4_whitelabel_no_evidence": ("""
+import triton, triton.language as tl
+@triton.jit
+def _my_kernel(block_table_ptr, n):
+    tl.store(block_table_ptr, n)
+def host(block_table, n):
+    # alloc-audit: masked-in-kernel
+    _my_kernel[(1,)](block_table, n)
+""", "C4"),
+
+
     # ── 合法样本：必须零告警（防判据收紧后变误报机器）─────────────
     "OK_clean": ("""
 import triton, triton.language as tl
@@ -172,11 +199,25 @@ BUGGY_SHAPES = [
     (r'[<>]=?\s*\d+\s*$', "字面量上界被判恒真（反向误报）"),
     # 第10轮 N2：只取位置形参
     ("_pnames = [x.arg for x in node.args.args]\n", "只取位置形参（keyword-only 盲区）"),
+    # 第12轮：白标证据行必须引用被保护实参
+    # 第12轮：页跨距证据必须同时含名字
+    # 第12轮：委派必须只看函数体（不含签名）
+    # 第12轮：白标不能是纯子串（必须行首锚定）
+    (r"^\\s*#\\s*alloc-audit:", "白标必须行首锚定"),
 ]
 
 KERNEL_ANTI_PATTERNS = [
     # 第9轮 §4-3：双层嵌套 gate ⇒ 实际周期 65536
     ("cache_utils.py", '_bound_check_skip(("gather"', '_bound_check_skip(("entry"', "双层 _bound_check_skip 嵌套"),
+]
+
+
+# ⚠️ 与 BUGGY_SHAPES 相反：这些是**必须存在**的机制（防止被"简化"掉）
+REQUIRED_SHAPES = [
+    ("_refs_addr = any(", "白标证据行必须引用被保护实参"),
+    ('.stride(0)" in _txt and', "页跨距证据必须同时含名字"),
+    ("for x in _kfn.body", "委派判据只看函数体语句（不含签名）"),
+    ("alloc-audit", "白标机制仍存在（行首锚定）"),
 ]
 
 
@@ -188,6 +229,12 @@ def check_no_regression() -> int:
             bad += 1
         else:
             print(f"  ✅ 历史 bug 形态已不存在：{why}")
+    for pat, why in REQUIRED_SHAPES:
+        if pat in GATE_SRC:
+            print(f"  ✅ 必需机制仍在：{why}")
+        else:
+            print(f"  ❌ 必需机制**被删掉了**：{why}")
+            bad += 1
     for fname, pat_a, pat_b, why in KERNEL_ANTI_PATTERNS:
         # ⛔ 第10轮：**读不到文件必须算失败**，不许静默跳过（这正是"跳过即绿"）
         cands = [

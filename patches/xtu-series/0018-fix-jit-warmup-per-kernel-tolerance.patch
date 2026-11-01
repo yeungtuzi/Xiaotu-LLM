@@ -1,0 +1,39 @@
+From: Xiaotu-LLM <xiaotu@local>
+Subject: [PATCH 0018] fix: JIT 预热逐内核容错（SM80 可启用 enable_jit_warmup）
+
+背景：`gpu_worker.py:907-912` 的注释指出 —— 若在 CUDA graph 捕获【之后】发生
+workspace resize，会释放掉图正在引用的内存（悬空指针 ⇒ 异步非法访存 ⇒
+`Xid 31 / FAULT_PDE ACCESS_TYPE_VIRT_READ`）。修法是让 warmup 在捕获前跑一遍，
+把 workspace 一次扩到位。
+
+阻塞：`enable_jit_warmup=true` 在 A100(SM80) 上会崩 —— `sparse_attn_indexer.py:955-966`
+在 `use_fp4_cache=False` 时用 `torch.float8_e4m3fn` 注册 PackSeq 预热，Triton 在 sm80
+不支持 fp8e4nv ⇒ `ValueError: type fp8e4nv not supported in this architecture`；
+而 `JitWarmupRegistry.warmup()` 对任一内核失败直接 raise，整机起不来。
+
+修复：把 `compile_many` 包进 try/except，**逐内核容错** —— fp8 那个跳过并告警，
+其余内核照常预热；启动不再被单个不支持的内核阻断。
+
+效果：SM80 上可开 `enable_jit_warmup` ⇒ workspace 在捕获前扩到最大 ⇒
+消除"捕获后 resize 释放图内存"这一类悬空指针（与 0017 属同一族根因）。
+
+---
+--- a/vllm/model_executor/warmup/jit_warmup.py
++++ b/vllm/model_executor/warmup/jit_warmup.py
+@@ -1115,4 +1115,15 @@
+                     f"{kernel.__class__.__name__} ({len(compile_keys)} keys)",
+                     refresh=False,
+                 )
+-                kernel.compile_many(compile_keys)
++                try:
++                    kernel.compile_many(compile_keys)
++                except Exception:
++                    # ⛔ [xtu] 单个内核预热失败不得阻断启动：A100(SM80) 无 fp8e4nv，
++                    #    fp8 PackSeq 预热会抛 ValueError；跳过它，其余照常预热即可。
++                    #    这样 enable_jit_warmup=true 在 SM80 上可用 ⇒ workspace 在
++                    #    CUDA graph 捕获【之前】就扩到最大，避免"捕获后再 resize 释放
++                    #    掉图正在引用的内存"（上游 gpu_worker.py:907 注释所指的悬空指针）。
++                    logger.warning(
++                        "JIT warmup skipped for %s (%d keys)",
++                        kernel.__class__.__name__, len(compile_keys), exc_info=True,
++                    )

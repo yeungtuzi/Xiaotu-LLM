@@ -106,6 +106,23 @@ def gpu_moe_decode_fp8(x, topk_ids, topk_weights, w13t, s13t, w2t, s2t,
                        BH: int = 128, BJ: int = 128, BI: int = 128):
     """decode 版:grid=P=T×K。返回 fp32 [T,H]。"""
     T = int(x.shape[0])
+    # ⛔ [xtu 2026-11-01 第三方审计] 内核里的尺度索引把分组宽**硬编码成 128**
+    #    （`//128`），而这些 load/store（末条还是 `tl.atomic_add`）**没有 mask**。
+    #    BH/BJ/BI 是形参、调用方本可传别的值 ⇒ 一旦 ≠128 或 H/I 不能被 128 整除，
+    #    就会**静默错尺度 / 越界写**。这里把不变量钉死，宁可快速失败。
+    assert BH == BJ == BI == 128, (
+        f"decode_moe_fp8 内核把分组宽硬编码为 128：实际 BH={BH} BJ={BJ} BI={BI}"
+    )
+    assert H % BH == 0 and I % BJ == 0 and I % BI == 0, (
+        f"分组宽必须整除: H={H}%{BH}, I={I}%{BJ}, I={I}%{BI}"
+    )
+    # ⛔ [同审计] 权重必须显式 `view(torch.uint8)`：若直接传 float8_e4m3fn，
+    #    Triton 会推断 fp8e4nv 指针类型 ⇒ SM80/MUSA 编译失败
+    #    （对比 gpu_prefill_fp8.py 的显式 view）。
+    if w13t.dtype == torch.float8_e4m3fn:
+        w13t = w13t.view(torch.uint8)
+    if w2t.dtype == torch.float8_e4m3fn:
+        w2t = w2t.view(torch.uint8)
     if s13t.dtype == torch.uint8:
         s13t = s13t.view(torch.float32)
     if s2t.dtype == torch.uint8:

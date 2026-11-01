@@ -2901,6 +2901,14 @@ def gpu_moe_layer_tiled(x, topk_ids, topk_weights, w13, s13, w2, s2,
     `tile_e<=0 或 >=E` ⇒ 退化成**整层一次算完**(与 `gpu_moe_layer` 等价),
     便于先做数值等价性验证再开流水。
     """
+    # ⛔ [xtu 2026-11-01 第三方审计] 本函数是**死代码**（全仓零调用点），且
+    #    `_moe_tile_launch` 不透传 `**_nvkw`，把 GKS/SC_E4M3/HAS_TS 硬编码为
+    #    MXFP4 取值 ⇒ 若有人接到 NVFP4（group_k=16、e4m3 组尺度 + weight_scale_2）
+    #    会按 MXFP4 **静默反量化**。这里显式拒绝，避免"看起来能跑但数值错"。
+    raise NotImplementedError(
+        "gpu_moe_layer_tiled 不支持 NVFP4/MXFP4 变体（tiled 路径未透传 nvkw）；"
+        "请使用 gpu_moe_layer / gpu_moe_layer_nvfp4"
+    )
     device = torch.device(device) if not isinstance(device, torch.device) else device
     T = x.shape[0]
     E = int(w13.shape[0])

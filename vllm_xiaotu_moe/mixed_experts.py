@@ -2996,7 +2996,11 @@ class _XiaotuExpertsMixin:
                             _fz = PinMaskFused(ids_i32.device)
                             _fz._enabled = True
                             self._pin_mask_fused = _fz
-                        cpu_ids, cpu_w, part_ids, _res = _fz.step(
+                        # ⛔ [xtu 2026-11-01 第三方审计] `step()` 只返回 **3** 元组
+                        #    （docstring 与 return 都是 3 个），这里原先解 4 个 ⇒
+                        #    一旦打开 XIAOTU_PIN_MASK_FUSED 就 ValueError。命中数由
+                        #    模块内部累计，用 `hits()` 读取（见下方统计点）。
+                        cpu_ids, cpu_w, part_ids = _fz.step(
                             ids_i32, wts_f32, _pinp.slotmap, int(_pinp.n_local))
                     else:
                         _ids_safe = ids_i32.clamp_min(0)
@@ -3078,7 +3082,7 @@ class _XiaotuExpertsMixin:
                     _hitstat_print = _PIN_HITSTAT_ON   # 【R3】导入期物化
                     if _hitstat_print:
                         # ⭐ 只有统计开关打开时才累加(累加也是设备端算子,不影响图)✓
-                        _hacc.add_(_res.sum())     # 命中数(设备端 ⇒ 可入图 ✓)
+                        _hacc.add_(_fz.hits().to(torch.float32))     # 命中数(设备端 ⇒ 可入图 ✓)
                         _tacc.add_(_res.numel())   # 分母(形状在捕获时定型 ✓)
                         _nacc.add_(1)              # 调用次数(含图重放 ✓)
                         if not _in_capture_window():

@@ -125,15 +125,22 @@ class SidecarRuntime:
 
 
     def _buf(self, qlen: int):
-        b = self._bufs.get(qlen)
+        """按 **2 的幂桶化**的 qlen 复用三块 GPU 缓冲，返回 `[:qlen]` 视图。
+
+        ⛔ [xtu 2026-11-01 第三方审计] 旧实现以**精确 qlen** 为键且无淘汰 ⇒
+        每个新 query 长度永久留下三块张量（8192×7168 bf16 ≈ 117 MB/新长度），
+        与已修的 `_reuse`/`_seg_buf`/`_buf`/`_PIN_BND` 是同一个 bug，此文件漏改。
+        """
+        cap = 1 << max(0, (int(qlen) - 1).bit_length())     # 2 的幂上行
+        b = self._bufs.get(cap)
         if b is None:
             b = (
-                torch.empty(qlen, self.hidden, dtype=torch.bfloat16, device=self._dev),
-                torch.empty(qlen, self.topk, dtype=torch.int32, device=self._dev),
-                torch.empty(qlen, self.topk, dtype=torch.float32, device=self._dev),
+                torch.empty(cap, self.hidden, dtype=torch.bfloat16, device=self._dev),
+                torch.empty(cap, self.topk, dtype=torch.int32, device=self._dev),
+                torch.empty(cap, self.topk, dtype=torch.float32, device=self._dev),
             )
-            self._bufs[qlen] = b
-        return b
+            self._bufs[cap] = b
+        return tuple(t[:qlen] for t in b)
 
 
     def _compute_mxfp4_batch(self, layer, qlen, k, ids_host, wts_host, out_host, hid_ptr):

@@ -37468,3 +37468,199 @@ SPEC=1                        # 默认（实测最优）
 
 依据实测斜率（cap=15 时）：0.90 → 2.06M、0.95 → 2.64M ⇒ 每 0.05 ≈ 58 万 token
 ⇒ 要 1.57M 应在 **0.85 附近**（实测验证中）。
+
+## B1172 · 生产事故现场复盘：**VRAM 越预算增长 → Triton 模块加载 OOM**（2026-11-01）
+
+### 现场（`/home/user/lvllm/stress-run5/`，用户压测与真实 DSH 负载共用）
+
+| 时间 | 事件 | 证据 |
+|---|---|---|
+| 10-31 15:54 | GPU 显存 **+124.0 MiB/min** | `LEAK_SUSPECT`（30 分钟窗口） |
+| 10-31 16:09 | **+107.6 MiB/min** | 同上 |
+| 10-31 16:24 | **+42.9 MiB/min** | 同上 |
+| 10-31 16:44 | **最满卡仅剩 531 MiB**（已用 40,429 / 40,960） | `GPU_FREE_LOW` |
+| 10-31 16:54 | 仅剩 523 MiB；宿主 RSS +94.1 MiB/min（650 GB） | `LEAK_SUSPECT` |
+| **10-31 16:56:26** | **`RuntimeError: Triton Error [CUDA]: out of memory`** | Worker_TP0，`triton/compiler._init_handles → driver.load_binary` |
+| 10-31 16:56:43 | 服务退出，再未恢复 | `SERVICE_RESTARTED pid 1659105 -> 0` |
+
+调用栈：`attention.py:1019 _sparse_indexer_and_attn` → `sparse_attn_indexer.py:1027 forward_cuda`
+→ `breakable_cudagraph.py:105` → **Triton JIT 模块加载** ⇒ **是"新形状要加载新内核模块"时没显存了**。
+
+### 决定性一条：**那次运行的 `compile_ranges_endpoints` 是 `None`**
+
+崩溃日志的启动参数：
+```
+'gpu_memory_utilization': 0.9, 'max_num_batched_tokens': 8192, 'num_speculative_tokens': 5
+'compile_ranges_endpoints': None        ← 没开 ① 的编译上界
+'kv_cache_dtype': 'fp8_ds_mla'
+```
+
+⇒ 即 **Inductor 按每个出现过的 token 数各编一张图**（① 线确认的机制），在**真实开发负载**
+（形状高度多样）下持续增长，最终把 0.90 × 40.96 = 36.9 GiB 的预算**撑破到 40.4 GiB**，然后 OOM。
+
+### 这正面验证了 ① 的修复方向
+
+* 同一机制在受控实验里：无上界时多样性负载 **1962 cubin/h**；加上界后 **0 新增**；
+* 生产这次是**真实负载下的同一机制**，且**恰好没开**上界 ⇒ 事故与机制自洽。
+* ⚠️ 注意：预算 0.90 也拦不住它（实际用到 99%）⇒ **光调 `GPU_UTIL` 不够，必须封住形状特化**。
+
+### 第二起死亡是另一类错误（不是容量问题）
+
+```
+[Sun Nov 1 06:28:49] NVRM: Xid (PCI:0000:c1:00): 31, pid=2121749, name=VLLM::Worker
+  MMU Fault: ENGINE GRAPHICS GPC2 GPCCLIENT_T1_5 faulted @ 0x7f6a_a202d000.
+  Fault is of type FAULT_PDE ACC          ← 访问未映射地址（两卡同时）
+```
+（此前 10-30 14:56 还有一次 **Xid 13**：`Misaligned Address` + `Xid 43`，325 行集中在 GPC 6 TPC 6/7）
+
+⇒ **Xid 31 (FAULT_PDE) / Xid 13 (Misaligned Address) 是"非法地址访问"，与容量无关**，
+需要在修好容量问题后独立定位（compute-sanitizer / 关自定义内核二分）。
+
+## B1173 · 崩溃窗口的缓存增量：**Inductor 14,091 个新文件，Triton 0 个**（2026-11-01）
+
+### 实测（生产实例 14:54:45 启动 → 16:56:26 死亡）
+
+| 缓存 | 崩溃窗口（14:50–17:00）新增 |
+|---|---:|
+| **Inductor**（`~/.cache/vllm/torch_compile_cache`） | **14,091 个文件** |
+| **Triton**（`~/.triton`） | **0 个文件** |
+
+⇒ **这两小时内显存增长（+42~124 MiB/min）对应的是 Inductor 编译变体**，不是 Triton。
+
+### 因此"死因"要这样拆
+
+1. **增长来自 Inductor**：`compile_ranges_endpoints=None` ⇒ 按每个出现过的 token 数各编一张图
+   ⇒ 2 小时 14,091 个产物 ⇒ 显存被推到 99%；
+2. **死亡发生在 Triton 模块加载**：但那一步**没有新编译**（Triton 0 新增）
+   ⇒ 只是要把一个**已缓存的模块加载进 GPU**，而此时只剩 523 MiB，`driver.load_binary` 失败。
+
+⇒ 即：**"Triton OOM"是症状，不是原因；原因是 Inductor 把显存吃干**。
+
+### 对维护方判断的校正
+
+| 说法 | 判定 |
+|---|---|
+| ✅ `COMPILE_RANGES` 限制 Inductor 变体、治"单调上爬" | **正确，且本起事故正是这一类**（14,091 vs 0） |
+| ⚠️ "不阻止新形状的 Triton JIT" | **原则上对**，但**本起事故里 Triton 新增为 0**，不是这次的驱动因素 |
+| ✅ "修不了 Xid 31 越界" | **正确**，那是独立的内存安全问题（06:28 那次） |
+
+### 全局缓存规模（供参考）
+
+| 目录 | 文件数 | 占用 |
+|---|---:|---:|
+| `~/.triton`（活跃） | 43,448 | 2.8 GB |
+| `~/.cache/triton`（陈旧） | 166,389 | 15 GB |
+| Inductor 缓存 | — | 仅崩溃窗口就 +14,091 |
+
+⇒ 后续若要彻底封顶，**两个缓存都要管**（Triton 侧可用 `JITCACHE_STAMP` 做增量观测）。
+
+## B1174 · `enable_jit_warmup=true` 在 A100 上**会直接启动失败**（审计实测链，方案被否）
+
+### 结论：不可用（已回退 `serve_ds41.sh:195` 保持 `false`）
+
+审计给出的完整证据链（本地镜像与远端同 commit `f03026a548`）：
+
+1. `true` ⇒ `vllm/model_executor/warmup/kernel_warmup.py:170-178` 执行 `registry.warmup()`，异常**直接 raise**，在服务就绪之前；
+2. ds41f 索引器是主线 `SparseAttnIndexer`（`models/deepseek_v41/attention.py:1294`），树内 vendored DeepGEMM 使 `has_deep_gemm()` 为真 ⇒ 该类被构造；
+3. 生产日志实测 `use_fp4_cache=False`（`Using FP8 indexer cache for Lightning Indexer`）；
+4. ⇒ `sparse_attn_indexer.py:955-966` 在 `enable_jit_warmup` 为真时注册
+   `_PACK_SEQ_TRITON_KERNEL.register_warmup(dtype=torch.float8_e4m3fn, pad_value=-inf)`；
+5. `VllmTritonJitKernel.compile → kernel.warmup(...)`（`jit_warmup_triton_helper.py:226-231,303-320`）
+   按 `TritonWarmupTensor(dtype)` 建张量 ⇒ Triton 以 **fp8e4nv** 指针在 sm80 编译 ⇒
+   `ValueError: type fp8e4nv not supported in this architecture`；
+6. 与 `a66b6ae` 提交信息、`NOTES.md:11584` 的实测记录**完全一致**。
+
+### 这意味着什么
+
+* **不能靠上游的 `enable_jit_warmup` 解决"运行期编译"**——它在 SM80 上先崩；
+* 要开它，**必须先给 SM80 关掉 fp8 `PackSeq` 的 warmup 注册**（改上游文件 ⇒ 走
+  `patches/xtu-series/` + 真机验证），这属于独立工作项；
+* 因此"把编译挪到启动期"的可行路径只剩 **HTTP 层形状桶预热**（我们自己的 `warmup_shapes.py`）。
+
+### 顺带确认的两条
+
+| 项 | 结论 |
+|---|---|
+| warmup 与 KV 预算 | **不冲突**：KV 先定容（`gpu_worker.py:851`），warmup 在后（`:865`→`:907`） |
+| `--kernel-config` 可被 `+--kernel-config` 覆盖 | 既有缺口（deny 正则 :158 未含它），应补 |
+
+## B1175 · 纠正："显存无界增长 +14 GiB"是**测量时点错误**，真实曲线在启动后 6 分钟即到平台
+
+### 数据（`~/lvllm/stress-run5/cache_watch.csv`，59 个逐分钟样本，06:45→07:44）
+
+| 时刻 | ind 文件 | tri 文件 | gpu1 (MiB) | kv% | reqs |
+|---|---:|---:|---:|---:|---:|
+| 06:45 | 853,377 | 43,439 | **26,057** | 0.00 | 0 |
+| 06:46 | — | 43,439 | **39,319** | 0.00 | 0 |
+| 06:51 | 190,425 | 43,439 | **40,163** | 0.07 | 1 |
+| 07:10 | 191,716 | 43,439 | **35,837** | 0.00 | 0 |
+| 07:44 | 193,937 | 43,439 | **40,133** | 0.17 | 1 |
+
+### 三条结论
+
+1. **那 +14 GiB 发生在启动期（06:45→06:46 一分钟内 +13,262 MiB），不是运行期增长。**
+   06:45 的 26,057 MiB 是**启动中途**的采样（KV 池尚未分配完），不是"启动完成"。
+2. **06:52 之后 52 分钟净变化 = −30 MiB**（40,163 → 40,133）⇒ **增长率为 0**，
+   已满足验收标准"≤0.2 GiB/h"。
+3. **Triton 产物在整整 59 分钟内 +0**（43,439 → 43,439）⇒ 无"新形状不断产生新 cubin"这回事；
+   Inductor 从 190k 慢涨到 193.9k（**约 1 个/秒**）但**不伴随显存增长** ⇒ 它是磁盘产物，不是显存。
+
+### 真实问题：**headroom = 314 MiB，而不是"增长"**
+
+* 观测总占用 40,133 MiB，而 `GPU_UTIL=0.90` 给 torch 的预算是 36,397 MiB
+  ⇒ **非 torch 部分 ≈ 3,736 MiB**（CUDA context + Triton 模块 + 工作区等），vLLM 的预算**不计它们**；
+* 06:51 的一次性 +826 MiB（39,337→40,163）是首个请求触发的**首次工作区/图分配**；
+* 空闲时掉到 35,837（−4,326），有请求再涨回 ⇒ 这是**工作集波动**，不是泄漏。
+
+⇒ 崩溃 1（`Triton Error [CUDA]: out of memory`，当时剩 523 MiB）的机制是：
+**新内核/工作区要一次分配，而池子已把 36.4 GiB 吃满、非 torch 又占 3.7 GiB，只剩几百 MiB。**
+
+### 由此得到的定容公式
+
+```
+free = total − (util × total) − non_torch
+     = 40,441 − 36,397 − 3,736 = 308 MiB        ← 实测 314 MiB ✓ 对得上
+```
+
+要拿到 2 GiB headroom：`util ≤ (40,441 − 3,736 − 2,048) / 40,441 = 0.858` ⇒ **取 0.85**。
+
+### 与"预留多少才够用"的对应
+
+| 项 | 量 |
+|---|---|
+| 首次请求的工作区步进（实测） | ~0.83 GiB |
+| 单个新 Triton 模块 + 缓冲 | ~数十 MB |
+| 安全余量 | ~1 GiB |
+| **合计需要** | **~2 GiB** |
+
+⇒ `GPU_UTIL 0.90 → 0.85` 即得 2 GiB，且 KV 池仍有约 **1.47M token**（实测 0.85 对应 1,472,960），
+是实测峰值用量（kv% 最大 0.17 × 2.06M ≈ 35 万）的 **4 倍以上**。
+
+## B1176 · Xid 31 第三次复发（08:46:10）⇒ 与显存 headroom 无关，是独立的内存安全事故
+
+### 现场
+
+```
+[Sun Nov  1 08:46:10 2026] NVRM: Xid (PCI:0000:c1:00): 31, pid=2168496, name=VLLM::Worker,
+  MMU Fault: ENGINE GRAPHICS GPC6 GPCCLIENT_T1_11 faulted @ 0x7f2f_7be2b000
+                           FAULT_PDE ACCESS_TYPE_VIRT_READ
+[同一秒]                (PCI:0000:41:00): 31, pid=2168495, name=VLLM::Worker,
+  MMU Fault: ENGINE GRAPHICS GPC0 GPCCLIENT_T1_4  faulted @ 0x7eb1_4fe2b000
+```
+
+第三次（前两次 10-31 16:56、11-01 06:28）**同一签名**：两个 rank 同一秒、同类型 `VIRT_READ`、
+页偏移同构（`…2b000` / `…d000`）⇒ **确定性代码路径的越界读**，不是硬件抖动，也不是 OOM。
+
+### 关键结论
+
+1. **本次死亡时显存并不紧**：实例在 08:46 之前刚从 Xid 中恢复并继续服务到 16:00 之后，
+   死亡与"headroom 只有 300 MiB"不是同一机制；
+2. 因此 `GPU_UTIL 0.90→0.85`（B1175）**解的是崩溃 1（Triton OOM）**，**解不了 Xid 31**；
+3. Xid 31 必须单独定位：`CUDA_LAUNCH_BLOCKING=1` 或 `compute-sanitizer --tool memcheck`
+   （GPU0 + TP=1 + nice，不碰生产），最小复现形状 = 带图 + 长 prompt + 并发 2。
+
+### 已排除
+
+- 不是 KV 池溢出（KV 使用率峰值 17%）；
+- 不是 Triton OOM（dmesg 无 `out of memory`，只有 Xid）；
+- 不是宿主 OOM killer（`MemAvailable` 当时充足，无 oom-kill 记录）。

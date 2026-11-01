@@ -1323,11 +1323,16 @@ def release_staging_reserve() -> None:
     if _PROF_RESERVE:
         # ⛔ [xtu 2026-11-01 第三方审计 A2-6] 顺序应为「同步 → clear → empty_cache」，
         #    且同步必须指定**占位所属的设备**（原为无参，是"当前设备"隐式）。
+        # ⚠️ [xtu 2026-11-01 再审计修正] 上一版写 `_ts.cuda.synchronize(device)`，但本
+        #    函数**没有 device 形参**（那个名字只在 reserve_staging_for_profile 里）⇒
+        #    NameError 被 `except: pass` 静默吞掉，设备定向同步从未执行。现改为从占位
+        #    张量自身取设备，并且不再静默吞异常。
         try:
             import torch as _ts
-            _ts.cuda.synchronize(device)
-        except Exception:  # noqa: BLE001
-            pass
+            _ts.cuda.synchronize(_PROF_RESERVE[0].device)
+        except Exception as _e:  # noqa: BLE001
+            print(f"[xtu-kv-diag] 设备定向同步失败(不掩盖): {type(_e).__name__}: {_e}",
+                  flush=True)
         _PROF_RESERVE.clear()
         # ⭐ A69：`clear()` 只是丢掉活引用，段仍留在 torch 缓存分配器里 ⇒
         #   记账以为已归还，实际没还 ⇒ **必须** empty_cache 才真正还给驱动 ✓

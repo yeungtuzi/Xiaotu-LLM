@@ -96,7 +96,8 @@ class PinMaskFused:
 
     def __init__(self, device: torch.device):
         self.device = device
-        self._bufs: dict[tuple[str, int, torch.dtype], torch.Tensor] = {}
+        self._bufs: dict[tuple[str, torch.dtype], torch.Tensor] = {}
+        self._retired: list = []   # 扩容时旧缓冲只挪不退（可能被 CUDA graph 引用）
         self._hits = torch.zeros((), dtype=torch.int64, device=device)
         self._enabled = os.environ.get(_ENV_ON, "") not in ("", "0")
 
@@ -113,8 +114,14 @@ class PinMaskFused:
         if t is None or int(t.numel()) < n:
             cap = n if t is None else max(n, int(t.numel()))
             cap = 1 << max(0, (cap - 1).bit_length())      # 2 的幂上行
+            old = t
             t = torch.empty(cap, dtype=dtype, device=self.device)
             self._bufs[key] = t
+            # ⛔ [xtu 2026-11-01 第三方审计] 与兄弟缓存（_reuse/_seg_buf/_buf）保持一致：
+            #    扩容时旧缓冲**只挪不退**。同流内分配器复用今天还安全，但一旦这些缓冲被
+            #    CUDA graph 捕获，直接丢弃就会让图仍指向被复用的内存。
+            if old is not None:
+                self._retired.append(old)
         return t[:n]
 
     @property

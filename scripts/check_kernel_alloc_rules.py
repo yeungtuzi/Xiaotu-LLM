@@ -46,25 +46,37 @@ KNOWN_BOUNDED = {
     "_FP8_RETIRED": "同 _SEG_RETIRED：2 幂扩容驱动，释放会 UAF",
     "_D2H_STREAM": "按 device 索引",
     "_ENGRAM_LAST_PENDING": "按层号累积（≤层数），用后 clear()",
-    "_CED_GROUP_NAMES": "固定名字集合（常量）",
+    "_CED_GROUP_NAMES": "每 KV 配置的层名集合，会 clear()+update（按配置数，有限）",
     "_GP_BUF2": "key = _gp_dev_key(dev) ⇒ 按设备",
     "_GP_BUF2_BYTES": "同上",
     "_GP_BUF2_DENIED": "同上（按设备记录拒绝标记）",
-    "_LUT_CACHE": "key 是常量查表，条目数 = LUT 种类",
+    # ── mixed_experts：审计第 5 轮逐个读过，均按 device / 层号索引（原靠 MAX 子串蒙过，
+    #    现显式登记，杜绝"巧合式放行"）──
+    "_GPF_INFO": "按 device 索引（mixed_experts.py:282/2252）",
+    "_GP_EVENTS": "按 device 索引（:358/2649）",
+    "_GP_PREFETCH_ON": "按 device 索引（:494）",
+    "_GP_READY": "按 device 索引（:495/2673）",
+    "_GP_SLOT": "key = (device, slot)，slot ∈ {0,1}（:496/2654）",
+    "_GP_SLOT_FREE": "同 _GP_SLOT（:497/2595/2653）",
+    "_PROFILE_PREALLOC_DONE": "标记集合，key = device（:509/2226）",
+    "_GP_PF_WARNED": "告警去重，key = device（:512/2366）",
+    "_PF_HB": "心跳时间戳，key = device（:514/2780）",
+
+    "_LUT_CACHE": "key 是 device（gpu_prefill.py:57）",
     "_SEG_RETIRED": "由 2 幂扩容驱动，上界 ~17；释放会引发 UAF，故不 free（见审计 §19 反驳）",
     "_PIN_BND_RETIRED": "同 _SEG_RETIRED：锁页缓冲，释放会 UAF",
     # 以下均以 **设备号 / 层号 / 固定槽位** 为 key（与请求长度无关）
-    "_SLOTS": "按 device 索引（≤GPU 数）",
+    "_SLOTS": "key = (dev.index,) + shapes（限量 MAXSEQS≤4 × 设备数）",
     "_PREFETCH_STREAMS": "按 device 索引",
-    "_LANDING": "按 device 索引",
+    "_LANDING": "key = (device, which∈{0..3})",
     "_LANDING_BUF": "按 device 索引",
-    "_TILE_RINGS": "按 (device, tile 号) 索引，tile 数固定",
+    "_TILE_RINGS": "key = (device, 全 shapes, nslots) ⇒ tile 数固定、nslots 固定",
     "_GP_SIDE": "按 device 索引",
     "_GP_LAYERS": "按层号索引",
     "_GP_PROFILE_LAYERS": "按层号索引",
-    "_PIN_LOCKS": "按 device 索引",
+    "_PIN_LOCKS": "key = (storage_ptr, offset, shape, dtype, tag) ⇒ 按参数而非按请求长度",
     "_PIN_BND": "按 (device, 层号) 索引",
-    "_BOUND_BUF_LOGGED": "去重标记，key 是档位常量",
+    "_BOUND_BUF_LOGGED": "去重标记，key 是缓冲区完整 key（只记录已打印过）",
     "_DBG": "调试计数器，key 是固定字符串",
     "_RING": "按层号/固定槽位索引",
 }
@@ -79,6 +91,18 @@ def iter_py(root: str):
                 yield os.path.join(dirpath, f)
 
 
+def _slice_of(node) -> str:
+    """取节点对应的**源码原文**（含注释），用于匹配 `# alloc-audit: ...` 白标。"""
+    if node is None:
+        return ""
+    lo = getattr(node, "lineno", 1)
+    hi = getattr(node, "end_lineno", lo)
+    return "\n".join(_LINES[lo - 1:hi])
+
+
+_LINES: list = []
+
+
 def check_file(path: str):
     try:
         src = open(path, encoding="utf-8", errors="replace").read()
@@ -86,6 +110,8 @@ def check_file(path: str):
     except SyntaxError:
         return []            # 语法错误由别的检查负责
     lines = src.splitlines()
+    global _LINES
+    _LINES = lines
     out = []
 
     # ---------- C2: 仍为 constexpr 的"易变形参" ----------
@@ -142,8 +168,22 @@ def check_file(path: str):
     # ---------- C1: 模块级可变容器被函数变更且无上限 ----------
     #    ⚠️ 首版只看"实参里是否有 .shape"⇒ **别名逃逸**（w = shape[-1]; container.add(w) 漏检）。
     #    现改为：只要是模块级容器、且被任何函数变更 ⇒ 要求该函数有上限判据或显式白标。
+    # ⛔ 审计 #5：旧版只看 `tree.body` 顶层 ⇒ 写在 `try:` 块里的模块级容器完全不可见。
+    _top = []
+    def _collect(nodes):
+        for n in nodes:
+            # ⛔ 递归只进 Try/If/With 这类**语句块**；绝不进 FunctionDef/ClassDef 的 body
+            #    （否则函数内局部变量会被误当成模块级容器：实测 98 条误报）
+            if isinstance(n, (ast.FunctionDef, ast.AsyncFunctionDef, ast.ClassDef)):
+                continue
+            _top.append(n)
+            for attr in ("body", "orelse", "finalbody", "handlers"):
+                sub = getattr(n, attr, None)
+                if isinstance(sub, list):
+                    _collect([x for x in sub if isinstance(x, ast.stmt)])
+    _collect(tree.body)
     mod_names = set()
-    for node in tree.body:
+    for node in _top:
         # ⚠️ `X: dict = {}` 是 AnnAssign（不是 Assign）——首版漏了它，自检立刻抓到
         if isinstance(node, ast.Assign):
             tgts = [t for t in node.targets if isinstance(t, ast.Name)]
@@ -175,10 +215,12 @@ def check_file(path: str):
                         if anc.lineno <= node.lineno <= (anc.end_lineno or anc.lineno):
                             if owner is None or anc.lineno > owner.lineno:
                                 owner = anc
-                scope_src = ast.unparse(owner) if owner else ""
-                bounded = bool(re.search(r"MAX\w*|len\([^)]*\)\s*(>=|>)\s*\w", scope_src))
+                # ⛔ 审计 #6：`MAX\w*` 子串会被任意含 MAX 的标识符"蒙过"
+                #    （实据：mixed_experts 巨型函数里的 _DEFER_MAXQ 给 9 个容器背书）。
+                #    ⇒ 取消启发式，只认：①KNOWN_BOUNDED 白名单 ②源码切片里的显式白标。
+                scope_src = _slice_of(owner) if owner else ""
                 labeled = ("alloc-audit: bounded" in scope_src) or (name in KNOWN_BOUNDED)
-                if not (bounded or labeled):
+                if not labeled:
                     out.append((path, node.lineno, "C1",
                                 f"模块级容器 `{name}` 被变更（{fn.attr}）但所属函数无上限判据/白标"
                                 f"（有界请加 `# alloc-audit: bounded` 并写明理由）"))
@@ -194,10 +236,9 @@ def check_file(path: str):
                             if anc.lineno <= node.lineno <= (anc.end_lineno or anc.lineno):
                                 if owner is None or anc.lineno > owner.lineno:
                                     owner = anc
-                    scope_src = ast.unparse(owner) if owner else ast.unparse(tree)
-                    bounded = bool(re.search(r"MAX\w*|len\([^)]*\)\s*(>=|>)\s*\w", scope_src))
+                    scope_src = _slice_of(owner) if owner else ""
                     labeled = ("alloc-audit: bounded" in scope_src) or (t.value.id in KNOWN_BOUNDED)
-                    if not (bounded or labeled):
+                    if not labeled:
                         out.append((path, node.lineno, "C1",
                                     f"模块级容器 `{t.value.id}` 被下标赋值但无上限判据/白标"
                                     f"（有界请加 `# alloc-audit: bounded` 并写明理由）"))

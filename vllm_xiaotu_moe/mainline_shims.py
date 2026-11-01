@@ -1400,8 +1400,12 @@ def _install_ced_group_name_probe() -> list[str]:
             if orig is None or getattr(orig, "_xtu_ced_grp", False):
                 continue
 
+            # ⛔ [xtu 2026-11-01 内核资源审计] 闭包晚绑定：`orig` 在循环外，
+            #    上一轮迭代把它置 None 后 `continue`，已装上的包装器再被调用就会
+            #    `None(...)` 抛 TypeError。用默认参数**逐次绑定**当前 mod 的 orig。
             @functools.wraps(orig)
-            def init_attn_backend(kv_cache_config, vllm_config, device, *a, **kw):
+            def init_attn_backend(kv_cache_config, vllm_config, device, *a,
+                                  _orig=orig, **kw):
                 try:
                     names = set()
                     for g in kv_cache_config.kv_cache_groups:
@@ -1414,7 +1418,7 @@ def _install_ced_group_name_probe() -> list[str]:
                                  f"{sorted(names)[:4]}")
                 except Exception as exc:  # noqa: BLE001
                     _log(f"ced 组名收集失败: {type(exc).__name__}: {exc}")
-                return orig(kv_cache_config, vllm_config, device, *a, **kw)
+                return _orig(kv_cache_config, vllm_config, device, *a, **kw)
 
             init_attn_backend._xtu_ced_grp = True  # type: ignore
             setattr(mod, "init_attn_backend", init_attn_backend)

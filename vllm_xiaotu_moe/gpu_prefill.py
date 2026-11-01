@@ -782,19 +782,34 @@ def _retire(t):
 
 
 _SEG_BUF = {}
+_SEG_RETIRED: list = []   # 扩容时旧缓冲只挪不退（图可能仍持有旧指针）
 
 
 def _seg_buf(name, shape, dtype, device, init=None):
-    """segmentation 用的**持久缓冲**（捕获期零分配）。"""
-    k = (str(device), name, tuple(int(v) for v in shape), dtype)
+    """segmentation 用的**持久缓冲**（捕获期零分配）。
+
+    ⛔ [xtu 2026-11-01 内核资源审计] 旧实现的 key 含**完整 shape**，而行维
+    `A = T*K` 随 chunk 长度变化 ⇒ 每个新 A 各留一整套缓冲，且 `_SEG_BUF`
+    **永不可淘汰**（见 :529）⇒ 与 `_BUF_MOE` 修掉的是同一个 bug（漏改的这一支）。
+    现在：行维按 **2 的幂**桶化，只有列维/尾部进 key；容量不足才扩容一次，
+    旧缓冲进 `_SEG_RETIRED` **绝不 free**（CUDA graph 可能仍烘焙旧指针）。
+    """
+    sh = tuple(int(v) for v in shape)
+    rows, tail = sh[0], sh[1:]
+    k = (str(device), name, tail, dtype)
     t = _SEG_BUF.get(k)
-    if t is None:
-        t = torch.empty(tuple(int(v) for v in shape), dtype=dtype, device=device)
+    if t is None or int(t.shape[0]) < rows:
+        cap = rows if t is None else max(rows, int(t.shape[0]))
+        cap = 1 << max(0, (cap - 1).bit_length())      # 2 的幂上行
+        old = t
+        t = torch.empty((cap,) + tail, dtype=dtype, device=device)
         if init is not None:
             init(t)
         _SEG_BUF[k] = t
+        if old is not None:
+            _SEG_RETIRED.append(old)
     _touch(k)
-    return t
+    return t[:rows]
 
 
 def _build_segmentation_reuse(topk_ids, topk_weights, num_experts, device):

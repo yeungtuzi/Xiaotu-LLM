@@ -24,7 +24,7 @@ def _gate_up_pairs_kernel(
     x_ptr, x_ld, ids_ptr, wts_ptr,
     w13_ptr, s13_ptr, acc_ptr,
     P, K, HS: tl.constexpr, H: tl.constexpr, I: tl.constexpr,
-    W13_E: tl.constexpr, S13_E: tl.constexpr,
+    W13_E, S13_E,  # ⛔ 第6轮B1：两者都是 .stride(0) 派生 ⇒ 降级为运行时标量
     BH: tl.constexpr, BJ: tl.constexpr, LIMIT: tl.constexpr,
 ):
     p = tl.program_id(0)
@@ -78,7 +78,7 @@ def _act_pairs_kernel(acc_ptr, act_ptr, P, I: tl.constexpr,
 def _down_pairs_kernel(
     act_ptr, ids_ptr, wts_ptr, w2_ptr, s2_ptr, out_ptr,
     out_ld, P, K, H: tl.constexpr, I: tl.constexpr,
-    W2_E: tl.constexpr, S2_E: tl.constexpr,
+    W2_E, S2_E,  # ⛔ 第6轮B1：两者都是 .stride(0) 派生 ⇒ 降级为运行时标量
     BH: tl.constexpr, BI: tl.constexpr,
 ):
     p = tl.program_id(0)

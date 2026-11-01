@@ -56,7 +56,8 @@ def host(out, block_table):
 
 
 def run_gate(path: str) -> tuple[int, str]:
-    r = subprocess.run([sys.executable, GATE, "--scope-file", path],
+    # 变异测试用合成样本 ⇒ 必须跳过"白名单名字必须存在"的检查
+    r = subprocess.run([sys.executable, GATE, "--scope-file", path, "--no-whitelist-check"],
                        capture_output=True, text=True, timeout=120)
     return r.returncode, r.stdout + r.stderr
 

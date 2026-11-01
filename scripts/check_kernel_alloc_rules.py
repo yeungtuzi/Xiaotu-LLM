@@ -43,10 +43,33 @@ KNOWN_BOUNDED = {
     "_PIN_CACHE": "key 含 storage 地址 ⇒ 按参数而非按形状",
     "_BMM_BUF": "key 的 ne 只有 {tile, 余数} 两种",
     "_BT_WIDTHS": "显式 _BT_WIDTHS_MAX=8",
+    "_BOUND_CHECKED": "显式 _BOUND_CHECKED_MAX=16（第6轮审计 N4 引入的 capture/热路径 gate）",
+    # ── 第6轮绕过①③（非空字面量初始化 / AugAssign）生效后浮出的一批 ──
+    #    全部逐条读过定义与写入点：均为**固定字符串 key 的统计/标志**，键集合由字面量决定。
+    "_PH": "固定字符串 key 的统计字典（gpu_prefill_fp8.py:996，键为 'decode'/'gather'/'dma_k' 等字面量）",
+    "_EV": "固定 key；acc 的二级键来自 _evt_add 的字符串字面量（:965/693 等）",
+    "_SC": "单键 {'bounds': ...}（:917）",
+    "_CED_STATE": "固定 key 的状态字典（mainline_shims.py:1444）",
+    "_PWAL_DIAG": "固定 key {'n','src'}（mainline_shims.py:66）",
+    "_LT_ACC": "固定 key 的计数器（mixed_experts.py:75）",
+    "_PF_CALL": "单键 {'n'}（mixed_experts.py:515）",
+    "_STAGE_ACC": "固定 key 的统计（gpu_prefill.py:2088；k 来自阶段名字面量）",
+    "_PIN_DONE": "单键 {'n': -1}（gpu_prefill.py:2253）",
+    "_IN_WARMUP": "单元素标志列表（gpu_prefill.py:1227，只写 [0]）",
+    "_IN_STARTUP": "单元素标志列表（gpu_prefill.py:1222，只写 [0]）",
+    "_T_ATTN": "固定 key {'t','n'}（deepseek_v4/attention.py:133）",
+    "_XTU_MQA_SEEN": "固定字符串 key {'triton','torch'}（sm12x_deep_gemm_fallbacks.py:458）",
+    "_CAP_WARNED": "单元素标志列表（expert_pool.py:52，只写 [0]）",
+    "_STEP": "单元素计数器（gpu_prefill.py:506，只写 [0]）",
+    "_LAST_REPORT": "单元素时间戳（gpu_prefill.py:615）",
+    "_CLEANER": "固定 key（含 'lock'）的线程协调字典（gpu_prefill.py:583）",
+    "_STAGE_EV": "固定 key {'pend'}（gpu_prefill.py:2127）",
+    "_DDB": "单键 {'n'}（gpu_prefill_fp8.py:1007，位于模块级块内）",
+    "_UPSTREAM_SEG": "单键 {'n'}（mainline_shims.py:466）",
     "_PROF_PIN_RESERVE": "profile 期占位，用后即 clear",
     "_PROF_RESERVE": "同上",
-    "_CAP_FREE": "显存抽样游标，长度固定",
-    "_LAST_USE": "按层号索引（层数固定）",
+    "_CAP_FREE": "是**栈**（push/pop 配对），不是定长——配对已修（#14）",
+    "_LAST_USE": "key = 缓冲 key（无层号）——与缓冲 key 同域，有限",
     "_FP8_BUF": "行维 2 幂桶化（本轮修复项）",
     "_FP8_RETIRED": "同 _SEG_RETIRED：2 幂扩容驱动，释放会 UAF",
     "_D2H_STREAM": "按 device 索引",
@@ -59,31 +82,31 @@ KNOWN_BOUNDED = {
     #    现显式登记，杜绝"巧合式放行"）──
     "_GPF_INFO": "key = _dev.index（mixed_experts.py:2249/2252）",
     "_GP_EVENTS": "按 device 索引（:358/2649）",
-    "_GP_PREFETCH_ON": "按 device 索引（:494）",
-    "_GP_READY": "key = (device_key, 下一槽位序号)（:495/2594/2673）",
-    "_GP_SLOT": "key = (device, slot)，slot ∈ {0,1}（:496/2654）",
+    "_GP_PREFETCH_ON": "⚠️ 死容器：全文件只有定义、无读写（:494）⇒ 可删",
+    "_GP_READY": "key = (device_key, 层号)（第二项是层号，不是槽位序号）",
+    "_GP_SLOT": "key 只有 device，slot 是 **value**（:2596/2654）",
     "_GP_SLOT_FREE": "同 _GP_SLOT：key = device（:497，经 setdefault 写入）",
-    "_PROFILE_PREALLOC_DONE": "集合，元素 = device key（:509/2226）",
+    "_PROFILE_PREALLOC_DONE": "集合，元素是 (E, I)（不是 device）——按模型几何，有限",
     "_GP_PF_WARNED": "告警去重，key = device（:512/2366）",
-    "_PF_HB": "心跳计数，key 是字符串字面量 \"t\"/\"n\"（:514/2475-2476）",
+    "_PF_HB": "有 4 个字符串 key（\"t\"/\"n\" 等，:514/2475-2476）",
 
     "_LUT_CACHE": "key 是 device（gpu_prefill.py:57）",
     "_SEG_RETIRED": "由 2 幂扩容驱动，上界 ~17；释放会引发 UAF，故不 free（见审计 §19 反驳）",
     "_PIN_BND_RETIRED": "同 _SEG_RETIRED：锁页缓冲，释放会 UAF",
     # 以下均以 **设备号 / 层号 / 固定槽位** 为 key（与请求长度无关）
-    "_SLOTS": "key = (dev.index,) + shapes（限量 MAXSEQS≤4 × 设备数）",
+    "_SLOTS": "key = 权重 shapes（与 MAXSEQS 无关）——按模型几何，有限",
     "_PREFETCH_STREAMS": "按 device 索引",
     "_LANDING": "key = (device, which∈{0..3})",
-    "_LANDING_BUF": "按 device 索引",
+    "_LANDING_BUF": "key 含 device 与 shapes（不是纯 device）",
     "_TILE_RINGS": "key = (device, 全 shapes, nslots) ⇒ tile 数固定、nslots 固定",
     "_GP_SIDE": "按 device 索引",
     "_GP_LAYERS": "按层号索引",
     "_GP_PROFILE_LAYERS": "按层号索引",
     "_PIN_LOCKS": "key = (storage_ptr, offset, shape, dtype, tag) ⇒ 按参数而非按请求长度",
-    "_PIN_BND": "按 (device, 层号) 索引",
+    "_PIN_BND": "key 只含 dtype（不是 device+层号）——当前有界，但理由需更正",
     "_BOUND_BUF_LOGGED": "去重标记，key 是缓冲区完整 key（只记录已打印过）",
     "_DBG": "调试计数器，key 是固定字符串",
-    "_RING": "按层号/固定槽位索引",
+    "_RING": "key = 权重 shapes（不是层号）——当前有界，但理由需更正",
 }
 
 
@@ -155,7 +178,12 @@ def check_file(path: str):
                     _VOL_TENSORS = ("block_table", "block_tables", "out", "topk_indices",
                                     "slot_ids", "acc", "max_score", "cu_seqlens",
                                     "logits", "q", "kv")
-                    if any(re.search(rf"\b{t}\b", _v) for t in _VOL_TENSORS) and ".shape[" in _v:
+                    # ⛔ 第6轮 B2：上一版把 `.stride(` 完全排除 ⇒ 对"跨距当 constexpr"**结构性失明**，
+                    #    而本案根因（HEAD_BLOCK/stride_*_t）正是这一类。
+                    #    恢复识别，但要求**随请求维张量**上的 `.stride(0)` 作证据，
+                    #    否则 `k_cache.stride(0)`（配置常量）会全量误报。
+                    _vol_hit = any(re.search(rf"\b{t}\b", _v) for t in _VOL_TENSORS)
+                    if _vol_hit and (".shape[" in _v or ".stride(0)" in _v or ".stride( 0" in _v):
                         _shapey = True
                         break
             if (a.arg in VOLATILE_NAMES or _shapey) and a.arg not in dns \
@@ -178,9 +206,18 @@ def check_file(path: str):
             continue
         # ⛔ 审计 #3：旧判据是**文本**匹配 ⇒ 注释里写一句 "synchronize" 就算通过。
         #    改为只看 AST 里的真实调用节点（注释天然不在 AST 中）。
+        # ⛔ 第6轮 #3：旧判据按**行号窗口**（可跨函数）⇒ 前一个函数里的 synchronize
+        #    会给后一个函数的 empty_cache 背书。改为只认**同一函数体内**、且在该调用之前。
         real_sync = False
+        _owner = None
+        for _f in ast.walk(tree):
+            if isinstance(_f, (ast.FunctionDef, ast.AsyncFunctionDef)):
+                if _f.lineno <= node.lineno <= (_f.end_lineno or _f.lineno):
+                    if _owner is None or _f.lineno > _owner.lineno:
+                        _owner = _f
+        _lo = _owner.lineno if _owner is not None else node.lineno - 12
         for anc in ast.walk(tree):
-            if not isinstance(anc, ast.Call) or anc.lineno > node.lineno or anc.lineno < node.lineno - 12:
+            if not isinstance(anc, ast.Call) or anc.lineno > node.lineno or anc.lineno < _lo:
                 continue
             f = anc.func
             nm = f.attr if isinstance(f, ast.Attribute) else (f.id if isinstance(f, ast.Name) else "")
@@ -220,7 +257,10 @@ def check_file(path: str):
             v = ast.unparse(node.value)
         else:
             continue
-        if any(c in v for c in MODULE_LEVEL_CTORS) or v in ("{}", "[]", "set()"):
+        # ⛔ 第6轮绕过①：`_SEEN = {0: None}`（非空字面量）曾不被识别
+        _v0 = v.lstrip()
+        _is_lit = _v0.startswith("{") or _v0.startswith("[") or _v0.startswith("set(") or _v0.startswith("dict(")
+        if any(c in v for c in MODULE_LEVEL_CTORS) or _is_lit:
             mod_names |= {t.id for t in tgts}
     if mod_names:
         for node in ast.walk(tree):
@@ -246,16 +286,25 @@ def check_file(path: str):
                 #    （实据：mixed_experts 巨型函数里的 _DEFER_MAXQ 给 9 个容器背书）。
                 #    ⇒ 取消启发式，只认：①KNOWN_BOUNDED 白名单 ②源码切片里的显式白标。
                 scope_src = _slice_of(owner) if owner else ""
-                labeled = ("alloc-audit: bounded" in scope_src) or (name in KNOWN_BOUNDED)
+                # ⛔ 第6轮绕过②：曾"函数里出现一句 # alloc-audit: bounded ⇒ 该函数内所有容器放行"。
+                #    改为白标必须**指名**该容器：`# alloc-audit: bounded <name>`
+                _lab = bool(re.search(rf"alloc-audit:\s*bounded[^\n]*\b{re.escape(name)}\b", scope_src))
+                labeled = _lab or (name in KNOWN_BOUNDED)
                 if not labeled:
                     out.append((path, node.lineno, "C1",
                                 f"模块级容器 `{name}` 被变更（{fn.attr}）但所属函数无上限判据/白标"
                                 f"（有界请加 `# alloc-audit: bounded` 并写明理由）"))
-        # 下标赋值：_CACHE[key] = value（dict 的典型用法，同样会无界增长）
+        # 下标赋值：_CACHE[key] = value；以及 AugAssign（`_CNT[k] += 1`）
+        # ⛔ 第6轮绕过③：AugAssign 曾在检查之外
         for node in ast.walk(tree):
-            if not isinstance(node, ast.Assign):
+            _tgts = []
+            if isinstance(node, ast.Assign):
+                _tgts = list(node.targets)
+            elif isinstance(node, ast.AugAssign):
+                _tgts = [node.target]
+            if not _tgts:
                 continue
-            for t in node.targets:
+            for t in _tgts:
                 if isinstance(t, ast.Subscript) and isinstance(t.value, ast.Name) and t.value.id in mod_names:
                     owner = None
                     for anc in ast.walk(tree):
@@ -264,7 +313,9 @@ def check_file(path: str):
                                 if owner is None or anc.lineno > owner.lineno:
                                     owner = anc
                     scope_src = _slice_of(owner) if owner else ""
-                    labeled = ("alloc-audit: bounded" in scope_src) or (t.value.id in KNOWN_BOUNDED)
+                    _nm = t.value.id
+                    _lab = bool(re.search(rf"alloc-audit:\s*bounded[^\n]*\b{re.escape(_nm)}\b", scope_src))
+                    labeled = _lab or (_nm in KNOWN_BOUNDED)
                     if not labeled:
                         out.append((path, node.lineno, "C1",
                                     f"模块级容器 `{t.value.id}` 被下标赋值但无上限判据/白标"
@@ -305,8 +356,12 @@ def check_file(path: str):
         body_src = ast.unparse(node)
 
         def _is_bound(a: ast.Assert) -> bool:
+            # ⛔ 第6轮 #7：上一版只数 assert 个数且 `<`/`>=` 也算 ⇒ 两条无关断言即可放行。
+            #    要求：①含上界/跨距语义 ②**引用了块表/slot 本身或其 shape/stride**。
             t = ast.unparse(a.test)
-            return any(k in t for k in ("max(", "min(", ".shape[", ".stride(", "numel", ">=", "<"))
+            sem = any(k in t for k in ("max(", "min(", ".shape[", ".stride(", "numel"))
+            refs = any(re.search(rf"\b{x}\b", t) for x in ADDR_ARGS)
+            return sem and refs
 
         n_assert = len([x for x in ast.walk(node) if isinstance(x, ast.Assert) and _is_bound(x)])
         # 边界可能由内核内校验：宿主把行数/块数显式传给内核 ⇒ 不算漏
@@ -329,13 +384,20 @@ def main():
     # ⛔ 审计 #2：默认根曾写死远端路径 ⇒ 在其它机器上 exit 2，仓库里没有可复现性。
     #    现按「环境变量 → 常见候选」顺序探测；都没有则**报错并给出如何指定**。
     def _pick(env: str, cands: list) -> str:
+        # ⛔ 审计 N8：默认候选里可能有一个**过期镜像**（实测 1/24 文件比部署树旧 61 行）
+        #    ⇒ 选"存在且最新"的那个，并在运行时打印 root + mtime，让"审的是哪个对象"可见。
         v = os.environ.get(env)
         if v and os.path.isdir(v):
             return v
-        for c in cands:
-            if os.path.isdir(c):
-                return c
-        return cands[0]
+        alive = [c for c in cands if os.path.isdir(c)]
+        if not alive:
+            return cands[0]
+        def _newest(d: str) -> float:
+            try:
+                return max(os.path.getmtime(os.path.join(d, "vllm")) if os.path.isdir(os.path.join(d, "vllm")) else os.path.getmtime(d), 0)
+            except OSError:
+                return 0.0
+        return max(alive, key=_newest)
 
     _here = os.path.dirname(os.path.dirname(os.path.abspath(__file__)))
     ap.add_argument("--root", default=_pick("XTU_VLLM_ROOT", [
@@ -348,6 +410,8 @@ def main():
         _here,
     ]))
     ap.add_argument("--quiet", action="store_true")
+    ap.add_argument("--no-whitelist-check", action="store_true",
+                    help="跳过'白名单名字必须能在被扫文件里找到定义'的检查（供变异测试用）")
     ap.add_argument("--scope-file", default=os.path.join(
         os.path.dirname(os.path.abspath(__file__)), "kernel_audit_scope.txt"),
         help="只检查该清单里的文件（默认 scripts/kernel_audit_scope.txt）")
@@ -385,9 +449,50 @@ def main():
             print(f"   {m}")
         return 3
 
+    # ⛔ 审计 N8：必须让人看见"这次审的是哪个 root、审的这批文件多旧"。
+    #    ⚠️ 目录 mtime 不能反映文件新旧（实测 root 目录 mtime 停在 10-05，
+    #    而内部文件一直在改）⇒ 改为取**被扫描文件**的最新 mtime。
+    import datetime as _dt
+    def _fmt(ts: float) -> str:
+        try:
+            return _dt.datetime.fromtimestamp(ts).strftime("%F %T")
+        except Exception:  # noqa: BLE001
+            return "N/A"
+    for _name, _d in (("root", a.root), ("plugin", a.plugin)):
+        _ft = []
+        for _t in targets:
+            if _t.startswith(_d):
+                try:
+                    _ft.append(os.path.getmtime(_t))
+                except OSError:
+                    pass
+        print(f"  {_name}: {_d}  (该 root 下被扫文件 {len(_ft)} 个，最新 mtime "
+              f"{_fmt(max(_ft)) if _ft else 'N/A'})")
+
     all_findings = []
     for p in targets:
         all_findings.extend(check_file(p))
+
+    # ⛔ 第6轮 #9：白名单里出现过**不存在的名字**（`_BND_PIN`）、重复项、类别错。
+    #    改为：每个白名单名字必须在被扫文件的源码里**出现过**，否则报错（退出码 3）。
+    import re as _re
+    _all_src = []
+    for p in targets:
+        try:
+            _all_src.append(open(p, encoding="utf-8", errors="replace").read())
+        except OSError:
+            pass
+    _blob = "\n".join(_all_src)
+    # ⚠️ 逐名判断（用集合会很脆弱：`X = {}` 与 `X: T = {}` 混在一起时容易漏）
+    def _has_def(n: str) -> bool:
+        return _re.search(rf"^\s*{_re.escape(n)}\s*(?::|=)", _blob, _re.M) is not None
+    _missing = [] if a.no_whitelist_check else [
+        n for n in list(KNOWN_BOUNDED) + list(KNOWN_BOUNDED_CONSTEXPR) if not _has_def(n)]
+    if _missing:
+        print(f"❌ 白名单里有 {len(_missing)} 个名字在被扫文件中找不到定义：")
+        for n in _missing:
+            print(f"   {n}")
+        return 3
 
     if not all_findings:
         print("✅ 未发现违规")

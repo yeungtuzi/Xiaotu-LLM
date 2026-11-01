@@ -1,0 +1,34 @@
+# 审计范围：本项目自有的手写内核文件（vLLM 树相对路径 + 插件路径）
+vllm/model_executor/layers/quantization/utils/fp8_utils.py
+vllm/model_executor/layers/sparse_attn_indexer.py
+vllm/model_executor/layers/mla.py
+vllm/models/deepseek_v41/attention.py
+vllm/models/deepseek_v41/common/engram.py
+vllm/models/deepseek_v41/common/ops/cache_utils.py
+vllm/models/deepseek_v41/common/ops/fused_compress_quant_cache.py
+vllm/models/deepseek_v41/common/ops/indexer_k_store.py
+vllm/models/deepseek_v4/attention.py
+vllm/models/deepseek_v4/common/ops/cache_utils.py
+vllm/models/deepseek_v4/common/ops/fused_compress_quant_cache.py
+vllm/models/deepseek_v4/common/ops/fused_indexer_q.py
+vllm/models/deepseek_v4/common/ops/fused_inv_rope_fp8_quant.py
+vllm/models/deepseek_v4/nvidia/ops/fp8_einsum.py
+vllm/models/deepseek_v4/nvidia/ops/sm12x_mqa.py
+vllm/models/deepseek_v4/sparse_mla.py
+vllm/models/glm5next/nvidia/ops/kpool_compress.py
+vllm/v1/attention/backends/mla/indexer.py
+vllm/v1/attention/backends/mla/sparse_mla_kernels.py
+vllm/v1/attention/backends/mla/sparse_swa.py
+vllm/v1/attention/backends/mla/flashmla_sparse.py
+vllm/v1/attention/backends/mla/flashmla_sparse_sm8x.py
+vllm/models/deepseek_v4/common/ops/sparse_mla_env.py
+vllm/models/deepseek_v4/nvidia/ops/sm12x_deep_gemm_fallbacks.py
+# ── 插件 ──
+plugin:vllm_xiaotu_moe/expert_pool.py
+plugin:vllm_xiaotu_moe/gpu_prefill.py
+plugin:vllm_xiaotu_moe/gpu_prefill_fp8.py
+plugin:vllm_xiaotu_moe/mainline_shims.py
+plugin:vllm_xiaotu_moe/pin_mask_triton.py
+plugin:vllm_xiaotu_moe/decode_moe_fp8.py
+plugin:vllm_xiaotu_moe/sidecar_gpu0.py
+plugin:vllm_xiaotu_moe/mixed_experts.py

@@ -124,28 +124,32 @@ def main() -> int:
     for lp, rp in allpairs:
         lm = hashlib.md5(open(lp, "rb").read()).hexdigest()
         rm = remote.get(rp)
+        # ⛔ 第13轮：旧版只存 basename，推送时再按 basename 反查 ⇒
+        #    全树 517 个 .py 有重名（`__init__.py` ×621）⇒ 推的是"第一个同名文件"，
+        #    真正不一致的那个永远不推，还把计数报成成功。
         if rm is None:
-            mismatch.append((os.path.basename(lp), lm[:8], "MISSING"))
+            mismatch.append((os.path.basename(lp), lm[:8], "MISSING", lp, rp))
         elif rm != lm:
-            mismatch.append((os.path.basename(lp), lm[:8], rm[:8]))
+            mismatch.append((os.path.basename(lp), lm[:8], rm[:8], lp, rp))
 
     # ⛔ 第12轮：旧 `--deploy` 是**先推后验** ⇒ 会把本地旧文件覆盖远端补丁
     #    （第11轮根因的反向重演）。现在：**先比对，只推不一致项**；
     #    若远端该文件比本地**新**（mtime 更晚）⇒ 默认**拒绝推送**（除非 --force）。
     if a.deploy and mismatch:
         pushed = refused = 0
-        for name, lm, rm in mismatch:
-            lp = next((x for x, y in allpairs if os.path.basename(x) == name), None)
-            rp = next((y for x, y in allpairs if os.path.basename(x) == name), None)
-            if lp is None or rp is None:
-                continue
+        for name, lm, rm, lp, rp in mismatch:
             if not a.force:
                 try:
                     rmt = subprocess.run(
                         SSH + [f'stat -c %Y "{rp}"'], capture_output=True, text=True, timeout=30)
-                    rtime = int(rmt.stdout.strip() or 0)
-                except Exception:  # noqa: BLE001
-                    rtime = 0
+                    if rmt.returncode != 0 or not rmt.stdout.strip():
+                        raise RuntimeError(rmt.stderr.strip()[:80] or "stat 无输出")
+                    rtime = int(rmt.stdout.strip())
+                except Exception as _e:  # noqa: BLE001
+                    # ⛔ 第13轮：异常时旧版 rtime=0 ⇒ 恒放行（fail-open）。改为拒绝。
+                    print(f"⛔ 拒绝推送 {name}：无法取远端 mtime（{_e}）⇒ fail-closed")
+                    refused += 1
+                    continue
                 if rtime > os.path.getmtime(lp):
                     print(f"⛔ 拒绝推送 {name}：远端更新（远端 mtime {rtime} > 本地 "
                           f"{int(os.path.getmtime(lp))}）⇒ 用 --force 才覆盖")
@@ -161,33 +165,39 @@ def main() -> int:
         if pushed:
             return main_verify_only(pairs, whole_pairs)
 
-    if mismatch:
-        print(f"❌ 本地镜像与远端部署树**不一致**：{len(mismatch)}/{len(allpairs)}")
-        for name, lm, rm in mismatch[:15]:
-            print(f"   {name}: 本地={lm} 远端={rm}")
-        print("\n⇒ 任何门禁结论在被审对象上**不可信**。先跑 --deploy 再重跑门禁。")
-        return 1
-
+    _remote_only_reported = False
     # ⛔ 第12轮：旧版只枚举**本地**文件 ⇒ 远端独有文件永远看不见。
-    remote_set = set()
+    # ⛔ 第13轮：该检测曾被 `if mismatch: return 1` 早退挡在前面 ⇒ 只要有任何不一致就永不报告；
+    #    且 `find` 返回码未检查 ⇒ 失败即 rset 空 ⇒ 静默"✅ 一致"。
+    remote_only = []
     for _local, _remote, _full in ROOTS:
         r = subprocess.run(SSH + [f'find "{_remote}" -name "*.py" -printf "%P\\n"'],
                            capture_output=True, text=True, timeout=60)
+        if r.returncode != 0:
+            print(f"❌ 无法枚举远端 {_remote}（find 返回 {r.returncode}）：{r.stderr.strip()[:100]}")
+            return 2
         rset = {x.strip() for x in r.stdout.splitlines() if x.strip()}
         lset = set()
         for dirpath, _d, files in os.walk(_local):
             for fn in files:
                 if fn.endswith(".py"):
                     lset.add(os.path.relpath(os.path.join(dirpath, fn), _local))
-        only_remote = rset - lset
-        if only_remote:
-            print(f"⚠️ 远端独有（本地没有，可能是在远端直接改的）：{len(only_remote)} 个，示例：")
-            for x in sorted(only_remote)[:5]:
-                print(f"   {_remote}/{x}")
-        remote_set |= only_remote
+        for x in sorted(rset - lset):
+            remote_only.append(os.path.join(_remote, x))
 
-    if remote_set:
+    if remote_only:
+        print(f"⚠️ 远端独有（本地没有，可能是在远端直接改的）：{len(remote_only)} 个，示例：")
+        for x in remote_only[:5]:
+            print(f"   {x}")
+
+    if mismatch:
+        print(f"❌ 本地镜像与远端部署树**不一致**：{len(mismatch)}/{len(allpairs)}")
+        for name, lm, rm, _lp, _rp in mismatch[:15]:
+            print(f"   {name}: 本地={lm} 远端={rm}")
+        print("\n⇒ 任何门禁结论在被审对象上**不可信**。先跑 --deploy 再重跑门禁。")
         return 1
+
+
 
     print(f"✅ 一致：{len(allpairs)}/{len(allpairs)} 文件 md5 相同"
           f"（scope {len(pairs)} + 全树其余 {len(whole_pairs)}）")

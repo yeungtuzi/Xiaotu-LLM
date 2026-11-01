@@ -186,6 +186,9 @@ def _check_call_sites(tree, fname: str, pnames: list, target_param: str) -> bool
         if _callee != fname:
             continue
         expr = None
+        # ⚠️ 已知缺口：`**kwargs` 展开无法静态绑定到具体形参。
+        #    试过"一刀切 return True"，但实测导致 68 条误报（大量启动器都用 `**opts`）
+        #    ⇒ 撤回，记为已知缺口（见 dev-docs/AUDIT_R5_FINDINGS.md 第13轮）。
         # 关键字优先
         for kw in c.keywords:
             if kw.arg == target_param:
@@ -515,7 +518,11 @@ def check_file(path: str):
                                     owner = anc
                     scope_src = _slice_of(owner) if owner else ""
                     _nm = t.value.id
-                    _lab = bool(re.search(rf"alloc-audit:\s*bounded[^\n]*\b{re.escape(_nm)}\b", scope_src))
+                    # ⛔ 第13轮：这条路径（下标赋值/AugAssign）**漏了行首锚定** ⇒
+                    #    注释里写"这里绝不能写 alloc-audit: bounded _CACHE"即免检（实证 bug）。
+                    _lab = bool(re.search(
+                        rf"^\s*#\s*alloc-audit:\s*bounded[^\n]*\b{re.escape(_nm)}\b",
+                        scope_src, re.M))
                     labeled = _lab or (_nm in KNOWN_BOUNDED)
                     if not labeled:
                         out.append((path, node.lineno, "C1",
@@ -531,6 +538,23 @@ def check_file(path: str):
     for node in ast.walk(tree):
         if not isinstance(node, ast.FunctionDef):
             continue
+        # ⛔ 第13轮：别名必须在**收集 launches 之前**展开，否则 `bt = block_table` 的启动
+        #    根本进不了 launches（argtxt 里没有 ADDR_ARGS 名字）。
+        _host_aliases = {}
+        for _n in ast.walk(node):
+            if isinstance(_n, ast.Assign) and len(_n.targets) == 1 and \
+                    isinstance(_n.targets[0], ast.Name) and isinstance(_n.value, ast.Name):
+                _host_aliases[_n.targets[0].id] = _n.value.id
+
+        def _alias_hit(txt):
+            for _a in ADDR_ARGS:
+                if re.search(rf"\b{re.escape(_a)}\b", txt):
+                    return _a
+            for _tgt, _src in _host_aliases.items():
+                if _src in ADDR_ARGS and re.search(rf"\b{re.escape(_tgt)}\b", txt):
+                    return _src
+            return None
+
         launches = []
         for c in ast.walk(node):
             if not isinstance(c, ast.Call):
@@ -552,9 +576,15 @@ def check_file(path: str):
             _is_launch = isinstance(f, ast.Subscript) or fname.endswith("_kernel") or "kernel" in fname
             if not _is_launch:
                 continue
-            argtxt = " ".join(ast.unparse(a) for a in c.args) + " " + " ".join(
-                f"{k.arg}={ast.unparse(k.value)}" for k in c.keywords if k.arg)
-            if any(re.search(rf"\b{a}\b", argtxt) for a in ADDR_ARGS):
+            # ⛔ 第13轮：`**kw` 的 `kw.arg is None` 曾被过滤 ⇒ kwargs 展开失明。
+            #    保留 `**kw` 的原文，并把 kw 变量的定义式一并拼进来（近似数据流）。
+            _kwtxt = " ".join(f"{k.arg}={ast.unparse(k.value)}" if k.arg else f"**{ast.unparse(k.value)}"
+                              for k in c.keywords)
+            for _k in c.keywords:
+                if _k.arg is None and isinstance(_k.value, ast.Name):
+                    _kwtxt += " " + ast.unparse(node)
+            argtxt = " ".join(ast.unparse(a) for a in c.args) + " " + _kwtxt
+            if _alias_hit(argtxt) is not None:
                 # ⚠️ 必须把**内核名**也放进去：否则"找内核体核验界是否被真用"永远找不到内核
                 #    （第11轮 N4 加固时就栽在这：argtxt 只有参数，没有 fname）
                 launches.append((c.lineno, fname + "[" + argtxt))
@@ -592,8 +622,8 @@ def check_file(path: str):
         n_assert = len(_basserts)
         # ⛔ 第10轮 N9：旧判据 `n_assert >= 1` ⇒ 一条 slot 断言把同一次启动里的**块表**也担保了
         #    （sink 函数就是活例）。改为：内核实参里出现的**每种** ADDR_ARG 都需要被某条断言引用。
-        _addrs_passed = {a for _l, _t in launches for a in ADDR_ARGS
-                         if re.search(rf"\b{re.escape(a)}\b", _t)}
+        _addrs_passed = {a for _l, _t in launches
+                         if (a := _alias_hit(_t)) is not None}
         _addrs_covered = {a for x in _basserts for a in ADDR_ARGS
                           if re.search(rf"\b{re.escape(a)}\b", ast.unparse(x.test))}
         # 委派：宿主把 `num_table_rows=block_table.shape[0]` 这类界传给内核 ⇒ 该实参算已覆盖

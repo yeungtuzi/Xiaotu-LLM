@@ -135,7 +135,6 @@ def host(slot_ids, block_table, cap):
 """, "C4"),
 
 
-    # ── 第12轮新增机制的反向样本（此前 0 覆盖）────────────────────
     # 白标必须给「内核体内的、引用该实参的」钳位证据；无关 `if pid < n:` 不算
     "C4_whitelabel_unrelated_clamp": ("""
 import triton, triton.language as tl
@@ -161,7 +160,6 @@ def host(block_table, n):
 """, "C4"),
 
 
-    # 第12轮最大盲区：内核定义在 a.py、宿主在 b.py ⇒ 跨文件发射
     "C2_cross_file": {
         "files": {
             "kern.py": """
@@ -178,6 +176,26 @@ def run(slot_ids, x):
         },
         "expect": "C2",
     },
+
+
+    # ── 第13轮：审计实测的残余绕过（此前 0 覆盖）──────────────────
+    # C1 下标路径的白标自消音（审计实证 bug）
+    "C1_label_selfsilence": ("""
+_CACHE: dict = {}
+def f(k):
+    # 这里绝不能写 alloc-audit: bounded _CACHE
+    _CACHE[k] = 1
+""", "C1"),
+
+    # C4 实参别名：`bt = block_table` 后再传
+    "C4_arg_alias": ("""
+def host(block_table):
+    bt = block_table
+    _kernel[(1,)](bt)
+""", "C4"),
+
+    # ⚠️ 已知缺口（不放入样本，避免误报"通过"）：`**kwargs` 展开无法静态绑定形参。
+    #    试过一刀切判据，但实测导致 68 条误报（大量启动器用 `**opts`）⇒ 撤回。
 
     # ── 合法样本：必须零告警（防判据收紧后变误报机器）─────────────
     "OK_clean": ("""
@@ -217,10 +235,6 @@ BUGGY_SHAPES = [
     (r'[<>]=?\s*\d+\s*$', "字面量上界被判恒真（反向误报）"),
     # 第10轮 N2：只取位置形参
     ("_pnames = [x.arg for x in node.args.args]\n", "只取位置形参（keyword-only 盲区）"),
-    # 第12轮：白标证据行必须引用被保护实参
-    # 第12轮：页跨距证据必须同时含名字
-    # 第12轮：委派必须只看函数体（不含签名）
-    # 第12轮：白标不能是纯子串（必须行首锚定）
 ]
 
 KERNEL_ANTI_PATTERNS = [
@@ -234,7 +248,7 @@ REQUIRED_SHAPES = [
     ("_refs_addr = any(", "白标证据行必须引用被保护实参"),
     ('.stride(0)" in _txt and', "页跨距证据必须同时含名字"),
     ("for x in _kfn.body", "委派判据只看函数体语句（不含签名）"),
-    ("alloc-audit", "白标机制仍存在（行首锚定）"),
+    (r"^\s*#\s*alloc-audit:", "白标机制仍存在（行首锚定）"),
     ("_is_launch = isinstance(f, ast.Subscript)", "内核启动按**下标形态**识别（不靠名字含 kernel）"),
     ("^\\s*#\\s*alloc-audit:\\s*init-time", "C3 init-time 白标必须行首锚定"),
     ("^\\s*#\\s*alloc-audit:\\s*bounded", "C1 bounded 白标必须行首锚定"),

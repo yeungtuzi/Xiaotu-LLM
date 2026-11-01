@@ -20,13 +20,14 @@
 #   THREADS=60 IMAGE_MAX=128 COMPILE_RANGES=32,256,8192
 #   PIN=1 PIN_SLOTS=15 PIN_MAXQ=16 CED=1 WARMUP=1 KV_DTYPE=fp8_ds_mla
 #   SPEC=1 MODEL_DIR=<路径>
-#   EXPANDABLE=0   1=开 expandable_segments（治碎片），**自动同时** NO_CUSTOM_AR=1
+#   EXPANDABLE=0   1=expandable_segments:True + 追加 --disable-custom-all-reduce；
+#                  0=显式 expandable_segments:False（自定义 allreduce 保持开启）
 #
 # +额外参数：只允许**白名单之外**的 `--flag` / `--flag=值`；
 #   会覆盖本脚本保证口径的旗标（--port/--compilation-config/--no-swa-bounded-replay…）一律拒绝。
 #
 # 退出码：0 成功 / 2 参数错误 / 3 前置条件不满足（端口、锁、内存门、归属冲突）
-#         4 启动失败 / 5 就绪超时
+#         4 启动失败 / 5 就绪超时 / 6 前缀缓存断言失败
 # ═══════════════════════════════════════════════════════════════════════════════
 set -uo pipefail
 
@@ -117,12 +118,16 @@ pid_alive() {   # 僵尸/死亡不算活
     [ "$st" != "Z" ] && [ "$st" != "X" ]
 }
 
-verify_owns() {   # pid 必须确实是本实例（端口归属 或 cmdline 的 --port）
+verify_owns() {   # pid 必须确实是本实例：端口归属，或【本入口那条命令行】且 --port 匹配
     local p="${1:-}" ps
     pid_alive "$p" || return 1
     ps="$(port_state "$PORT")"
     [ "$ps" = "owned:$p" ] && return 0
-    tr '\0' '\n' < "/proc/$p/cmdline" 2>/dev/null | grep -qx -- "$PORT"
+    # ⛔ 兜底不能只看"argv 里有 8700"：`sleep 8700` 这种会被误判成本实例（审计实测）
+    tr '\0' '\n' < "/proc/$p/cmdline" 2>/dev/null \
+        | grep -qx -- "vllm.entrypoints.openai.api_server" || return 1
+    tr '\0' '\n' < "/proc/$p/cmdline" 2>/dev/null \
+        | awk -v p="$PORT" 'prev=="--port" && $0==p {f=1} {prev=$0} END{exit !f}'
 }
 
 is_uint() { case "${1:-}" in ''|*[!0-9]*) return 1 ;; esac; }
@@ -139,6 +144,9 @@ validate() {
     [ "$THREADS" -ge 12 ] && [ "$THREADS" -le 192 ] || die "THREADS=$THREADS 超出 12..192"
     is_uint "$PIN_SLOTS" && is_uint "$PIN_MAXQ" && is_uint "$IMAGE_MAX" \
         || die "PIN_SLOTS/PIN_MAXQ/IMAGE_MAX 必须是非负整数"
+    [ "$IMAGE_MAX" -le 128 ] || die "IMAGE_MAX 上限 128（得到 '$IMAGE_MAX'）"
+    [ "$PIN_SLOTS" -le 64 ] || die "PIN_SLOTS 上限 64（得到 '$PIN_SLOTS'）"
+    [ "$PIN_MAXQ" -le 256 ] || die "PIN_MAXQ 上限 256（得到 '$PIN_MAXQ'）"
     awk -v u="$GPU_UTIL" 'BEGIN{exit !(u+0>0.05 && u+0<=1.0)}' || die "GPU_UTIL 必须在 (0.05,1.0]（得到 '$GPU_UTIL'）"
     case "$CED" in 0|1) ;; *) die "CED 只能是 0/1" ;; esac
     case "$PIN" in 0|1) ;; *) die "PIN 只能是 0/1" ;; esac
@@ -198,13 +206,19 @@ validate() {
                   --kv-offloading-size --kv-offloading-backend \
                   --prefix-caching-hash-algo --enable-prefix-caching \
                   --no-enable-prefix-caching --swa-bounded-replay \
-                  --no-swa-bounded-replay; do
+                  --no-swa-bounded-replay \
+                  --disable-custom-all-reduce --enable-custom-all-reduce \
+                  --no-enable-custom-all-reduce; do
             if [ "$_d" = "$_k" ] || [[ "$_d" == "$_k"* ]]; then
                 die "额外参数 '$_a' 命中受保护旗标 $_d（含缩写前缀），拒绝" 2
             fi
         done
         if [[ "$_k" =~ $deny ]]; then
             die "额外参数 '$_k' 会覆盖本脚本保证的口径/安全参数，拒绝（要改请改本脚本白名单）" 2
+        fi
+        # ⛔ 族级硬门：EXPANDABLE=1 时 VMM 与 IPC 句柄互斥，任何 custom all-reduce 变体都不得混进来
+        if [ "$EXPANDABLE" = "1" ] && [[ "$_k" =~ custom.*all-?reduce ]]; then
+            die "EXPANDABLE=1 时禁止任何 custom-all-reduce 额外参数（VMM 不能导出 IPC 句柄）：'$_a'" 2
         fi
     done
 }
@@ -315,7 +329,7 @@ start() {
         say "compile_ranges=空（本次不传端点；这是非生产口径，报告中必须注明）"
     fi
     if [ "$EXPANDABLE" = "1" ]; then
-        say "EXPANDABLE=1：expandable_segments:True + NO_CUSTOM_AR=1（custom allreduce 退回 NCCL，用于治碎片）"
+        say "EXPANDABLE=1：expandable_segments:True + --disable-custom-all-reduce（custom AR 退回 NCCL，用于治碎片）"
     else
         say "EXPANDABLE=0：expandable_segments:False（历史设置；碎片靠其它手段）"
     fi
@@ -353,10 +367,19 @@ start() {
         #   ⇒ custom_all_reduce 会在 KV profiling 阶段报 invalid argument、Worker 被杀
         #   （2026-10-27 两次实测）。所以 EXPANDABLE=1 时**必须同时**关掉它。
         if [ "$EXPANDABLE" = "1" ]; then
-            export PYTORCH_CUDA_ALLOC_CONF=expandable_segments:True
-            export NO_CUSTOM_AR=1
+            case "${PYTORCH_CUDA_ALLOC_CONF:-}" in
+                *expandable_segments:False*)
+                    echo "[ds41] ⛔ 环境把 expandable_segments 设为 False，与 EXPANDABLE=1 冲突" >&2
+                    exit 2 ;;
+            esac
+            export PYTORCH_CUDA_ALLOC_CONF="${PYTORCH_CUDA_ALLOC_CONF:-expandable_segments:True}"
         else
-            export PYTORCH_CUDA_ALLOC_CONF=expandable_segments:False
+            case "${PYTORCH_CUDA_ALLOC_CONF:-}" in
+                *expandable_segments:True*)
+                    echo "[ds41] ⛔ 环境把 expandable_segments 设为 True，但 EXPANDABLE=0；要开请显式传 EXPANDABLE=1" >&2
+                    exit 2 ;;
+            esac
+            export PYTORCH_CUDA_ALLOC_CONF="${PYTORCH_CUDA_ALLOC_CONF:-expandable_segments:False}"
         fi
         export VLLM_USE_SIMPLE_KV_OFFLOAD=0   # 防父环境漏入 ⇒ SimpleCPUOffloadConnector 会让 fs 层静默消失
         # ⛔ 生产 env 必须复刻：缺 VLLM_EXPERTS_LOAD_DEVICE=cpu 时缺省为 gpu ⇒ 476GB 专家上卡必 OOM
@@ -372,7 +395,7 @@ start() {
         export XIAOTU_MOE_SPIN_IDLE_US="${XIAOTU_MOE_SPIN_IDLE_US:-300}"
         export XIAOTU_GPF_STAGE_TILE_E="${XIAOTU_GPF_STAGE_TILE_E:-48}"
         export XIAOTU_MOE_MBT="$MBT"   # 必须跟随 --max-num-batched-tokens，否则 staging 预分配错配
-        export PYTORCH_CUDA_ALLOC_CONF="${PYTORCH_CUDA_ALLOC_CONF:-expandable_segments:False}"
+        exec 9>&-      # 别把锁 fd 继承给服务（否则服务在跑时 start 会误报"已有 start/stop"）
         exec setsid "${ARGS[@]}"
     ) >> "$LOG_FILE" 2>&1 < /dev/null &
     local lp=$! pid="" i
@@ -433,6 +456,11 @@ start() {
     if [ "$CED" = "1" ] && grep -aq "SWA bounded replay needs model runner V2" "$LOG_FILE"; then
         die "CED=1 但日志显示 CED 未生效（needs model runner V2）" 4
     fi
+    if [ "$EXPANDABLE" = "1" ] && tr '\0' '\n' < "/proc/$pid/cmdline" 2>/dev/null \
+            | grep -qE 'enable-custom-all-reduce'; then
+        die "EXPANDABLE=1 但生效命令行里出现 enable-custom-all-reduce ⇒ 绑定被破坏" 4
+    fi
+    { echo "[ds41] [口径] EXPANDABLE=$EXPANDABLE PYTORCH_CUDA_ALLOC_CONF=${PYTORCH_CUDA_ALLOC_CONF:-unset} custom-AR=$([ "$EXPANDABLE" = "1" ] && echo off || echo on)"; } >> "$LOG_FILE"
     say "显存: $(nvidia-smi --query-gpu=index,memory.used --format=csv,noheader | tr '\n' ' ')"
 
     if [ "$WARMUP" = "1" ]; then
@@ -442,7 +470,7 @@ start() {
                 >> "$RUN_DIR/ds41_${TAG}_warmup.log" 2>&1 < /dev/null & )
             say "预热在后台跑，日志 $RUN_DIR/ds41_${TAG}_warmup.log"
         else
-            say "⚠️ WARMUP=1 但 $WARMUP_SCRIPT 不存在 ⇒ 预热未执行（口径缺失，需记录）"
+            die "WARMUP=1 但 $WARMUP_SCRIPT 不存在 ⇒ 拒绝以「已预热」口径继续（改 WARMUP=0 或补脚本）" 3
         fi
     fi
 }
@@ -510,7 +538,7 @@ status() {
     say "GPU: $(nvidia-smi --query-gpu=index,memory.used --format=csv,noheader | tr '\n' ' ')"
     say "实际口径:"
     tr '\0' '\n' < "/proc/$pid/environ" 2>/dev/null \
-        | grep -E '^(XIAOTU_MOE_THREADS|XIAOTU_PIN|XIAOTU_PIN_MAXQ|GPU_UTIL|MAXSEQS|COMPILE_RANGES)=' \
+        | grep -E '^(XIAOTU_MOE_THREADS|XIAOTU_PIN|XIAOTU_PIN_MAXQ|GPU_UTIL|MAXSEQS|COMPILE_RANGES|PYTORCH_CUDA_ALLOC_CONF|EXPANDABLE)=' \
         | sed 's/^/    /'
     cc="$(eff_compilation_config "$pid")"
     say "    [生效] --compilation-config $cc"

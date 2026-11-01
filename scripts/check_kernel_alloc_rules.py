@@ -603,6 +603,32 @@ def main():
         return _re.search(rf"^\s*{_re.escape(n)}\s*(?::|=)", _blob, _re.M) is not None
     _missing = [] if a.no_whitelist_check else [
         n for n in list(KNOWN_BOUNDED) + list(KNOWN_BOUNDED_CONSTEXPR) if not _has_def(n)]
+    # ⛔ 第39轮教训：白名单有**两个字典**（容器 vs constexpr 形参），放错等于没放，
+    #    而门禁不会提示。这里做机械校验：容器名必须能作为模块级容器找到，
+    #    constexpr 名必须能作为**某个函数的形参**找到。
+    _param_names, _assigned = set(), set()
+    for _p in targets:
+        try:
+            _t = ast.parse(open(_p, encoding="utf-8", errors="replace").read())
+        except SyntaxError:
+            continue
+        for _n in ast.walk(_t):
+            if isinstance(_n, (ast.FunctionDef, ast.AsyncFunctionDef)):
+                _param_names |= {a.arg for a in _n.args.args} | {a.arg for a in _n.args.kwonlyargs}
+            elif isinstance(_n, ast.Assign):
+                _assigned |= {t.id for t in _n.targets if isinstance(t, ast.Name)}
+            elif isinstance(_n, ast.AnnAssign) and isinstance(_n.target, ast.Name):
+                _assigned.add(_n.target.id)
+    _wrong_ctor = [n for n in KNOWN_BOUNDED if n not in _assigned]
+    _wrong_cx = [n for n in KNOWN_BOUNDED_CONSTEXPR if n not in _param_names]
+    if _wrong_ctor or _wrong_cx:
+        print("❌ 白名单放错了字典（容器名必须能在模块级找到；constexpr 名必须是函数形参）：")
+        for n in _wrong_ctor:
+            print(f"   {n}: 在 KNOWN_BOUNDED 里，但找不到模块级赋值")
+        for n in _wrong_cx:
+            print(f"   {n}: 在 KNOWN_BOUNDED_CONSTEXPR 里，但不是任何函数的形参")
+        return 3
+
     if _missing:
         print(f"❌ 白名单里有 {len(_missing)} 个名字在被扫文件中找不到定义：")
         for n in _missing:

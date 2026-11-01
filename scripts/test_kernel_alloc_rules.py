@@ -11,47 +11,74 @@ HERE = os.path.dirname(os.path.abspath(__file__))
 GATE = os.path.join(HERE, "check_kernel_alloc_rules.py")
 
 # 每份样本都应当触发**恰好**对应的类别
+# ⚠️ 已知缺口（不放入样本，避免误报"通过"）：
+#    C3 不做可达性分析 ⇒ 同函数内 if/else 不可达分支里的 synchronize
+#    仍会给 empty_cache 背书（第7轮审计实测）。修它需要控制流可达性分析。
 SAMPLES = {
-    "C2_expr": ('''
+    "C2_expr": ("""
 import triton, triton.language as tl
 @triton.jit
 def bad_kernel(x_ptr, seq_len_kv: tl.constexpr):
     tl.store(x_ptr, seq_len_kv)
-''', "C2"),
+""", "C2"),
 
-    "C1_expr": ('''
+    "C1_expr": ("""
 _SHAPES: dict = {}
 def record(n):
     _SHAPES[n] = 1
-''', "C1"),
+""", "C1"),
 
-    "C3_expr": ('''
+    "C3_expr": ("""
 import torch
 def f():
     torch.cuda.empty_cache()
-''', "C3"),
+""", "C3"),
 
-    "C4_expr": ('''
-import torch
+    "C4_expr": ("""
 def host(out, block_table):
     assert out.shape[0] > 0
     _kernel[(1,)](out, block_table)
-''', "C4"),
+""", "C4"),
 
-    # 合法样本：应当**零告警**
-    "OK_expr": ('''
-import torch, triton, triton.language as tl
+    "C2_positional": ("""
+import triton, triton.language as tl
+@triton.jit
+def k2(x_ptr, stride_q_t: tl.constexpr):
+    tl.store(x_ptr, stride_q_t)
+def host(q, x):
+    k2[(1,)](x, q.stride(0))
+""", "C2"),
 
+    "C2_dns_on_constexpr": ("""
+import triton, triton.language as tl
 @triton.jit(do_not_specialize=["seq_len_kv"])
-def good_kernel(x_ptr, seq_len_kv: tl.constexpr):
+def k3(x_ptr, seq_len_kv: tl.constexpr):
     tl.store(x_ptr, seq_len_kv)
+""", "C2"),
 
-def host(out, block_table):
+    "C4_tautology": ("""
+def host(block_table, batch_size):
+    assert block_table.shape[1] >= 0
+    _kernel[(1,)](block_table)
+""", "C4"),
+
+    "C1_defaultdict": ("""
+import collections
+_X = collections.defaultdict(list)
+def f(n):
+    _X[n].append(n)
+""", "C1"),
+
+    "OK_expr": ("""
+import triton, triton.language as tl
+@triton.jit
+def good_kernel(x_ptr, n):
+    tl.store(x_ptr, n)
+def host(out, block_table, batch_size):
     assert block_table.dim() == 2
-    assert block_table.stride(1) == 1
-    assert block_table.shape[0] >= out.shape[0]
+    assert block_table.shape[0] >= batch_size
     _kernel[(1,)](out, block_table)
-''', None),
+""", None),
 }
 
 

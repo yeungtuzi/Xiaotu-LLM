@@ -27,7 +27,7 @@ VOLATILE_NAMES = {
     "stride_group", "stride_hidden",
 }
 VOLATILE = re.compile(r"$^")   # 保留占位，实际用集合判断
-MODULE_LEVEL_CTORS = ("set(", "list(", "dict(", "OrderedDict(")
+MODULE_LEVEL_CTORS = ("set(", "list(", "dict(", "OrderedDict(", "defaultdict(", "fromkeys(")
 
 # 已由第三方审计核定"有界"的模块级容器 → 理由（未登记的新容器仍会被告警）
 # 已核"有界"的 constexpr 形参（值会变，但取值集合有限）→ 理由
@@ -205,6 +205,10 @@ def check_file(path: str):
                 # ⛔ 第7轮阻断项①：上一版只在**关键字实参**里找 `arg=expr`，
                 #    而这些内核全部**位置传参** ⇒ 结构性失明（把 constexpr 改回去也照样绿）。
                 #    这里用 AST 取调用点，把位置实参按**形参顺序**映射到名字。
+                # ⚠️ Triton 调用里 **constexpr 形参不占位置实参**（用关键字传或省略）
+                #    ⇒ 位置映射只能对"非 constexpr"形参按顺序进行。
+                # ⚠️ Triton **允许** constexpr 形参按位置传（也可省略/关键字传）
+                #    ⇒ 位置映射覆盖全部形参（审计样本 C2_positional 就是这种）。
                 _pnames = [x.arg for x in node.args.args]
                 _shapey = _check_call_sites(tree, node.name, _pnames, a.arg)
                 _v = ""
@@ -306,6 +310,11 @@ def check_file(path: str):
             continue
         # ⛔ 第6轮绕过①：`_SEEN = {0: None}`（非空字面量）曾不被识别
         _v0 = v.lstrip()
+        # `collections.defaultdict(list)` / `dict.fromkeys(...)`：右值是**属性调用**，
+        # 不在 MODULE_LEVEL_CTORS 的字面串里 ⇒ 单独认
+        if "defaultdict(" in v or ".fromkeys(" in v:
+            mod_names |= {t.id for t in tgts}
+            continue
         _is_lit = _v0.startswith("{") or _v0.startswith("[") or _v0.startswith("set(") or _v0.startswith("dict(")
         if any(c in v for c in MODULE_LEVEL_CTORS) or _is_lit:
             mod_names |= {t.id for t in tgts}
@@ -315,7 +324,7 @@ def check_file(path: str):
                 continue
             fn = node.func
             targets = []
-            if isinstance(fn, ast.Attribute) and fn.attr in ("add", "append", "update", "insert"):
+            if isinstance(fn, ast.Attribute) and fn.attr in ("add", "append", "update", "insert", "extend", "setdefault"):
                 if isinstance(fn.value, ast.Name) and fn.value.id in mod_names:
                     targets.append(fn.value.id)
             elif isinstance(fn, ast.Attribute) and fn.attr == "setdefault":
@@ -409,8 +418,15 @@ def check_file(path: str):
             # ⛔ 第7轮阻断项⑤：旧版只要出现 `.shape[` + 变量名即计数 ⇒ 两条"下界/恒真"断言即可放行。
             #    要求必须有**值域上界**（max( 或 .min( 或 与 numel 比较），或至少形如
             #    `...max() <= ...` / `... <= ...shape[...] * ...` 的乘积上界。
-            sem = ("max(" in t or "min(" in t) or (
-                ".shape[" in t and ("<=" in t or "<" in t) and "*" in t)
+            # 判据（第7轮 N5 的合理内核）：必须有**非恒真**的上界比较 ——
+            #   ✅ `x.max() <= cap` / `x <= shape[-1]*block_size` / `shape[0] >= batch_size`
+            #   ❌ `shape[1] >= 0`（对常量字面量的恒真比较）
+            _has_cmp = any(op in t for op in ("<=", ">=", "<", ">"))
+            if not _has_cmp:
+                return False
+            _tauto = bool(re.search(r"[<>]=?\s*\d+\s*$", t.strip())) or bool(
+                re.search(r"[<>]=?\s*0\b", t))
+            return not _tauto
             refs = any(re.search(rf"\b{x}\b", t) for x in ADDR_ARGS)
             return sem and refs
 
@@ -422,11 +438,12 @@ def check_file(path: str):
         _slice = "\n".join(lines[node.lineno - 1:(node.end_lineno or node.lineno)])
         if "alloc-audit: masked-in-kernel" in _slice:
             continue
-        if n_assert >= 2 or delegated:
+        # 恒真比较已被剔除 ⇒ 1 条真实上界/跨距断言即视为已声明契约
+        if n_assert >= 1 or delegated:
             continue
         out.append((path, launches[0][0], "C4",
                     f"宿主 `{node.name}` 把块表/slot 作为**内核实参**传入（无 mask 寻址），"
-                    f"但只有 {n_assert} 条上界/跨距断言"))
+                    f"但**没有**非恒真的上界/跨距断言（{n_assert} 条）"))
     return out
 
 

@@ -58,9 +58,15 @@ def _resolve(rel: str):
     return None, None
 
 
+def main_verify_only(pairs, whole_pairs) -> int:
+    """推送后**再校验一次**（避免"推完不验"）：重新执行本脚本但**不带 --deploy**。"""
+    return subprocess.run([sys.executable, os.path.abspath(__file__)]).returncode
+
+
 def main() -> int:
     ap = argparse.ArgumentParser()
-    ap.add_argument("--deploy", action="store_true", help="先推送再校验")
+    ap.add_argument("--deploy", action="store_true", help="先校验，再推送**不一致**的文件")
+    ap.add_argument("--force", action="store_true", help="允许用本地覆盖更旧的远端文件")
     a = ap.parse_args()
 
     pairs = []
@@ -94,22 +100,6 @@ def main() -> int:
                 whole.append((lp, rp))
     whole_pairs = [(lp, rp) for lp, rp in whole if lp not in {p[0] for p in pairs}]
 
-    # ⛔ 第11轮 N6：`--deploy` 曾只推 scope 的 32 条，而比对用 allpairs
-    #    ⇒ 插件树非 scope 的文件永远推不上去 ⇒ "先 deploy 再重跑"永远红、无法收敛。
-    _deploy_list = pairs + whole_pairs if a.deploy else []
-
-    if a.deploy:
-        bad = 0
-        for lp, rp in _deploy_list:
-            r = subprocess.run(SCP + [lp, "gpu:" + os.path.dirname(rp) + "/"],
-                               capture_output=True, text=True, timeout=60)
-            if r.returncode != 0:
-                print(f"❌ 推送失败 {os.path.basename(lp)}: {r.stderr.strip()[:100]}")
-                bad += 1
-        print(f"推送：{len(_deploy_list) - bad}/{len(_deploy_list)} 成功")
-        if bad:
-            return 1
-
     allpairs = pairs + whole_pairs
     remote = {}
     # ⛔ 命令行有长度上限 ⇒ 分批（每批 150 个）
@@ -139,11 +129,64 @@ def main() -> int:
         elif rm != lm:
             mismatch.append((os.path.basename(lp), lm[:8], rm[:8]))
 
+    # ⛔ 第12轮：旧 `--deploy` 是**先推后验** ⇒ 会把本地旧文件覆盖远端补丁
+    #    （第11轮根因的反向重演）。现在：**先比对，只推不一致项**；
+    #    若远端该文件比本地**新**（mtime 更晚）⇒ 默认**拒绝推送**（除非 --force）。
+    if a.deploy and mismatch:
+        pushed = refused = 0
+        for name, lm, rm in mismatch:
+            lp = next((x for x, y in allpairs if os.path.basename(x) == name), None)
+            rp = next((y for x, y in allpairs if os.path.basename(x) == name), None)
+            if lp is None or rp is None:
+                continue
+            if not a.force:
+                try:
+                    rmt = subprocess.run(
+                        SSH + [f'stat -c %Y "{rp}"'], capture_output=True, text=True, timeout=30)
+                    rtime = int(rmt.stdout.strip() or 0)
+                except Exception:  # noqa: BLE001
+                    rtime = 0
+                if rtime > os.path.getmtime(lp):
+                    print(f"⛔ 拒绝推送 {name}：远端更新（远端 mtime {rtime} > 本地 "
+                          f"{int(os.path.getmtime(lp))}）⇒ 用 --force 才覆盖")
+                    refused += 1
+                    continue
+            r = subprocess.run(SCP + [lp, "gpu:" + os.path.dirname(rp) + "/"],
+                               capture_output=True, text=True, timeout=60)
+            if r.returncode == 0:
+                pushed += 1
+            else:
+                print(f"❌ 推送失败 {name}: {r.stderr.strip()[:100]}")
+        print(f"推送：成功 {pushed}，拒绝 {refused}")
+        if pushed:
+            return main_verify_only(pairs, whole_pairs)
+
     if mismatch:
         print(f"❌ 本地镜像与远端部署树**不一致**：{len(mismatch)}/{len(allpairs)}")
         for name, lm, rm in mismatch[:15]:
             print(f"   {name}: 本地={lm} 远端={rm}")
         print("\n⇒ 任何门禁结论在被审对象上**不可信**。先跑 --deploy 再重跑门禁。")
+        return 1
+
+    # ⛔ 第12轮：旧版只枚举**本地**文件 ⇒ 远端独有文件永远看不见。
+    remote_set = set()
+    for _local, _remote, _full in ROOTS:
+        r = subprocess.run(SSH + [f'find "{_remote}" -name "*.py" -printf "%P\\n"'],
+                           capture_output=True, text=True, timeout=60)
+        rset = {x.strip() for x in r.stdout.splitlines() if x.strip()}
+        lset = set()
+        for dirpath, _d, files in os.walk(_local):
+            for fn in files:
+                if fn.endswith(".py"):
+                    lset.add(os.path.relpath(os.path.join(dirpath, fn), _local))
+        only_remote = rset - lset
+        if only_remote:
+            print(f"⚠️ 远端独有（本地没有，可能是在远端直接改的）：{len(only_remote)} 个，示例：")
+            for x in sorted(only_remote)[:5]:
+                print(f"   {_remote}/{x}")
+        remote_set |= only_remote
+
+    if remote_set:
         return 1
 
     print(f"✅ 一致：{len(allpairs)}/{len(allpairs)} 文件 md5 相同"

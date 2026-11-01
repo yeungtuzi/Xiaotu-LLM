@@ -220,6 +220,7 @@ REQUIRED_SHAPES = [
     ("_is_launch = isinstance(f, ast.Subscript)", "内核启动按**下标形态**识别（不靠名字含 kernel）"),
     ("^\\s*#\\s*alloc-audit:\\s*init-time", "C3 init-time 白标必须行首锚定"),
     ("^\\s*#\\s*alloc-audit:\\s*bounded", "C1 bounded 白标必须行首锚定"),
+    ("elif isinstance(_v, ast.Attribute)", "C2 支持 `mod.kernel[...]` 属性限定调用"),
 ]
 
 

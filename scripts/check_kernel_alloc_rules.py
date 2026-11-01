@@ -175,7 +175,16 @@ def _check_call_sites(tree, fname: str, pnames: list, target_param: str) -> bool
         if not isinstance(c, ast.Call):
             continue
         f = c.func
-        if not (isinstance(f, ast.Subscript) and isinstance(f.value, ast.Name) and f.value.id == fname):
+        # ⛔ 第12轮：旧判据只认 `Name[...]` ⇒ `mod.kernel[...]` 失明。
+        #    改为接受 Attribute（取最后一段名字比较）。
+        _callee = None
+        if isinstance(f, ast.Subscript):
+            _v = f.value
+            if isinstance(_v, ast.Name):
+                _callee = _v.id
+            elif isinstance(_v, ast.Attribute):
+                _callee = _v.attr
+        if _callee != fname:
             continue
         expr = None
         # 关键字优先

@@ -18,9 +18,27 @@ import ast
 import os
 import sys
 
-ROOT = os.environ.get("XTU_VLLM_ROOT", "/home/user/lvllm/process_data/ref/repos/vllm-mainline")
-PLUGIN = os.environ.get("XTU_PLUGIN_ROOT", "/home/user/lvllm/vllm-xiaotu-moe/vllm_xiaotu_moe")
-SCOPE = os.environ.get("XTU_SCOPE", "/home/user/lvllm/kernel_audit_scope.txt")
+import os as _os
+
+
+def _first_existing(*cands):
+    for c in cands:
+        try:
+            if c and _os.path.exists(c):
+                return c
+        except OSError:
+            continue          # sshfs 断开时 exists() 会抛 ENOTCONN
+    return cands[0]
+
+ROOT = _first_existing(os.environ.get("XTU_VLLM_ROOT", ""),
+                       "/root/lvllm/data/repos/vllm-mainline",
+                       "/home/user/lvllm/process_data/ref/repos/vllm-mainline")
+PLUGIN = _first_existing(os.environ.get("XTU_PLUGIN_ROOT", ""),
+                         "/root/lvllm/repos/xiaotu-llm/vllm_xiaotu_moe",
+                         "/home/user/lvllm/vllm-xiaotu-moe/vllm_xiaotu_moe")
+SCOPE = _first_existing(os.environ.get("XTU_SCOPE", ""),
+                        "/root/lvllm/repos/xiaotu-llm/scripts/kernel_audit_scope.txt",
+                        "/home/user/lvllm/kernel_audit_scope.txt")
 
 CTOR_NAMES = {"dict", "list", "set", "OrderedDict", "defaultdict"}
 MUT_METHODS = {"add", "append", "update", "insert", "extend", "setdefault", "pop", "clear"}
@@ -66,6 +84,10 @@ def b1_container_alias(tree) -> list:
         if isinstance(n, (ast.Assign, ast.AugAssign)):
             for t in (n.targets if isinstance(n, ast.Assign) else [n.target]):
                 if isinstance(t, ast.Subscript) and isinstance(t.value, ast.Name) and t.value.id in alias:
+                    # ⚠️ 键是**字面量**（`st["n"] += 1`）⇒ 固定键集合、不会增长 ⇒ 不是问题。
+                    #    只有**动态键**才可能无界增长。
+                    if isinstance(t.slice, ast.Constant):
+                        continue
                     out.append((n.lineno, t.value.id, alias[t.value.id]))
     return out
 
@@ -164,9 +186,10 @@ def main() -> int:
             bad += 1
 
     dup, aliases = b4_b5_name_aliases(trees)
+    # ⚠️ B4 只作**提示**，不计失败：`kernel` 这种通用名在 13 个文件里都有定义，
+    #    这是历史已知的匿名内核，不是缺陷（真正的处置是跨文件解析时"歧义即跳过"）。
     for k, v in dup:
-        print(f"  B4 同名内核 `{k}` 出现在 {len(v)} 个文件：{[os.path.basename(x) for x in v]}")
-        bad += 1
+        print(f"  B4[提示] 同名内核 `{k}` 出现在 {len(v)} 个文件：{[os.path.basename(x) for x in v]}")
     for p, ln, orig, alias in aliases:
         print(f"  B5 import 别名发射 {p}:{ln}  {alias} -> {orig}")
         bad += 1

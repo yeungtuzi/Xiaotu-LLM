@@ -1,7 +1,21 @@
 """一次性扫描：局部变量承载 `.stride(0)`/`.shape[0]` → 喂给 constexpr 形参。"""
 import ast, os, re, sys
 
-SCOPE_FILE = os.environ.get('XTU_SCOPE', '/home/user/lvllm/kernel_audit_scope.txt')
+import os as _os
+
+
+def _first_existing(*cands):
+    for c in cands:
+        try:
+            if c and _os.path.exists(c):
+                return c
+        except OSError:
+            continue          # sshfs 断开时 exists() 会抛 ENOTCONN
+    return cands[0]
+
+SCOPE_FILE = _first_existing(os.environ.get('XTU_SCOPE',''),
+    '/root/lvllm/repos/xiaotu-llm/scripts/kernel_audit_scope.txt',
+    '/home/user/lvllm/kernel_audit_scope.txt')
 scope = [l.strip() for l in open(SCOPE_FILE) if l.strip() and not l.startswith('#')]
 def resolve(rel):
     rel = rel.replace('plugin:', '')

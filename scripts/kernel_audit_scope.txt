@@ -32,3 +32,4 @@ plugin:vllm_xiaotu_moe/pin_mask_triton.py
 plugin:vllm_xiaotu_moe/decode_moe_fp8.py
 plugin:vllm_xiaotu_moe/sidecar_gpu0.py
 plugin:vllm_xiaotu_moe/mixed_experts.py
+plugin:vllm_xiaotu_moe/byte_transpose.py

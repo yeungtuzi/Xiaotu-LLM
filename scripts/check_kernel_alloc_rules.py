@@ -100,7 +100,6 @@ KNOWN_BOUNDED = {
     #    现显式登记，杜绝"巧合式放行"）──
     "_GPF_INFO": "key = _dev.index（mixed_experts.py:2249/2252）",
     "_GP_EVENTS": "按 device 索引（:358/2649）",
-    "_GP_PREFETCH_ON": "⚠️ 死容器：全文件只有定义、无读写（:494）⇒ 可删",
     "_GP_READY": "key = (device_key, 层号)（第二项是层号，不是槽位序号）",
     "_GP_SLOT": "key 只有 device，slot 是 **value**（:2596/2654）",
     "_GP_SLOT_FREE": "同 _GP_SLOT：key = device（:497，经 setdefault 写入）",

@@ -491,7 +491,6 @@ def _in_capture_window() -> bool:
 # Runtime switch is a FILE, not an env var: the flag must be flip-able inside one
 # server process to A/B it honestly (`XIAOTU_GP_ASM_PREFETCH_FILE`), matching how
 # the prefill threshold is switched.
-_GP_PREFETCH_ON: dict = {}
 _GP_READY: dict = {}       # (dev_key, layer_index) -> (km, ready_event, slot)
 _GP_SLOT: dict = {}        # dev_key -> next slot to assemble into
 _GP_SLOT_FREE: dict = {}   # dev_key -> {slot: event after the GEMM that read it}

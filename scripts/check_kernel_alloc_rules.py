@@ -30,6 +30,11 @@ VOLATILE = re.compile(r"$^")   # 保留占位，实际用集合判断
 MODULE_LEVEL_CTORS = ("set(", "list(", "dict(", "OrderedDict(")
 
 # 已由第三方审计核定"有界"的模块级容器 → 理由（未登记的新容器仍会被告警）
+# 已核"有界"的 constexpr 形参（值会变，但取值集合有限）→ 理由
+KNOWN_BOUNDED_CONSTEXPR = {
+    "PADDED_TOP_K": "2 的幂桶化（审计第 5 轮已核：combine_topk 的 CompileKey 字段均有界）",
+}
+
 KNOWN_BOUNDED = {
     "_BUF_CACHE": "2 幂桶化，key 只含列维/常量",
     "_BUF_MOE": "2 幂桶化",
@@ -132,7 +137,29 @@ def check_file(path: str):
             ann = ast.unparse(a.annotation) if a.annotation else ""
             if "constexpr" not in ann:
                 continue
-            if a.arg in VOLATILE_NAMES and a.arg not in dns:
+            # ⛔ 审计 #8：只认写死名字表 ⇒ `width_from_shape: tl.constexpr` 一律漏。
+            #    增加第二判据：**调用点实参表达式**里出现 `.shape` / `.stride(`
+            #    ⇒ 该 constexpr 事实上随形状变化。
+            _shapey = False
+            if a.arg not in dns:
+                _pat = re.compile(rf"{re.escape(node.name)}\s*\[")
+                for _m in _pat.finditer(src):
+                    _seg = src[_m.end():_m.end() + 1200]
+                    _km = re.search(rf"\b{re.escape(a.arg)}\s*=\s*([^,\n]{{0,160}})", _seg)
+                    if not _km:
+                        continue
+                    _v = _km.group(1)
+                    # ⚠️ 只认"**随请求变化的张量**上的 `.shape[`"：
+                    #    `k_cache.stride(0)` / `out.stride(1)` 这类跨距在配置固定时是常量，
+                    #    用 `.stride(` 当证据会 24/24 全误报（实测）。
+                    _VOL_TENSORS = ("block_table", "block_tables", "out", "topk_indices",
+                                    "slot_ids", "acc", "max_score", "cu_seqlens",
+                                    "logits", "q", "kv")
+                    if any(re.search(rf"\b{t}\b", _v) for t in _VOL_TENSORS) and ".shape[" in _v:
+                        _shapey = True
+                        break
+            if (a.arg in VOLATILE_NAMES or _shapey) and a.arg not in dns \
+                    and a.arg not in KNOWN_BOUNDED_CONSTEXPR:
                 out.append((path, a.lineno, "C2",
                             f"形参 `{a.arg}` 是 tl.constexpr 且名字像随请求变化，"
                             f"但不在 do_not_specialize 名单里（该内核 {node.name}）"))
@@ -299,8 +326,27 @@ def check_file(path: str):
 
 def main():
     ap = argparse.ArgumentParser()
-    ap.add_argument("--root", default="/home/user/lvllm/process_data/ref/repos/vllm-mainline")
-    ap.add_argument("--plugin", default="/home/user/lvllm/vllm-xiaotu-moe")
+    # ⛔ 审计 #2：默认根曾写死远端路径 ⇒ 在其它机器上 exit 2，仓库里没有可复现性。
+    #    现按「环境变量 → 常见候选」顺序探测；都没有则**报错并给出如何指定**。
+    def _pick(env: str, cands: list) -> str:
+        v = os.environ.get(env)
+        if v and os.path.isdir(v):
+            return v
+        for c in cands:
+            if os.path.isdir(c):
+                return c
+        return cands[0]
+
+    _here = os.path.dirname(os.path.dirname(os.path.abspath(__file__)))
+    ap.add_argument("--root", default=_pick("XTU_VLLM_ROOT", [
+        "/home/user/lvllm/process_data/ref/repos/vllm-mainline",
+        os.path.join(_here, "data/repos/vllm-mainline"),
+        "/root/lvllm/data/repos/vllm-mainline",
+    ]))
+    ap.add_argument("--plugin", default=_pick("XTU_PLUGIN_ROOT", [
+        "/home/user/lvllm/vllm-xiaotu-moe",
+        _here,
+    ]))
     ap.add_argument("--quiet", action="store_true")
     ap.add_argument("--scope-file", default=os.path.join(
         os.path.dirname(os.path.abspath(__file__)), "kernel_audit_scope.txt"),

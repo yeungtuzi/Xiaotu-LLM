@@ -33,6 +33,8 @@ MODULE_LEVEL_CTORS = ("set(", "list(", "dict(", "OrderedDict(", "defaultdict(", 
 # 已核"有界"的 constexpr 形参（值会变，但取值集合有限）→ 理由
 KNOWN_BOUNDED_CONSTEXPR = {
     "PADDED_TOP_K": "2 的幂桶化（审计第 5 轮已核：combine_topk 的 CompileKey 字段均有界）",
+    "topk": "topk 宽度（= topk_indices.shape[-1]，配置常量），**不是** token 数",
+    "stride_qm": "= q.stride(0)；q 的首维是 **num_heads**（不是 token）⇒ 配置常量",
 }
 
 KNOWN_BOUNDED = {
@@ -325,8 +327,12 @@ def check_file(path: str):
             fn = node.func
             targets = []
             if isinstance(fn, ast.Attribute) and fn.attr in ("add", "append", "update", "insert", "extend", "setdefault"):
-                if isinstance(fn.value, ast.Name) and fn.value.id in mod_names:
-                    targets.append(fn.value.id)
+                # 直接：_CACHE.add(x)；下标：_CACHE[k].append(x)（defaultdict 的典型用法）
+                _v = fn.value
+                if isinstance(_v, ast.Subscript):
+                    _v = _v.value
+                if isinstance(_v, ast.Name) and _v.id in mod_names:
+                    targets.append(_v.id)
             elif isinstance(fn, ast.Attribute) and fn.attr == "setdefault":
                 if isinstance(fn.value, ast.Name) and fn.value.id in mod_names:
                     targets.append(fn.value.id)

@@ -21,7 +21,7 @@ vllm/v1/attention/backends/mla/sparse_mla_kernels.py
 vllm/v1/attention/backends/mla/sparse_swa.py
 vllm/v1/attention/backends/mla/flashmla_sparse.py
 vllm/v1/attention/backends/mla/flashmla_sparse_sm8x.py
-vllm/models/deepseek_v4/common/ops/sparse_mla_env.py
+vllm/v1/attention/backends/mla/sparse_mla_env.py
 vllm/models/deepseek_v4/nvidia/ops/sm12x_deep_gemm_fallbacks.py
 # ── 插件 ──
 plugin:vllm_xiaotu_moe/expert_pool.py

@@ -42,11 +42,9 @@ KNOWN_BOUNDED = {
     "_PROF_RESERVE": "同上",
     "_CAP_FREE": "显存抽样游标，长度固定",
     "_LAST_USE": "按层号索引（层数固定）",
-    "_RING": "按层号/固定槽位索引",
     "_FP8_BUF": "行维 2 幂桶化（本轮修复项）",
     "_FP8_RETIRED": "同 _SEG_RETIRED：2 幂扩容驱动，释放会 UAF",
     "_D2H_STREAM": "按 device 索引",
-    "_BND_PIN": "按 (device, 层号) 索引",
     "_ENGRAM_LAST_PENDING": "按层号累积（≤层数），用后 clear()",
     "_CED_GROUP_NAMES": "固定名字集合（常量）",
     "_GP_BUF2": "key = _gp_dev_key(dev) ⇒ 按设备",
@@ -55,7 +53,6 @@ KNOWN_BOUNDED = {
     "_LUT_CACHE": "key 是常量查表，条目数 = LUT 种类",
     "_SEG_RETIRED": "由 2 幂扩容驱动，上界 ~17；释放会引发 UAF，故不 free（见审计 §19 反驳）",
     "_PIN_BND_RETIRED": "同 _SEG_RETIRED：锁页缓冲，释放会 UAF",
-    "flashinfer_sparse_index_cache": "每 build 前 clear",
     # 以下均以 **设备号 / 层号 / 固定槽位** 为 key（与请求长度无关）
     "_SLOTS": "按 device 索引（≤GPU 数）",
     "_PREFETCH_STREAMS": "按 device 索引",
@@ -126,8 +123,18 @@ def check_file(path: str):
         window_with_self = "\n".join(lines[max(0, i - 12):i + 1])
         if "alloc-audit: init-time" in window_with_self:
             continue
-        if ("synchronize" not in window_with_self and "record_stream" not in window_with_self
-                and "wait_event" not in window_with_self and "stream.wait" not in window_with_self):
+        # ⛔ 审计 #3：旧判据是**文本**匹配 ⇒ 注释里写一句 "synchronize" 就算通过。
+        #    改为只看 AST 里的真实调用节点（注释天然不在 AST 中）。
+        real_sync = False
+        for anc in ast.walk(tree):
+            if not isinstance(anc, ast.Call) or anc.lineno > node.lineno or anc.lineno < node.lineno - 12:
+                continue
+            f = anc.func
+            nm = f.attr if isinstance(f, ast.Attribute) else (f.id if isinstance(f, ast.Name) else "")
+            if nm in ("synchronize", "record_stream", "wait_event", "wait_stream"):
+                real_sync = True
+                break
+        if not real_sync:
             out.append((path, node.lineno, "C3",
                         "empty_cache() 前 12 行内没有 synchronize/record_stream/wait_event"
                         "（若在服务开始前执行，加 `# alloc-audit: init-time` 标注）"))
@@ -212,7 +219,12 @@ def check_file(path: str):
         has_kernel_call = bool(re.search(r"_kernel\s*\[", body_src))
         if not has_kernel_call:
             continue
-        n_assert = len([x for x in ast.walk(node) if isinstance(x, ast.Assert)])
+        # ⛔ 审计 #5：旧判据只数 assert 个数 ⇒ 两条 `assert x.dim()==2` 就能过。
+        #    改为：断言表达式里必须出现上界/跨距语义（max(/min(/.shape[/stride(/numel）。
+        def _is_bound(a: ast.Assert) -> bool:
+            t = ast.unparse(a.test)
+            return any(k in t for k in ("max(", "min(", ".shape[", ".stride(", "numel", ">=", "<"))
+        n_assert = len([x for x in ast.walk(node) if isinstance(x, ast.Assert) and _is_bound(x)])
         if n_assert < 2:
             out.append((path, node.lineno, "C4",
                         f"宿主 `{node.name}` 把 block_table/slot_ids 交给内核（无 mask 寻址），"
@@ -248,11 +260,18 @@ def main():
     else:
         for r in roots:
             targets.extend(iter_py(r))
+    # ⛔ 审计 #1：缺失项曾被静默丢弃（清单 32 条只扫 31 条，且"31"被当成全量）
+    missing = [t for t in targets if not os.path.isfile(t)]
     targets = [t for t in targets if os.path.isfile(t)]
     print(f"扫描范围：{len(targets)} 个自有文件" if a.scope_file else f"扫描范围：全树 {len(targets)} 文件")
     # ⛔ 防"假绿"：一个文件都没扫到 ⇒ 必须报错，绝不返回 0
     if not targets:
         print("❌ 扫描范围为空（路径拼接错误或清单失效）—— 拒绝给出'通过'结论")
+        return 3
+    if missing:
+        print(f"❌ 清单中有 {len(missing)} 条路径不存在（不得静默跳过）：")
+        for m in missing:
+            print(f"   {m}")
         return 3
 
     all_findings = []

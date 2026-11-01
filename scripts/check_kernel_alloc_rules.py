@@ -36,7 +36,7 @@ MODULE_LEVEL_CTORS = ("set(", "list(", "dict(", "OrderedDict(", "defaultdict(", 
 CONSTEXPR_PAGE_STRIDES = {
     "RAW_STRIDE": "deepseek_v41/common/ops/fused_compress_quant_cache.py:119 = kv_score.stride(0)",
     "CACHE_STRIDE": "deepseek_v41/common/ops/fused_compress_quant_cache.py:298 = kv_cache.stride(0)",
-    "KV_BLOCK_STRIDE": "deepseek_v4/common/ops/fused_compress_quant_cache.py:145 = kv_cache.stride(0)",
+    "KV_BLOCK_STRIDE": "deepseek_v4/common/ops/fused_compress_quant_cache.py:174 = kv_cache.stride(0)",
     "TAIL_BLOCK_ELEMS": "glm5next/nvidia/ops/kpool_compress.py:464 = tail_kv_cache.stride(0)",
 }
 KNOWN_BOUNDED_CONSTEXPR = {
@@ -58,6 +58,8 @@ KNOWN_BOUNDED = {
     "_BT_BOUND_CALLS": "键集合与 _BT_BOUND_SEEN 同域（≤16），值只是复检计数器",
     "_FCC_BOUND_SEEN": "显式上限 16（fused_compress_quant_cache.py 的 capture/热路径 gate）",
     "_FCC_BOUND_CALLS": "键集合与 _FCC_BOUND_SEEN 同域（≤16），值只是复检计数器",
+    "_MQA_BOUND_SEEN": "显式上限 16（sm12x_mqa.py / indexer.py 的 capture/热路径 gate）",
+    "_MQA_BOUND_CALLS": "键集合与 _MQA_BOUND_SEEN 同域（≤16），值只是复检计数器",
     # ── 第39轮：KV 缓存布局常量（调用点实测：kv_cache.stride(0) / kv_score.stride(0)）──
     #    进程内恒定（由 KV 缓存分配决定），跨重启可能变 ⇒ 变体数有界，**不随每请求变化**。
     # ── 第6轮绕过①③（非空字面量初始化 / AugAssign）生效后浮出的一批 ──
@@ -200,6 +202,12 @@ def _check_call_sites(tree, fname: str, pnames: list, target_param: str) -> bool
         if re.search(r"\.stride\(\s*0\s*\)", expr) or re.search(r"\.shape\[\s*0\s*\]", expr):
             return True
     return False
+
+
+# ⛔ 第12轮：`check_file` 里用了 `targets`，而它是 `main()` 的**局部变量**
+#    ⇒ 任何"带 文件:行号 的活白标"都会 UnboundLocalError，整条门禁 traceback、
+#    后续文件全部不再被扫（当前树恰好没有活白标，所以"绿"= 没走到这段）。
+_TARGETS: list = []
 
 
 def check_file(path: str):
@@ -475,10 +483,12 @@ def check_file(path: str):
             _has_cmp = any(op in t for op in ("<=", ">=", "<", ">"))
             if not _has_cmp:
                 return False
+            # ⛔ 第12轮：`numel() >= 1` 这类断言曾算"上界" ⇒ 已由上面的 `_tauto`（拒 0/1 字面量）处理；
+            #    对**变量**的比较（`shape[0] >= batch_size`）是合法契约，不能一刀切否掉。
             # ⛔ 第10轮 N6：旧版把 `<= 4096` 也算恒真 ⇒ 最自然的容量写法被判"没有断言"
             #    （反向误报压力，只会逼人加白名单）。只把**对 0 的比较**当恒真。
-            _tauto = bool(re.search(r"[<>]=?\s*0\s*$", t.strip())) or bool(
-                re.search(r"[<>]=?\s*0\b", t))
+            # 只把"与 0/1 这类小字面量比较"当恒真；对变量比较（`>= batch_size`）是合法契约
+            _tauto = bool(re.search(r"[<>]=?\s*[01]\b", t))
             if _tauto:
                 return False
             # ⛔ 第9轮 §3-1：旧版在这里提前 return，导致下面"必须引用块表"的要求**永不可达**
@@ -521,7 +531,9 @@ def check_file(path: str):
                 _kfn = _find_kernel(tree, _kn)
                 if _kfn is None:
                     continue
-                _body = ast.unparse(_kfn)
+                # ⛔ 第12轮：`ast.unparse(fn)` **包含函数签名** ⇒ 只要在内核形参表里声明
+                #    该名字就算"用到了"。改为只看**函数体语句**。
+                _body = "\n".join(ast.unparse(x) for x in _kfn.body)
                 if re.search(rf"\b{re.escape(_bound_param)}\b", _body) and (
                         "tl.minimum" in _body or "tl.maximum" in _body or "mask=" in _body):
                     _delegated_ok.add(_a)
@@ -554,14 +566,17 @@ def check_file(path: str):
             _ev = re.search(r"([A-Za-z0-9_./]+\.py):(\d+)", _label.group(2))
             _ok = False
             if _ev:
-                _evfile = next((x for x in targets if x.endswith(_ev.group(1))), None)
+                _evfile = next((x for x in _TARGETS if x.endswith(_ev.group(1))), None)
                 _evline = int(_ev.group(2))
                 if _evfile:
                     for _kn in {x for _l, _t in launches for x in re.findall(r"([A-Za-z_]\w*)\s*\[", _t)}:
                         _kfn = _find_kernel(_evfile and ast.parse(open(_evfile, encoding="utf-8", errors="replace").read()), _kn)
                         if _kfn and _kfn.lineno <= _evline <= (_kfn.end_lineno or _kfn.lineno):
                             _txt = open(_evfile, encoding="utf-8", errors="replace").read().splitlines()[_evline - 1]
-                            if _CLAMP.search(_txt):
+                            # ⛔ 第12轮：旧判据只看"含裸 < >" ⇒ 无关的 `if pid < n:` 就能蒙过。
+                            #    改为：证据行必须**引用被保护的实参**，且含钳位/mask 构造。
+                            _refs_addr = any(re.search(rf"\b{re.escape(a)}\b", _txt) for a in ADDR_ARGS)
+                            if _refs_addr and _CLAMP.search(_txt):
                                 _ok = True
                             break
             if not _ok:
@@ -638,6 +653,7 @@ def main():
     # ⛔ 审计 #1：缺失项曾被静默丢弃（清单 32 条只扫 31 条，且"31"被当成全量）
     missing = [t for t in targets if not os.path.isfile(t)]
     targets = [t for t in targets if os.path.isfile(t)]
+    _TARGETS.clear(); _TARGETS.extend(targets)
     print(f"扫描范围：{len(targets)} 个自有文件" if a.scope_file else f"扫描范围：全树 {len(targets)} 文件")
     # ⛔ 防"假绿"：一个文件都没扫到 ⇒ 必须报错，绝不返回 0
     if not targets:
@@ -715,7 +731,7 @@ def main():
         _m = re.search(r"([A-Za-z0-9_./]+\.py):(\d+)", _ev)
         if not _m:
             _ps_bad.append((_n3, "证据里没有 文件:行号")); continue
-        _fp = next((p for p in targets if p.endswith(_m.group(1))), None)
+        _fp = next((p for p in _TARGETS if p.endswith(_m.group(1))), None)
         if _fp is None or not os.path.exists(_fp):
             _ps_bad.append((_n3, f"证据文件不存在 {_m.group(1)}")); continue
         try:
@@ -727,7 +743,10 @@ def main():
         # ⛔ 第11轮：**行号会随编辑漂移**（我插一行，证据就失效）。
         #    判据改为「该文件里存在一行同时含 `<name>=` 与 `.stride(0)`」——
         #    行号只作提示，真正核验的是内容。
-        _ok_here = ".stride(0)" in _txt
+        # ⛔ 第12轮：旧判据只看"该行含 .stride(0)"，**名字不参与** ⇒
+        #    实测真实反例：KV_BLOCK_STRIDE 的证据行其实是 `state_cache.stride(1)`，门禁仍绿。
+        #    ⇒ 证据行必须**同时**出现该名字与 .stride(0)。
+        _ok_here = (".stride(0)" in _txt and re.search(rf"\b{re.escape(_n3)}\b", _txt) is not None)
         if not _ok_here:
             _pat = re.compile(rf"\b{re.escape(_n3)}\b[^\n]{{0,80}}\.stride\(0\)")
             _ok_here = any(_pat.search(x) for x in _all)

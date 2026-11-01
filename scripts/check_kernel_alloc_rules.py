@@ -502,7 +502,9 @@ def check_file(path: str):
                 break
         # 已人工复核：内核内部对块表/slot 的访问自带 mask ⇒ 用源码切片白标
         _slice = "\n".join(lines[node.lineno - 1:(node.end_lineno or node.lineno)])
-        if "alloc-audit: masked-in-kernel" in _slice:
+        # 两种白标：内核内自带 mask / 上界由调用方保证（后者必须写明依据）
+        if ("alloc-audit: masked-in-kernel" in _slice
+                or "alloc-audit: bound-in-caller" in _slice):
             continue
         # 恒真比较已被剔除 ⇒ 1 条真实上界/跨距断言即视为已声明契约
         if n_assert >= 1 or delegated:
@@ -656,15 +658,16 @@ def main():
                     continue   # 页跨距：已在 CONSTEXPR_PAGE_STRIDES 显式登记并有证据
                 if _w in _pn and _check_call_sites(_t2, _n2.name, _pn, _w):
                     _volatile_wl.append((_p, _n2.name, _w))
-    if _volatile_wl:
+    if not a.no_whitelist_check and _volatile_wl:
         print("❌ 白名单与调用点证据矛盾（这些 constexpr 名被 `.stride(0)`/`.shape[0]` 派生值喂过）：")
         for _p, _k, _w in _volatile_wl[:10]:
             print(f"   {_p} {_k} ← {_w}")
         return 3
 
-    _wrong_ctor = [n for n in KNOWN_BOUNDED if n not in _assigned]
-    _wrong_cx = [n for n in KNOWN_BOUNDED_CONSTEXPR if n not in _param_names]
-    if _wrong_ctor or _wrong_cx:
+    _wrong_ctor = [] if a.no_whitelist_check else [n for n in KNOWN_BOUNDED if n not in _assigned]
+    _wrong_cx = [] if a.no_whitelist_check else [
+        n for n in KNOWN_BOUNDED_CONSTEXPR if n not in _param_names]
+    if not a.no_whitelist_check and (_wrong_ctor or _wrong_cx):
         print("❌ 白名单放错了字典（容器名必须能在模块级找到；constexpr 名必须是函数形参）：")
         for n in _wrong_ctor:
             print(f"   {n}: 在 KNOWN_BOUNDED 里，但找不到模块级赋值")

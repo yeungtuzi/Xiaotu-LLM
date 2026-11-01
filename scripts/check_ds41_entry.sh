@@ -1,19 +1,23 @@
 #!/usr/bin/env bash
 # check_ds41_entry.sh —— 机械检查：ds41f 服务是否**经由唯一入口** `serve_ds41.sh` 启动
 #
-# 来由（2026-11-01 用户明令）：ds41f 必须只有一个启动入口，其他 agent / 调试脚本
-#   一律从这里开始。历史事故：绕过入口直起 ⇒ `COMPILE_RANGES` 从未被翻译进
-#   `--compilation-config` ⇒ Inductor 按 token 数产生 85 万个编译产物 ⇒ 显存单调上涨 ⇒ OOM。
+# 来由（2026-11-01 用户明令）：
+#   ① ds41f 只能走 `serve_ds41.sh` 启动；
+#   ② **判活不能只看 8700 端口**（加载期还没 bind，会被误判成"未运行"）；
+#   ③ 重复启动必须给出**明确提示**（不是静默失败）。
 #
-# 检查项（全部只读）：
-#   ① 端口 8700 的拥有者 PID，是否等于 `run/ds41_*.pid` 里登记的 PID；
-#   ② 命令行是否含 `--compilation-config` 且其中有 `compile_ranges_endpoints`；
-#   ③ 命令行是否含 `--no-swa-bounded-replay`（= CED 被关，视为基线臂，仅告警）；
-#   ④ 环境里 `XIAOTU_MOE_THREADS` 是否为 60（不是 60 只告警，需在报告中标注口径）。
+# 状态机（判据顺序：PID 文件 → 进程 → 端口 → health）：
+#   RUNNING   进程活、端口归属它、health==200      ⇒ 跑全部口径检查
+#   STARTING  进程活、但端口未 bind 或 health!=200 ⇒ 打印已运行秒数，提示勿重复启动
+#   BYPASS    端口有主，但该 pid 不在任何 ds41_*.pid 里 ⇒ 违规（疑似绕过入口）
+#   DUPLICATE 同时存在 >1 个 api_server 进程         ⇒ 违规
+#   STOPPED   无存活进程、端口空闲                  ⇒ 未运行
 #
-# 退出码：0=合规；1=违规（存在 vLLM 不知道/未受控的启动）；2=未找到服务
+# 退出码：0=RUNNING 且合规 / 1=违规（BYPASS 或 DUPLICATE 或口径不符）
+#         2=未运行 / 3=启动中（合规，但未就绪）
 #
 # 用法：bash scripts/check_ds41_entry.sh [--port 8700] [--run-dir <dir>]
+# 环境：ALLOW_PC0=1 显式允许 PC=0 臂（否则判违规）
 
 set -u
 PORT=8700
@@ -23,87 +27,130 @@ while [ $# -gt 0 ]; do
     case "$1" in
         --port) PORT="${2:?}"; shift 2 ;;
         --run-dir) RUN_DIR="${2:?}"; shift 2 ;;
-        -h|--help) sed -n '2,22p' "$0"; exit 0 ;;
-        *) echo "未知参数: $1" >&2; exit 64 ;;
+        -h|--help) sed -n '2,24p' "$0"; exit 0 ;;
+        *) echo "未知参数: $1（ALLOW_PC0=1 是环境变量，不是参数）" >&2; exit 64 ;;
     esac
 done
 
-owner="$(ss -ltnp 2>/dev/null | grep -F ":$PORT " | grep -oE 'pid=[0-9]+' | head -1 | cut -d= -f2)"
-if [ -z "$owner" ]; then
-    echo "未找到监听 $PORT 的进程 ⇒ 服务未运行（退出码 2）"
+alive() {
+    local p="${1:-}" st
+    case "$p" in ''|*[!0-9]*) return 1 ;; esac
+    [ -r "/proc/$p/stat" ] || return 1
+    st="$(awk '{print $3}' "/proc/$p/stat" 2>/dev/null)"
+    [ "$st" != "Z" ] && [ "$st" != "X" ]
+}
+is_api_server() {
+    local p="${1:-}"
+    tr '\0' ' ' < "/proc/$p/cmdline" 2>/dev/null | grep -q "vllm.entrypoints.openai.api_server"
+}
+port_owner() {
+    ss -Hltnp "sport = :$PORT" 2>/dev/null | grep -oE 'pid=[0-9]+' | head -1 | cut -d= -f2
+}
+health() {
+    local h
+    h="$(curl -s -o /dev/null -w '%{http_code}' --noproxy '*' --max-time 3 "http://127.0.0.1:$PORT/health" 2>/dev/null || true)"
+    case "${h:-}" in ''|*[!0-9]*) echo 000 ;; *) echo "$h" ;; esac
+}
+
+# ── 收集 PID 文件 ────────────────────────────────────────────────────────────
+declared=()   # "pid|file"
+for f in "$RUN_DIR"/ds41_*.pid; do
+    [ -e "$f" ] || continue
+    p="$(tr -dc '0-9' < "$f" 2>/dev/null || true)"
+    [ -n "$p" ] && declared+=("$p|$f")
+done
+
+owner="$(port_owner)"
+running_pid=""
+for rec in ${declared[@]+"${declared[@]}"}; do
+    p="${rec%%|*}"
+    if alive "$p" && is_api_server "$p"; then running_pid="$p"; declared_file="${rec#*|}"; fi
+done
+
+api_count="$(ps -eo args 2>/dev/null | grep -c "[v]llm.entrypoints.openai.api_server")"
+
+# ── DUPLICATE ───────────────────────────────────────────────────────────────
+if [ "${api_count:-0}" -gt 1 ]; then
+    echo "✗ 同时存在 ${api_count} 个 api_server 进程 ⇒ 重复启动" >&2
+    ps -eo pid,etimes,args | grep "[a]pi_server" | awk '{printf "    pid=%s 已运行%s 秒\n", $1, $2}'
+    echo "    处置：用 PID 文件确认哪一个受控（$RUN_DIR/ds41_*.pid），其余按"唯一入口 stop"或人工确认后停" >&2
+    exit 1
+fi
+
+# ── BYPASS：端口有主但不受控 ────────────────────────────────────────────────
+if [ -n "$owner" ] && [ "$owner" != "${running_pid:-}" ]; then
+    echo "✗ 端口 $PORT 由 pid=$owner 持有，但它不在 $RUN_DIR/ds41_*.pid 中" >&2
+    echo "    该实例**不是**由 serve_ds41.sh 启动 ⇒ 编译档位/CED/线程口径都不可信" >&2
+    echo "    处置：停掉它，改用 bash scripts/serve_ds41.sh start" >&2
+    exit 1
+fi
+
+# ── STOPPED ─────────────────────────────────────────────────────────────────
+if [ -z "$running_pid" ]; then
+    echo "未运行：无存活的 api_server 进程、端口 $PORT 空闲（退出码 2）"
     exit 2
 fi
 
-echo "端口 $PORT 拥有者 pid=$owner"
-rc=0
-
-# ① 是否与 PID 文件登记一致
-matched=""
-for f in "$RUN_DIR"/ds41_*.pid; do
-    [ -e "$f" ] || continue
-    if [ "$(cat "$f" 2>/dev/null)" = "$owner" ]; then matched="$f"; fi
-done
-if [ -n "$matched" ]; then
-    echo "✓ PID 与 $matched 一致（由 serve_ds41.sh 启动）"
-else
-    echo "✗ 该 PID 不在 $RUN_DIR/ds41_*.pid 中 ⇒ 疑似绕过唯一入口直起" >&2
-    rc=1
+# ── STARTING：进程活但未就绪（**不按端口判定就绪**）────────────────────────
+elapsed="$(ps -o etimes= -p "$running_pid" 2>/dev/null | tr -d ' ')"
+h="$(health)"
+if [ -z "$owner" ] || [ "$h" != "200" ]; then
+    echo "启动中：pid=$running_pid 已运行 ${elapsed:-?} 秒，端口 ${owner:+已归属 pid=$owner}${owner:-尚未监听}，health=$h（退出码 3）"
+    echo "  ⇒ 请勿重复启动（此状态下再执行 start 会被唯一入口拒绝并给出提示）"
+    echo "  ⇒ 日志：$RUN_DIR/$(basename "${declared_file%.pid}").log"
+    exit 3
 fi
 
-# ② 编译档位必须进命令行
-cmdline="$(tr '\0' ' ' < "/proc/$owner/cmdline" 2>/dev/null)"
+# ── RUNNING：跑全部口径检查 ─────────────────────────────────────────────────
+echo "运行中：pid=$running_pid（$declared_file）已运行 ${elapsed:-?} 秒，health=200"
+rc=0
+cmdline="$(tr '\0' ' ' < "/proc/$running_pid/cmdline")"
+environ="$(tr '\0' '\n' < "/proc/$running_pid/environ" 2>/dev/null)"
+
 case "$cmdline" in
     *compile_ranges_endpoints*) echo "✓ 命令行含 compile_ranges_endpoints" ;;
-    *) echo "✗ 命令行缺 compile_ranges_endpoints ⇒ 形状特化会重新堆积（2026-10-31 事故同款）" >&2; rc=1 ;;
+    *) echo "✗ 缺 compile_ranges_endpoints ⇒ 形状特化会重新堆积（2026-10-31 事故同款）" >&2; rc=1 ;;
 esac
 
-# ③ CED（默认开；显式关闭只告警）
 case "$cmdline" in
-    *--no-swa-bounded-replay*) echo "⚠️ 命令行含 --no-swa-bounded-replay ⇒ CED 关闭（基线臂，报告须标注）" ;;
+    *--no-swa-bounded-replay*) echo "⚠️ CED 关闭（基线臂，报告须标注）" ;;
     *) echo "✓ CED 未关闭（树默认开启）" ;;
 esac
 
-# ④ 线程口径
-threads="$(tr '\0' '\n' < "/proc/$owner/environ" 2>/dev/null | grep '^XIAOTU_MOE_THREADS=' | cut -d= -f2)"
+threads="$(printf '%s\n' "$environ" | grep '^XIAOTU_MOE_THREADS=' | cut -d= -f2)"
 if [ "${threads:-}" = "60" ]; then
     echo "✓ XIAOTU_MOE_THREADS=60"
 else
     echo "⚠️ XIAOTU_MOE_THREADS=${threads:-未设}（非 60，性能数据须标注口径）"
 fi
 
-# ⑤ 碎片/分配器口径（2026-11-01 新增轴：EXPANDABLE 与 custom AR 必须成对出现）
-alloc="$(tr '\0' '\n' < "/proc/$owner/environ" 2>/dev/null | grep '^PYTORCH_CUDA_ALLOC_CONF=' | cut -d= -f2-)"
-exp_flag="$(printf '%s' "$cmdline" | grep -o -- '--disable-custom-all-reduce' | head -1)"
+alloc="$(printf '%s\n' "$environ" | grep '^PYTORCH_CUDA_ALLOC_CONF=' | cut -d= -f2-)"
 case "${alloc:-}" in
     *expandable_segments:True*)
-        if [ -n "$exp_flag" ]; then
+        if printf '%s' "$cmdline" | grep -q -- '--disable-custom-all-reduce'; then
             echo "✓ expandable_segments:True + custom-AR 已关（VMM/IPC 绑定完整）"
         else
-            echo "✗ expandable_segments:True 但命令行缺 --disable-custom-all-reduce ⇒ 必然在 KV profiling 崩（2026-10-27 事故）" >&2
+            echo "✗ expandable_segments:True 但缺 --disable-custom-all-reduce ⇒ KV profiling 必崩" >&2
             rc=1
         fi ;;
     *expandable_segments:False*) echo "  expandable_segments:False（碎片不回收，frag 会累积）" ;;
     *) echo "  PYTORCH_CUDA_ALLOC_CONF=${alloc:-未设}" ;;
 esac
 
-# ⑥ 磁盘前缀缓存口径（PC=1 时命令行必须带 L1 大小与 transfer-config）
 kvoff="$(printf '%s' "$cmdline" | grep -oE -- '--kv-offloading-size [0-9]+' | head -1)"
 if [ -n "$kvoff" ]; then
     if printf '%s' "$cmdline" | grep -q -- 'TieringOffloadingSpec'; then
         echo "✓ 前缀缓存已接线（$kvoff，tiering offload）"
     else
-        echo "✗ 有 --kv-offloading-size 但缺 TieringOffloadingSpec ⇒ 磁盘层不会生效" >&2
+        echo "✗ 有 --kv-offloading-size 但缺 TieringOffloadingSpec ⇒ 磁盘层不生效" >&2
         rc=1
     fi
+elif [ "${ALLOW_PC0:-0}" = "1" ]; then
+    echo "  PC=0（已用 ALLOW_PC0=1 显式放行；报告须注明）"
 else
-    if [ "${ALLOW_PC0:-0}" = "1" ]; then
-        echo "  前缀缓存未开（PC=0，已用 ALLOW_PC0=1 显式放行；报告须注明）"
-    else
-        echo "✗ 前缀缓存未开（PC=1 是默认生产口径；实验臂请加 ALLOW_PC0=1）" >&2
-        rc=1
-    fi
+    echo "✗ PC=0（PC=1 是默认生产口径；实验臂请加 ALLOW_PC0=1）" >&2
+    rc=1
 fi
 
-
-[ "$rc" = "0" ] && echo "合规：ds41f 由唯一入口启动" || echo "违规：存在不受控启动" >&2
+[ "$rc" = "0" ] && echo "合规：ds41f 由唯一入口启动且口径自洽" || echo "违规：口径不符" >&2
 exit "$rc"

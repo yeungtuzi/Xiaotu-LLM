@@ -60,6 +60,8 @@ KNOWN_BOUNDED = {
     "_BOUND_RECHECK": "显式上限：键集合与 _BOUND_CHECKED 同域（≤16），值只是复检计数器",
     "_BT_BOUND_SEEN": "显式上限 16（sparse_mla_kernels.py 的 capture/热路径 gate）",
     "_BT_BOUND_CALLS": "键集合与 _BT_BOUND_SEEN 同域（≤16），值只是复检计数器",
+    "_FCC_BOUND_SEEN": "显式上限 16（fused_compress_quant_cache.py 的 capture/热路径 gate）",
+    "_FCC_BOUND_CALLS": "键集合与 _FCC_BOUND_SEEN 同域（≤16），值只是复检计数器",
     # ── 第39轮：KV 缓存布局常量（调用点实测：kv_cache.stride(0) / kv_score.stride(0)）──
     #    进程内恒定（由 KV 缓存分配决定），跨重启可能变 ⇒ 变体数有界，**不随每请求变化**。
     # ── 第6轮绕过①③（非空字面量初始化 / AugAssign）生效后浮出的一批 ──
@@ -675,11 +677,19 @@ def main():
             _ps_bad.append((_n3, f"证据文件不存在 {_m.group(1)}")); continue
         try:
             _ln = int(_m.group(2))
-            _txt = open(_fp, encoding="utf-8", errors="replace").read().splitlines()[_ln - 1]
+            _all = open(_fp, encoding="utf-8", errors="replace").read().splitlines()
+            _txt = _all[_ln - 1]
         except (OSError, IndexError):
             _ps_bad.append((_n3, "证据行号越界")); continue
-        if ".stride(0)" not in _txt:
-            _ps_bad.append((_n3, f"证据行不含 .stride(0)：{_txt.strip()[:60]}"))
+        # ⛔ 第11轮：**行号会随编辑漂移**（我插一行，证据就失效）。
+        #    判据改为「该文件里存在一行同时含 `<name>=` 与 `.stride(0)`」——
+        #    行号只作提示，真正核验的是内容。
+        _ok_here = ".stride(0)" in _txt
+        if not _ok_here:
+            _pat = re.compile(rf"\b{re.escape(_n3)}\b[^\n]{{0,80}}\.stride\(0\)")
+            _ok_here = any(_pat.search(x) for x in _all)
+        if not _ok_here:
+            _ps_bad.append((_n3, f"整文件都找不到 `{_n3}=….stride(0)` 的证据"))
     if not a.no_whitelist_check and _ps_bad:
         print("❌ CONSTEXPR_PAGE_STRIDES 条目缺少可核验的 .stride(0) 证据：")
         for _n3, _why in _ps_bad:

@@ -23,10 +23,13 @@ SCP = ["scp", "-F", "/root/lvllm/tmp/sshcfg", "-o", "BatchMode=yes", "-o", "Conn
 
 # (本地相对路径, 远端目录)
 # (本地根, 远端根, 是否全量比对)
-# ⚠️ vLLM 本地镜像**只维护我们改过的那批文件**（不是全量副本）⇒ 只比 scope；
-#    插件树是**我们自己的完整源码** ⇒ 全量比对（第10轮实测 hybrid_model.py 曾漂移）。
+# ⛔ 第11轮 N1：上一版注释写"vLLM 本地镜像不是全量副本"——**这是假的**。
+#    实测本地镜像就是全量树（2794 个 .py），且当时有 **12 个文件比远端旧**
+#    （远端含我们自己的补丁 `[xtu-10]` / `XTU_VARLEN_K` / `_XTU_UNFUSED_NAMES`），
+#    而本脚本仍报 45/45 绿 ⇒ 门禁绿建立在假前提上。
+#    ⇒ 两棵树一律**全量比对**。
 ROOTS = [
-    ("/root/lvllm/data/repos/vllm-mainline", "/home/user/lvllm/process_data/ref/repos/vllm-mainline", False),
+    ("/root/lvllm/data/repos/vllm-mainline", "/home/user/lvllm/process_data/ref/repos/vllm-mainline", True),
     ("/root/lvllm/repos/xiaotu-llm/vllm_xiaotu_moe", "/home/user/lvllm/vllm-xiaotu-moe/vllm_xiaotu_moe", True),
 ]
 
@@ -91,15 +94,19 @@ def main() -> int:
                 whole.append((lp, rp))
     whole_pairs = [(lp, rp) for lp, rp in whole if lp not in {p[0] for p in pairs}]
 
+    # ⛔ 第11轮 N6：`--deploy` 曾只推 scope 的 32 条，而比对用 allpairs
+    #    ⇒ 插件树非 scope 的文件永远推不上去 ⇒ "先 deploy 再重跑"永远红、无法收敛。
+    _deploy_list = pairs + whole_pairs if a.deploy else []
+
     if a.deploy:
         bad = 0
-        for lp, rp in pairs:
+        for lp, rp in _deploy_list:
             r = subprocess.run(SCP + [lp, "gpu:" + os.path.dirname(rp) + "/"],
                                capture_output=True, text=True, timeout=60)
             if r.returncode != 0:
                 print(f"❌ 推送失败 {os.path.basename(lp)}: {r.stderr.strip()[:100]}")
                 bad += 1
-        print(f"推送：{len(pairs) - bad}/{len(pairs)} 成功")
+        print(f"推送：{len(_deploy_list) - bad}/{len(_deploy_list)} 成功")
         if bad:
             return 1
 

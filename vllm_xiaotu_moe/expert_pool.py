@@ -126,7 +126,7 @@ def load_pin_table(path: str) -> dict[int, list[int]]:
     """
     with open(path, "rb") as f:
         buf = f.read()
-    magic, ver, n_layers, e_max, n_ent = struct.unpack_from("<4sIIII", buf, 0)
+    magic, ver, _, _, n_ent = struct.unpack_from("<4sIIII", buf, 0)
     assert magic == b"XTUP" and ver == 1, f"bad pin table {magic!r} v{ver}"
     hdr = struct.calcsize("<4sIIII")
     out: dict[int, list[int]] = {}

@@ -564,6 +564,10 @@ def _cleaner_loop(period_s: float) -> None:
                     #    的流追踪里），解映射后再访问就是 cudaErrorIllegalAddress，
                     #    且直到下次 synchronize 才报（2026-10-28 r93/r94 的形态）。
                     with torch.cuda.device(_i):
+                        if torch.cuda.is_current_stream_capturing():
+                            # ⛔ 用户收窄目标"不当释放"：capture 期解映射页 = Xid31。
+                            #    不依赖调用方/env 门控，本函数自己拒绝。
+                            continue
                         torch.cuda.synchronize(_i)
                         # ⚠️ `empty_cache()` 不接受参数；传 device 会 TypeError 且被吞 ⇒ 静默失效
                         torch.cuda.empty_cache()
@@ -572,7 +576,7 @@ def _cleaner_loop(period_s: float) -> None:
                           f"{type(e).__name__} {e}", flush=True)
             ms = (time.perf_counter() - t0) * 1000.0
             dev = torch.device("cuda", torch.cuda.current_device())
-            free, total = torch.cuda.mem_get_info(dev)
+            free, _ = torch.cuda.mem_get_info(dev)
             print(f"[xtu-vram] empty_cache 已执行（耗 {ms:.1f} ms）"
                   f"⇒ free={int(free) / 2**30:.3f} GiB", flush=True)
         except Exception:                 # noqa: BLE001
@@ -1427,7 +1431,13 @@ def release_staging_reserve() -> None:
             except Exception:  # noqa: BLE001
                 _dev = torch.cuda.current_device()
             torch.cuda.synchronize(_dev)
-            _t2.cuda.empty_cache()
+            # ⛔ [xtu 2026-11-01 用户收窄目标] "不当释放"类：capture 期解映射页 = Xid31。
+            #    本函数理论上只在启动 profiling 结束调用，但**不依赖调用方**判断更稳。
+            if not torch.cuda.is_current_stream_capturing():
+                _t2.cuda.empty_cache()
+            else:
+                print("[xtu-kv-diag] capture 进行中 ⇒ 跳过 empty_cache（避免解映射）",
+                      flush=True)
             _f1, _tot1 = _t2.cuda.mem_get_info(_t2.cuda.current_device())
             print("[xtu-kv-diag] 释放 staging 占位: free %.2f GiB（已 empty_cache）"
                   % (_f1 / 2**30,), flush=True)
@@ -2210,7 +2220,6 @@ def kmajor_from_engine_shards_v2(engine, device, hidden: int, inter: int,
         w13_raw[:, c0:c0 + cr13, :].copy_(blk[:, 0, :].reshape(E, cr13, rb13))
         w13_raw[:, I + c0:I + c0 + cr13, :].copy_(blk[:, 1, :].reshape(E, cr13, rb13))
     w2_raw = _reuse(("raw2",), (E, H, rb2), device)
-    c2 = int(geo["w2_cbytes"])
     cr2 = int(geo["w2_crows"])
     for n in range(ns):
         c0 = n * cr2
@@ -2485,7 +2494,6 @@ def kmajor_from_engine_shards(engine, device, hidden: int, inter: int,
         del buf, blk
 
     w2_raw = _reuse(("raw2",), (E, H, rb2), device)
-    c2 = int(geo["w2_cbytes"])
     cr2 = int(geo["w2_crows"])
     for n in range(ns):
         buf = _dma_hostbuf(engine, 1, n, int(geo["w2_node_bytes"]), device)
@@ -3285,7 +3293,6 @@ def torch_reference_layer(
     T = x.shape[0]
     K = topk_ids.shape[1]
     dev = x.device
-    E = w13.shape[0]
     vals = _E2M1.to(dev)
 
     def exp_dequant(e):

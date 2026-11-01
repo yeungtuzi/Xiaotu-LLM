@@ -1811,8 +1811,6 @@ def _install_ced_slice_shim() -> list[str]:
     orig_layer = Layer.forward
     orig_model = Model.forward
     # 逐 token 的入参名(见 model.py:315 的签名)
-    TOK = ("x", "positions", "input_ids", "pre_mix", "post_mix", "res_mix",
-           "residual", "engram_hashes", "engram_mask")
 
     def _eligible(layer) -> bool:
         # 【§604 修】**第一判据 = 层号**,必须与 metadata 侧 §579 的

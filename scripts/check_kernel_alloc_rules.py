@@ -60,6 +60,8 @@ KNOWN_BOUNDED = {
     "_FCC_BOUND_CALLS": "键集合与 _FCC_BOUND_SEEN 同域（≤16），值只是复检计数器",
     "_MQA_BOUND_SEEN": "显式上限 16（sm12x_mqa.py / indexer.py 的 capture/热路径 gate）",
     "_MQA_BOUND_CALLS": "键集合与 _MQA_BOUND_SEEN 同域（≤16），值只是复检计数器",
+    "_BND_ADDR_SEEN": "显式上限 16（indexer_k_store.py 的 capture/热路径 gate）",
+    "_BND_ADDR_CALLS": "键集合与 _BND_ADDR_SEEN 同域（≤16），值只是复检计数器",
     # ── 第39轮：KV 缓存布局常量（调用点实测：kv_cache.stride(0) / kv_score.stride(0)）──
     #    进程内恒定（由 KV 缓存分配决定），跨重启可能变 ⇒ 变体数有界，**不随每请求变化**。
     # ── 第6轮绕过①③（非空字面量初始化 / AugAssign）生效后浮出的一批 ──

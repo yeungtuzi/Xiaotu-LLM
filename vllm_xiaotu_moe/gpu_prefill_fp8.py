@@ -377,7 +377,6 @@ def kmajor_from_engine_shards_fp8(engine, device, hidden: int, inter: int,
         w2_raw = w13_raw.view(-1)[: E * H * I].view(E, H, I)
     else:
         w2_raw = _buf("raw2", (E, H, I), device)
-    c2 = int(geo["w2_cbytes"])
     cr2 = int(geo["w2_crows"])
     _dma2d = _dma2d_available(engine)
     # Phase timing with CUDA events (no syncs, so it cannot perturb what it
@@ -1100,7 +1099,6 @@ def _moe_tile_launch_bmm(x, tok_all, wts_all, seg_start, e0, e1,
     """bmm 版 tile 计算：gather -> bmm(gate_up) -> SwiGLU -> bmm(down) -> index_add。"""
     import torch as _t
 
-    dev = x.device
     ne_all = int(e1 - e0)
     if ne_all == 0:
         return

@@ -34,7 +34,6 @@ MODULE_LEVEL_CTORS = ("set(", "list(", "dict(", "OrderedDict(", "defaultdict(", 
 KNOWN_BOUNDED_CONSTEXPR = {
     "PADDED_TOP_K": "2 的幂桶化（审计第 5 轮已核：combine_topk 的 CompileKey 字段均有界）",
     "topk": "topk 宽度（= topk_indices.shape[-1]，配置常量），**不是** token 数",
-    "stride_qm": "= q.stride(0)；q 的首维是 **num_heads**（不是 token）⇒ 配置常量",
 }
 
 KNOWN_BOUNDED = {
@@ -46,6 +45,7 @@ KNOWN_BOUNDED = {
     "_BMM_BUF": "key 的 ne 只有 {tile, 余数} 两种",
     "_BT_WIDTHS": "显式 _BT_WIDTHS_MAX=8",
     "_BOUND_CHECKED": "显式 _BOUND_CHECKED_MAX=16（第6轮审计 N4 引入的 capture/热路径 gate）",
+    "_BOUND_RECHECK": "显式上限：键集合与 _BOUND_CHECKED 同域（≤16），值只是复检计数器",
     # ── 第6轮绕过①③（非空字面量初始化 / AugAssign）生效后浮出的一批 ──
     #    全部逐条读过定义与写入点：均为**固定字符串 key 的统计/标志**，键集合由字面量决定。
     "_PH": "固定字符串 key 的统计字典（gpu_prefill_fp8.py:996，键为 'decode'/'gather'/'dma_k' 等字面量）",
@@ -163,9 +163,23 @@ def _check_call_sites(tree, fname: str, pnames: list, target_param: str) -> bool
             expr = ast.unparse(c.args[idx])
         if expr is None:
             continue
-        if not any(re.search(rf"\b{t}\b", expr) for t in _VOL_TENSOR_NAMES):
+        # ⛔ 第8轮阻断项A残留：上一版用 `\bslot_ids\b` 词边界匹配张量名，
+        #    而真实调用是 `compressed_slot_ids.stride(0)`（前缀不同）⇒ 结构性失明。
+        #    ⇒ 不再按"张量名白名单"过滤：只要实参表达式里出现 `.stride(` 或 `.shape[`
+        #    就视为"按形状派生的跨距/维度"，再由维度白名单排除 `shape[-1]` 这类固定维。
+        _fixed_dim = re.search(r"\.shape\[\s*-\s*1\s*\]", expr) is not None
+        if _fixed_dim:
             continue
-        if ".shape[" in expr or ".stride(0)" in expr:
+        # 名字匹配**容忍前后缀**：`compressed_slot_ids` / `kv_cache_out` 都应命中
+        # （这正是第8轮阻断项A漏掉 `compressed_slot_ids.stride(0)` 的原因）
+        _hit = False
+        for _t in _VOL_TENSOR_NAMES:
+            if re.search(rf"(^|[^A-Za-z0-9])[A-Za-z0-9_]*{re.escape(_t)}[A-Za-z0-9_]*\s*\.", expr):
+                _hit = True
+                break
+        if not _hit:
+            continue
+        if re.search(r"\.stride\(\s*0\s*\)", expr) or re.search(r"\.shape\[\s*0\s*\]", expr):
             return True
     return False
 
@@ -174,8 +188,9 @@ def check_file(path: str):
     try:
         src = open(path, encoding="utf-8", errors="replace").read()
         tree = ast.parse(src)
-    except SyntaxError:
-        return []            # 语法错误由别的检查负责
+    except SyntaxError as e:
+        # ⛔ 第8轮 §4-4：解析失败**静默变绿**是最危险的假绿 ⇒ 报成 finding
+        return [(path, 1, "C0", f"文件无法解析（SyntaxError: {e.msg}）⇒ 本文件未被审计")]            # 语法错误由别的检查负责
     lines = src.splitlines()
     global _LINES
     _LINES = lines
@@ -188,8 +203,26 @@ def check_file(path: str):
         decs = " ".join(ast.unparse(d) for d in node.decorator_list)
         if "triton.jit" not in decs:
             continue
-        # do_not_specialize 名单
-        dns = set(re.findall(r'["\']([A-Za-z_][A-Za-z0-9_]*)["\']', decs))
+        # ⛔ 第8轮 §4-2：旧版从**整条装饰器字符串**抠引号词 ⇒
+        #    `@triton.autotune(key=["num_candidates"])` 会污染 dns（逼人把合法 constexpr 降级）。
+        #    改为只读 `do_not_specialize=` 这个关键字（含位置参数形式）。
+        dns = set()
+        for _d in node.decorator_list:
+            if not isinstance(_d, ast.Call):
+                continue
+            _src = ast.unparse(_d.func)
+            if "triton.jit" not in _src:
+                continue
+            _vals = [k.value for k in _d.keywords if k.arg == "do_not_specialize"]
+            # 位置形式：@triton.jit([...]) 极少见，一并支持
+            _vals += [a for a in _d.args if isinstance(a, (ast.List, ast.Tuple, ast.Set))]
+            for _v in _vals:
+                if isinstance(_v, (ast.List, ast.Tuple, ast.Set)):
+                    for _e in _v.elts:
+                        if isinstance(_e, ast.Constant) and isinstance(_e.value, str):
+                            dns.add(_e.value)
+                elif isinstance(_v, ast.Constant) and isinstance(_v.value, str):
+                    dns.add(_v.value)
         args = [a.arg for a in node.args.args] + [a.arg for a in node.args.kwonlyargs]
         for kw in node.args.kwonlyargs:
             if kw.arg in args and kw.arg in dns:
@@ -218,7 +251,7 @@ def check_file(path: str):
                     _pat = None
                 else:
                     _v = ""
-            if False:
+            if False:  # noqa: SIM223  (保留占位，勿删)
                     # ⚠️ 只认"**随请求变化的张量**上的 `.shape[`"：
                     #    `k_cache.stride(0)` / `out.stride(1)` 这类跨距在配置固定时是常量，
                     #    用 `.stride(` 当证据会 24/24 全误报（实测）。

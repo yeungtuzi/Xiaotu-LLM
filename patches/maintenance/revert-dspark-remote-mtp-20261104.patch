@@ -1,0 +1,143 @@
+From: Xiaotu-LLM <xiaotu@local>
+Subject: [MAINTENANCE] 移除 dflash speculator 里已废除的 DSpark-remote（GPU0 独立 MTP）代码
+
+适用范围：**仅**用于"树里被塞进了 DSpark-remote（GPU0 独立 MTP）代码"的情形；
+本补丁把 `vllm/v1/worker/gpu/spec_decode/dflash/speculator.py` 的该段改动**反向撤销**，
+回到上游 HEAD 版本。**不在 `patches/xtu-series/series` 里**，因为它撤销的是别人的在途改动，
+不是我们对上游的功能补丁。
+
+背景（2026-11-04）：
+1. 用户明令「GPU0独立mtp已经废除」；`scripts/serve_ds41.sh` 已显式 `export XIAOTU_DSPARK_REMOTE=0`。
+2. 但树里残留了 remote-MTP 实现，其中 `dflash/speculator.py` 有一行
+       hidden_states = self.model.main_norm(self.model.main_proj(hidden_states))
+   直接访问 draft 模型属性；而 remote 路径回落的 `_IdentityDraftModel` 只有
+   `combine_hidden_states()`（恒等、不投影）⇒ 启动即 `AttributeError: ... 'main_norm'`。
+3. 即使绕过 AttributeError，identity 不投影会让 15360 宽的 aux 直接灌进 5120 的
+   `hidden_states` ⇒ `RuntimeError: The size of tensor a (5120) must match ... (15360)`。
+4. 上游 HEAD 同一位置用的是多态调用 `self.model.combine_hidden_states(...)`（见 :377），
+   本来就没有这个 bug ⇒ 正确处置是**恢复上游版本**，而不是继续在坏代码上打补丁。
+
+实测（恢复后，SPEC=1 + PC=0 + EXPANDABLE=1 + GPU_UTIL=0.9）：
+  health=200、GPU1/2 各 36.9 GiB、warmup 200/32 tokens、
+  Mean acceptance length=3.00、日志中 `main_norm`/`Connection refused` 计数 0。
+
+用法（在含该污染代码的 vllm 树里）：
+  git apply -R patches/maintenance/revert-dspark-remote-mtp-20261104.patch
+  # 或等价地：git checkout -- vllm/v1/worker/gpu/spec_decode/dflash/speculator.py
+
+---
+diff --git b/vllm/v1/worker/gpu/spec_decode/dflash/speculator.py a/vllm/v1/worker/gpu/spec_decode/dflash/speculator.py
+index 1b724d0f4f..57110e0b05 100644
+--- b/vllm/v1/worker/gpu/spec_decode/dflash/speculator.py
++++ a/vllm/v1/worker/gpu/spec_decode/dflash/speculator.py
+@@ -1,7 +1,6 @@
+ # SPDX-License-Identifier: Apache-2.0
+ # SPDX-FileCopyrightText: Copyright contributors to the vLLM project
+ import copy
+-import os
+ from typing import Any
+ 
+ import torch
+@@ -151,9 +150,6 @@ class DFlashSpeculator(DraftModelSpeculator):
+         )
+ 
+     def capture(self) -> None:
+-        if __import__("os").environ.get("XIAOTU_DSPARK_REMOTE", "") not in ("", "0", "false", "False"):
+-            # Remote GPU0 server captures its own draft graph.
+-            return
+         logger.info("Capturing model for %s speculator...", self._speculator_name)
+         # Padded sample rows must not scatter into a live request during capture.
+         self.sample_indices.zero_()
+@@ -191,20 +187,6 @@ class DFlashSpeculator(DraftModelSpeculator):
+         target_input_buffers: InputBuffers,
+         target_attn_groups: list[list[AttentionGroup]],
+     ) -> None:
+-        if __import__("os").environ.get("XIAOTU_DSPARK_REMOTE", "") not in ("", "0", "false", "False"):
+-            # Build the generic speculator state (incl. attn_cg_support) but do
+-            # not allocate draft KV groups; GPU0 server owns them.
+-            DraftModelSpeculator.set_attn(
+-                self, model_state, kv_cache_config, block_tables,
+-                target_input_buffers, target_attn_groups,
+-            )
+-            self.draft_kv_cache_group_ids = []
+-            self.draft_kv_cache_group_id = -1
+-            self._context_slot_mappings = torch.zeros(
+-                0, 0, dtype=torch.int64, device=self.device
+-            )
+-            self._layer_group_idx = None
+-            return
+         super().set_attn(
+             model_state,
+             kv_cache_config,
+@@ -380,8 +362,6 @@ class DFlashSpeculator(DraftModelSpeculator):
+         is_profile: bool = False,
+     ) -> torch.Tensor:
+         num_reqs = input_batch.num_reqs
+-        if (dummy_run or is_profile) and __import__("os").environ.get("XIAOTU_DSPARK_REMOTE", "") not in ("", "0", "false", "False"):
+-            return self.draft_tokens[:num_reqs]
+         num_target_tokens = input_batch.num_tokens
+         num_query_tokens = num_reqs * self.num_query_per_req
+         max_seq_len = input_batch.seq_lens_cpu_upper_bound[:num_reqs].max().item()
+@@ -399,44 +379,6 @@ class DFlashSpeculator(DraftModelSpeculator):
+             )
+         else:
+             hidden_states = last_hidden_states
+-        if os.environ.get("XIAOTU_DSPARK_REMOTE", "") not in ("", "0", "false", "False") and not dummy_run and not is_profile:
+-            try:
+-                import pickle as _pkl
+-                import socket as _sock
+-
+-                _req = {
+-                    "main_x": hidden_states[:num_target_tokens].detach().cpu(),
+-                    "positions": input_batch.positions[:num_target_tokens].detach().cpu(),
+-                    "anchor": int(input_batch.input_ids[num_target_tokens - 1].item()),
+-                    "q_len": int(self.num_query_per_req),
+-                }
+-                _s = _sock.socket(_sock.AF_UNIX, _sock.SOCK_STREAM)
+-                _s.connect(os.environ.get("XIAOTU_DSPARK_REMOTE_SOCK", "/tmp/dspark_gpu0.sock"))
+-                _f = _s.makefile("rwb")
+-                _pkl.dump(_req, _f)
+-                _f.flush()
+-                _resp = _pkl.load(_f)
+-                if not _resp.get("ok"):
+-                    raise RuntimeError(_resp.get("error", "remote draft failed"))
+-                _tok = torch.tensor(
+-                    _resp["tokens"][: self.num_query_per_req],
+-                    dtype=self.draft_tokens.dtype,
+-                    device=self.device,
+-                ).unsqueeze(0)
+-                self.draft_tokens[:num_reqs].copy_(_tok.expand(num_reqs, -1))
+-                print(f"[dspark-remote] tokens={_resp['tokens']}", flush=True)
+-                return self.draft_tokens[:num_reqs]
+-            except Exception as _e:
+-                print(f"[dspark-remote] fallback local: {_e}", flush=True)
+-
+-        if hidden_states.shape[-1] != self.hidden_states.shape[-1]:
+-            print(f"[dflash-combine] in={tuple(hidden_states.shape)} model={type(self.model).__name__}", flush=True)
+-            # ⛔ [xtu 2026-11-04] 这里直接访问 `main_norm`/`main_proj` 只有"带这两个
+-            #    属性的 draft 模型"才成立；DSpark 的 `_IdentityDraftModel` 只提供
+-            #    `combine_hidden_states()` 多态接口 ⇒ 启动即 AttributeError。
+-            #    改为与上面 :397 相同的多态调用，两种 draft 模型都能走。
+-            hidden_states = self.model.combine_hidden_states(hidden_states)
+-            print(f"[dflash-combine] out={tuple(hidden_states.shape)}", flush=True)
+         self.hidden_states[:num_target_tokens].copy_(hidden_states[:num_target_tokens])
+         self.prepare_context_anchor(input_batch, num_rejected)
+ 
+@@ -502,17 +444,6 @@ class DFlashSpeculator(DraftModelSpeculator):
+                 self.sample_from_anchor,
+             )
+ 
+-        if __import__("os").environ.get("XIAOTU_DSPARK_QUERY_DUMP") and not torch.cuda.is_current_stream_capturing() and not getattr(self, "_xtu_query_dumped", False):
+-            try:
+-                import torch as _t
+-                _t.save({
+-                    "sample_indices": self.sample_indices[: self.num_speculative_steps],
+-                    "sample_pos": self.sample_pos[: self.num_speculative_steps],
+-                }, __import__("os").environ["XIAOTU_DSPARK_QUERY_DUMP"])
+-                self._xtu_query_dumped = True
+-                print("[dspark-query-dump] wrote-gpu", flush=True)
+-            except Exception as _e:
+-                print(f"[dspark-query-dump] failed: {_e}", flush=True)
+         batch_sync, num_batch_tokens = (
+             self._build_uniform_batch_dp_sync(dp_sync, num_reqs, self.num_query_per_req)
+             if dp_sync is not None

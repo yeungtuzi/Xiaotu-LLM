@@ -62,6 +62,8 @@ KNOWN_BOUNDED = {
     "_MQA_BOUND_CALLS": "键集合与 _MQA_BOUND_SEEN 同域（≤16），值只是复检计数器",
     "_BND_ADDR_SEEN": "显式上限 16（indexer_k_store.py 的 capture/热路径 gate）",
     "_BND_ADDR_CALLS": "键集合与 _BND_ADDR_SEEN 同域（≤16），值只是复检计数器",
+    "_FCC_BND_SEEN": "显式上限 16（v41 fused_compress_quant_cache.py 的 capture gate）",
+    "_FCC_BND_CALLS": "键集合与 _FCC_BND_SEEN 同域（≤16），值只是复检计数器",
     # ── 第39轮：KV 缓存布局常量（调用点实测：kv_cache.stride(0) / kv_score.stride(0)）──
     #    进程内恒定（由 KV 缓存分配决定），跨重启可能变 ⇒ 变体数有界，**不随每请求变化**。
     # ── 第6轮绕过①③（非空字面量初始化 / AugAssign）生效后浮出的一批 ──
@@ -617,7 +619,9 @@ def check_file(path: str):
             # 判据（第7轮 N5 的合理内核）：必须有**非恒真**的上界比较 ——
             #   ✅ `x.max() <= cap` / `x <= shape[-1]*block_size` / `shape[0] >= batch_size`
             #   ❌ `shape[1] >= 0`（对常量字面量的恒真比较）
-            _has_cmp = any(op in t for op in ("<=", ">=", "<", ">"))
+            # ⛔ 2026-11-04：`a.shape[0] == b.shape[0]` 这类**结构等式**同样是契约
+            #    （维度对不上时内核实参会错位读取），不能只认不等号。
+            _has_cmp = any(op in t for op in ("<=", ">=", "<", ">", "=="))
             if not _has_cmp:
                 return False
             # ⛔ 第12轮：`numel() >= 1` 这类断言曾算"上界" ⇒ 已由上面的 `_tauto`（拒 0/1 字面量）处理；

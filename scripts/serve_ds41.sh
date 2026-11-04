@@ -16,11 +16,11 @@
 #   bash scripts/serve_ds41.sh restart [NAME=VAL ...] [+--flag=值 ...]
 #
 # 可覆盖的 NAME=VAL（白名单外一律拒绝）：
-#   TAG=prod PORT=8700 TP=2 GPU_UTIL=0.85 MAXSEQS=4 MBT=8192 MAXLEN=524288
+#   TAG=prod PORT=8700 TP=2 GPU_UTIL=0.90 MAXSEQS=4 MBT=8192 MAXLEN=524288
 #   THREADS=60 IMAGE_MAX=128 COMPILE_RANGES=32,256,8192
 #   PIN=1 PIN_SLOTS=15 PIN_MAXQ=16 CED=1 WARMUP=1 KV_DTYPE=fp8_ds_mla
 #   SPEC=1 MODEL_DIR=<路径>
-#   EXPANDABLE=0   1=expandable_segments:True + 追加 --disable-custom-all-reduce；
+#   EXPANDABLE=1   1=expandable_segments:True（**默认**，碎片治理）；0=关 + 追加 --disable-custom-all-reduce；
 #                  0=显式 expandable_segments:False（自定义 allreduce 保持开启）
 #
 # +额外参数：只允许**白名单之外**的 `--flag` / `--flag=值`；
@@ -42,14 +42,14 @@ MEM_GATE="${MEM_GATE:-$REPO_DIR/scripts/prelaunch_mem_gate.sh}"
 # 本机实际部署树（REPO_DIR/vllm 不存在；跨树校验按真实位置比对，不按名字猜）
 VLLM_DIR="${VLLM_DIR:-/home/user/lvllm/process_data/ref/repos/vllm-mainline/vllm}"   # 注意：vpath 是包目录 dirname(vllm.__file__)
 
-TAG="prod"; PORT=8700; TP=2; GPU_UTIL=0.85; MAXSEQS=4; MBT=8192; MAXLEN=524288
+TAG="prod"; PORT=8700; TP=2; GPU_UTIL=0.9; MAXSEQS=4; MBT=8192; MAXLEN=524288
 THREADS=60; IMAGE_MAX=128; COMPILE_RANGES="32,256,8192"
 PIN=1; PIN_SLOTS=15; PIN_MAXQ=16; CED=1; WARMUP=1
-PC=1; PC_GB=64; PC_BLOCKS=16; PC_ROOT="/home/user/.cache/prefix-cache"
+PC=0; PC_GB=64; PC_BLOCKS=16; PC_ROOT="/home/user/.cache/prefix-cache"
 PC_FREE_MIN_MIB="${PC_FREE_MIN_MIB:-524288}"
 PC_WRITE_WAIT="${PC_WRITE_WAIT:-900}"
 ALLOC_CONF_EFFECTIVE=""
-KV_DTYPE="fp8_ds_mla"; SPEC=1; MODEL_DIR="$MODEL_DIR_DEFAULT"; EXPANDABLE=0
+KV_DTYPE="fp8_ds_mla"; SPEC=1; MODEL_DIR="$MODEL_DIR_DEFAULT"; EXPANDABLE=1
 EXTRA_ARGS=()
 
 die() { printf '[ds41] ⛔ %s\n' "$1" >&2; exit "${2:-2}"; }
@@ -373,7 +373,7 @@ start() {
         say "EXPANDABLE=0：expandable_segments:False（历史设置；碎片靠其它手段）"
     fi
     [ "$CED" = "0" ] && say "⚠️ CED=0：这是基线臂，报告中必须标注"
-    [ "$PC" = "0" ] && say "⚠️ PC=0：本次不启用磁盘前缀缓存（非默认生产口径，报告须注明）"
+    [ "$PC" = "0" ] && say "⚠️ PC=0（稳定口径）：不启用磁盘前缀缓存；如需持久缓存实验臂用 PC=1，须加 ALLOW_PC1=1"
 
     if [ "$PC" = "1" ]; then
         mkdir -p "$PC_ROOT" 2>/dev/null || die "PC_ROOT 无法创建：$PC_ROOT" 3

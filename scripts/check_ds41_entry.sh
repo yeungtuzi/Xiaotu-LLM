@@ -17,7 +17,7 @@
 #         2=未运行 / 3=启动中（合规，但未就绪）
 #
 # 用法：bash scripts/check_ds41_entry.sh [--port 8700] [--run-dir <dir>]
-# 环境：ALLOW_PC0=1 显式允许 PC=0 臂（否则判违规）
+# 环境：ALLOW_PC1=1 显式允许非稳定口径（PC=1，实验臂用）
 
 set -u
 PORT=8700
@@ -28,7 +28,7 @@ while [ $# -gt 0 ]; do
         --port) PORT="${2:?}"; shift 2 ;;
         --run-dir) RUN_DIR="${2:?}"; shift 2 ;;
         -h|--help) sed -n '2,24p' "$0"; exit 0 ;;
-        *) echo "未知参数: $1（ALLOW_PC0=1 是环境变量，不是参数）" >&2; exit 64 ;;
+        *) echo "未知参数: $1（ALLOW_PC1=1 是环境变量，不是参数）" >&2; exit 64 ;;
     esac
 done
 
@@ -137,18 +137,28 @@ case "${alloc:-}" in
     *) echo "  PYTORCH_CUDA_ALLOC_CONF=${alloc:-未设}" ;;
 esac
 
+# ⛔ 2026-11-04 用户定：**稳定口径 = PC=0 + EXPANDABLE=1**（控显存乱飞优先，放弃磁盘前缀缓存）。
+#    PC 与 expandable_segments 在 vLLM 里硬互斥（vllm/config/vllm.py:1214-1258）。
+#    以前这里反过来（PC=1 才是"默认"），导致实例可以静默用 PC=1+EXPANDABLE=0 跑一整天
+#    而没人发现（台账 #391）。现在改为**机械校验**，两侧都要对上。
 kvoff="$(printf '%s' "$cmdline" | grep -oE -- '--kv-offloading-size [0-9]+' | head -1)"
-if [ -n "$kvoff" ]; then
-    if printf '%s' "$cmdline" | grep -q -- 'TieringOffloadingSpec'; then
-        echo "✓ 前缀缓存已接线（$kvoff，tiering offload）"
-    else
-        echo "✗ 有 --kv-offloading-size 但缺 TieringOffloadingSpec ⇒ 磁盘层不生效" >&2
-        rc=1
-    fi
-elif [ "${ALLOW_PC0:-0}" = "1" ]; then
-    echo "  PC=0（已用 ALLOW_PC0=1 显式放行；报告须注明）"
+expd="$(printf '%s' "$cmdline" | grep -oE 'expandable_segments:(True|False)' | head -1)"
+if [ "${ALLOW_PC1:-0}" = "1" ]; then
+    echo "  PC=1（已用 ALLOW_PC1=1 显式放行；报告须注明这是非稳定口径）"
 else
-    echo "✗ PC=0（PC=1 是默认生产口径；实验臂请加 ALLOW_PC0=1）" >&2
+    if [ -n "$kvoff" ]; then
+        echo "✗ 发现 $kvoff（PC 开）⇒ 与稳定口径 PC=0 不符；实验臂请加 ALLOW_PC1=1" >&2
+        rc=1
+    else
+        echo "✓ PC=0（稳定口径）"
+    fi
+fi
+if [ "${ALLOW_PC1:-0}" = "1" ]; then
+    :
+elif [ "$expd" = "expandable_segments:True" ]; then
+    echo "✓ expandable_segments:True（稳定口径）"
+else
+    echo "✗ expandable_segments 非 True（实测 '${expd:-未取到}'）⇒ 碎片治理未启用" >&2
     rc=1
 fi
 

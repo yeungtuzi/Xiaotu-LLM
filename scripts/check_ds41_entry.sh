@@ -142,7 +142,9 @@ esac
 #    以前这里反过来（PC=1 才是"默认"），导致实例可以静默用 PC=1+EXPANDABLE=0 跑一整天
 #    而没人发现（台账 #391）。现在改为**机械校验**，两侧都要对上。
 kvoff="$(printf '%s' "$cmdline" | grep -oE -- '--kv-offloading-size [0-9]+' | head -1)"
-expd="$(printf '%s' "$cmdline" | grep -oE 'expandable_segments:(True|False)' | head -1)"
+# ⚠️ expandable_segments 在**环境变量** PYTORCH_CUDA_ALLOC_CONF 里，不在命令行
+expd="$(printf '%s\n' "$environ" | grep '^PYTORCH_CUDA_ALLOC_CONF=' \
+        | grep -oE 'expandable_segments:(True|False)' | head -1)"
 if [ "${ALLOW_PC1:-0}" = "1" ]; then
     echo "  PC=1（已用 ALLOW_PC1=1 显式放行；报告须注明这是非稳定口径）"
 else

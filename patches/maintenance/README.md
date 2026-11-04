@@ -12,6 +12,7 @@
 
 | 文件 | 用途 | 日期 |
 |---|---|---|
+| `cleanup-dspark-remote-scaffold-20261104.patch` | 移除 `spec_decode/dspark/speculator.py` 里的 DSpark-remote 脚手架（`_IdentityDraftModel` / `_xtu_remote` / `load_draft_model` 与 `set_attn` 的 remote 分支）。用户 2026-11-04「GPU0独立mtp已经废除」；这些符号在树内已零引用。**不动** `XTU_VARLEN_K` 变长草稿特性。 | 2026-11-04 |
 | `revert-dspark-remote-mtp-20261104.patch` | 撤销 `spec_decode/dflash/speculator.py` 里已废除的 DSpark-remote（GPU0 独立 MTP）代码，回到上游 HEAD。来由：该段代码直接访问 `self.model.main_norm/main_proj`，而 remote 回落的 `_IdentityDraftModel` 只有 `combine_hidden_states()` ⇒ 启动 AttributeError；即便绕过，identity 不投影导致 15360 vs 5120 尺寸不匹配。上游 HEAD 本来用多态调用，无此 bug。 | 2026-11-04 |
 
 ## 使用

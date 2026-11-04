@@ -1,0 +1,133 @@
+From: Xiaotu-LLM <xiaotu@local>
+Subject: [MAINTENANCE] 移除 dspark speculator 里已废除的 DSpark-remote（GPU0 独立 MTP）脚手架
+
+配套补丁：`revert-dspark-remote-mtp-20261104.patch`（撤销 dflash 侧的同类代码）。
+本补丁撤销 `spec_decode/dspark/speculator.py` 里的 remote-MTP 脚手架，即：
+
+  - `class _IdentityDraftModel(torch.nn.Module): combine_hidden_states() -> 恒等`
+  - `DSparkSpeculator._xtu_remote()`（读 `XIAOTU_DSPARK_REMOTE`）
+  - `load_draft_model()` 里的 remote 分支（remote 时返回 identity、跳过本地权重加载）
+  - `set_attn()` 里的 remote 分支（不分配本地 draft KV group）
+
+背景：用户 2026-11-04「GPU0独立mtp已经废除」。这些符号在树内**已零引用**
+（除本文件外 grep `_IdentityDraftModel|_xtu_remote|XIAOTU_DSPARK_REMOTE` 命中 0），
+留着只会让"已废除的路径"随时被环境变量复活 —— 这正是 SPEC=1 启动崩溃的直接原因。
+
+注意：**不要**把它和 `XTU_VARLEN_K`（变长草稿预算）混为一谈——
+后者是仍在使用的独立特性，本补丁**不动**它。
+
+实测（清理后、**未重启**生产）：
+  远端 `_IdentityDraftModel|_xtu_remote|XIAOTU_DSPARK_REMOTE` 计数 = 0
+  生产 PID 382423 存活、health=200（清理只改文件，不触碰运行中的进程）
+
+用法（在含该污染代码的 vllm 树里）：
+  git apply patches/maintenance/cleanup-dspark-remote-scaffold-20261104.patch
+  # 或等价地：用本地干净版本覆盖该文件
+
+---
+--- /tmp/dspark_remote.py	2026-11-04 18:11:54.486734832 +0800
++++ data/repos/vllm-mainline/vllm/v1/worker/gpu/spec_decode/dspark/speculator.py	2026-11-01 20:27:51.175899551 +0800
+@@ -25,7 +25,6 @@
+ 
+ from typing import Any
+ 
+-import os
+ import torch
+ 
+ from vllm.config import VllmConfig
+@@ -38,11 +37,6 @@
+ logger = init_logger(__name__)
+ 
+ 
+-class _IdentityDraftModel(torch.nn.Module):
+-    def combine_hidden_states(self, hidden_states):
+-        return hidden_states
+-
+-
+ class DSparkSpeculator(DFlashSpeculator):
+     _speculator_name = "DSpark"
+ 
+@@ -87,52 +81,12 @@
+ 
+         self.use_confidence_head: bool = False
+ 
+-    @staticmethod
+-    def _xtu_remote() -> bool:
+-        return __import__("os").environ.get("XIAOTU_DSPARK_REMOTE", "") not in ("", "0", "false", "False")
+-
+-    def set_attn(
+-        self,
+-        model_state,
+-        kv_cache_config,
+-        block_tables,
+-        target_input_buffers,
+-        target_attn_groups,
+-    ) -> None:
+-        super().set_attn(
+-            model_state, kv_cache_config, block_tables,
+-            target_input_buffers, target_attn_groups,
+-        )
+-        if self._xtu_remote():
+-            # GPU0 server owns draft weights/KV/graph; target must not allocate
+-            # any local draft KV groups.  Keep attn_cg_support from super().
+-            self.draft_kv_cache_group_ids = []
+-            self.draft_kv_cache_group_id = -1
+-            self._context_slot_mappings = torch.zeros(
+-                0, 0, dtype=torch.int64, device=self.device
+-            )
+-            self._layer_group_idx = None
+-
+     def load_draft_model(
+         self,
+         target_model: torch.nn.Module,
+         target_attn_layer_names: set[str],
+     ) -> torch.nn.Module:
+-        if self._xtu_remote():
+-            # Remote path: no local DSpark weights on GPU1/2.
+-            return _IdentityDraftModel()
+         model = load_dspark_model(target_model, self.vllm_config)
+-        if __import__("os").environ.get("XIAOTU_DSPARK_MARKOV_DUMP"):
+-            try:
+-                _md = {
+-                    _k: _v.detach()
+-                    for _k, _v in model.state_dict().items()
+-                    if "markov" in _k or "confidence" in _k or "main_proj" in _k
+-                }
+-                torch.save(_md, __import__("os").environ["XIAOTU_DSPARK_MARKOV_DUMP"])
+-                print(f"[dspark-markov-dump] keys={len(_md)}", flush=True)
+-            except Exception as _e:
+-                print(f"[dspark-markov-dump] failed: {_e}", flush=True)
+         # Reduced draft vocab: probabilistic rejection sampling indexes draft
+         # logits by target id, so precompute the draft->target column map and a
+         # scratch buffer to scatter logits into target vocab before sampling.
+@@ -168,14 +122,6 @@
+         sample_pos: torch.Tensor,
+         step: int,
+     ) -> torch.Tensor:
+-        if (__import__("os").environ.get("XIAOTU_DSPARK_LOGITS_DUMP") and getattr(self, "_xtu_real_propose", False) and not torch.cuda.is_current_stream_capturing()):
+-            try:
+-                import torch as _t
+-                path = __import__("os").environ["XIAOTU_DSPARK_LOGITS_DUMP"] + f".step{step}"
+-                _t.save(logits.detach().cpu(), path)
+-                print("[dspark-logits-dump] wrote " + __import__("os").environ["XIAOTU_DSPARK_LOGITS_DUMP"], flush=True)
+-            except Exception as _e:
+-                print(f"[dspark-logits-dump] failed: {_e}", flush=True)
+         self._maybe_predict_acceptance(logits, idx_map, self._step_cols[step])
+         if self.draft_logits is None:
+             draft_ids = logits.argmax(dim=-1)
+@@ -343,15 +289,4 @@
+             num_tokens_across_dp,
+             cudagraph_runtime_mode,
+         )
+-        if __import__("os").environ.get("XIAOTU_DSPARK_QUERY_DUMP") and not torch.cuda.is_current_stream_capturing() and not getattr(self, "_xtu_query_dumped", False):
+-            try:
+-                import torch as _t
+-                _t.save({
+-                    "input_ids": self.input_buffers.input_ids[:num_tokens_padded].detach().cpu(),
+-                    "positions": self.input_buffers.positions[:num_tokens_padded].detach().cpu(),
+-                }, __import__("os").environ["XIAOTU_DSPARK_QUERY_DUMP"])
+-                self._xtu_query_dumped = True
+-                print("[dspark-query-dump] wrote", flush=True)
+-            except Exception as _e:
+-                print(f"[dspark-query-dump] failed: {_e}", flush=True)
+         self._sample_sequential(num_reqs, head_hidden)

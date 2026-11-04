@@ -23,6 +23,13 @@
 #   EXPANDABLE=1   1=expandable_segments:True（**默认**，碎片治理）；0=关 + 追加 --disable-custom-all-reduce；
 #                  0=显式 expandable_segments:False（自定义 allreduce 保持开启）
 #
+#
+# ⛔ 启动冒烟（2026-11-04 起，**独立于 WARMUP**）：start 返回后仍会在后台跑一次
+#    "混合并发"冒烟（1 路短 prompt 长解码 + 1 路 ~380 token 短 prefill），
+#    上限 10 分钟（正常约 6 秒）、固定占 2 个 slot。长 prefill 耐力（6.9K+/~10min）由手工压测覆盖，不进启动闸门。⇒ **测速/TTFT 前先看 `status`**：
+#    出现「⏳ 启动冒烟进行中」就等它结束；失败会写 `<TAG>.smoke.fail`，
+#    `status` 会以「⛔ 冒烟失败」显示（即使服务已死也能看到）。
+#
 # +额外参数：只允许**白名单之外**的 `--flag` / `--flag=值`；
 #   会覆盖本脚本保证口径的旗标（--port/--compilation-config/--no-swa-bounded-replay…）一律拒绝。
 #
@@ -539,6 +546,71 @@ start() {
     { echo "[ds41] [口径] EXPANDABLE=$EXPANDABLE PYTORCH_CUDA_ALLOC_CONF=${ALLOC_CONF_EFFECTIVE:-unset} custom-AR=$([ "$EXPANDABLE" = "1" ] && echo off || echo on) PC=$PC PC_GB=$PC_GB PC_BLOCKS=$PC_BLOCKS PC_ROOT=$PC_ROOT GPU_UTIL=$GPU_UTIL PC_FILES_BASE=${_pc_base:-na}"; } >> "$LOG_FILE"
     say "显存: $(nvidia-smi --query-gpu=index,memory.used --format=csv,noheader | tr '\n' ' ')"
 
+    # ⛔ 2026-11-04 审计 B 后重写：启动健康闸。
+    #   事故：14:17 服务被错误断言打崩（一 prefill + 一 decode 并发），8 小时无人发现。
+    #   本闸**独立于 WARMUP**（调试臂 WARMUP=0 同样需要它），两路**非对称**：
+    #     B 路：短 prompt + 长解码（先起，占住 decode）
+    #     A 路：短 prompt（~380 token）+ 只解 1 token（让"1 decode + 1 prefill"同处一个 batch step）
+    #   失败时同时落到：smoke.log、服务日志 $LOG_FILE、标记文件 <TAG>.smoke.fail
+    #   （`status` 会 tail 标记文件；只写 stderr 等于没人看得见）。
+    (
+        exec 9>&- >/dev/null 2>>"$RUN_DIR/ds41_${TAG}_smoke.err"
+        sm() { printf '%s\n' "$*" >> "$RUN_DIR/ds41_${TAG}_smoke.log"; }
+        # 清理必须在任何早退之前（审计 B · M-3：否则无 curl 时旧失败标记会一直挂着）
+        rm -f "$RUN_DIR/ds41_${TAG}_smoke_"*.code "$RUN_DIR/ds41_${TAG}_smoke_"*.rc \
+              "$RUN_DIR/ds41_${TAG}_smoke_"*.req "$RUN_DIR/ds41_${TAG}.smoke.fail" 2>/dev/null
+        if ! command -v curl >/dev/null 2>&1; then
+            sm "[$(date +%H:%M:%S)] ⚠️ 冒烟跳过：无 curl"
+            exit 0
+        fi
+        # A 路的填充串：30 × 46 ≈ 1.4K 字符 ≈ 380 token。
+        #   ⛔ 2026-11-04 实测教训：填到 6.9K token 时，与 decode 并发会让 GPU prefill 的
+        #   slack 不足 ⇒ 落到 **CPU prefill**（`[xtu-pf-progress] device=cpu`，~8s/层），
+        #   单次冒烟要十几分钟、还占着 2 个 slot ⇒ 冒烟本身成了负担。
+        #   本冒烟要覆盖的是"**同一 batch 里既有 prefill 又有 decode**"（14:17 事故形态），
+        #   380 token 已足够形成混合批；不追求把 prompt 堆到 GPU prefill 门槛之上。
+        # ⛔ 前缀缓存默认开启 ⇒ 固定填充串从第二次 start 起会被**整段命中**，
+        #    A 路的"长 prefill"直接消失，冒烟退化成两路 decode 却仍显示 ok=2（比原版更隐蔽的假绿）。
+        #    ⇒ 每轮拼一个 nonce 进 content，保证每次都是冷 prefill。
+        _rid="$(date +%s)_$$"
+        _pad="run ${_rid} $(awk 'BEGIN{for(i=0;i<30;i++)printf "alpha beta gamma delta epsilon zeta eta theta "}')"
+                printf '{"model":"%s","messages":[{"role":"user","content":"probe b"}],"max_tokens":256,"temperature":0}' \
+            "$SERVED_NAME" > "$RUN_DIR/ds41_${TAG}_smoke_${_rid}_1.req"
+        printf '{"model":"%s","messages":[{"role":"user","content":"%s"}],"max_tokens":1,"temperature":0}' \
+            "$SERVED_NAME" "$_pad" > "$RUN_DIR/ds41_${TAG}_smoke_${_rid}_2.req"
+        printf 'started %s rid=%s\n' "$(date '+%H:%M:%S')" "$_rid" > "$RUN_DIR/ds41_${TAG}.smoke.busy" 2>/dev/null
+        _url="http://127.0.0.1:${PORT}/v1/chat/completions"
+        _fire() {  # $1=序号 $2=请求体文件
+            { curl -s -o /dev/null --noproxy '*' --max-time 600 -w '%{http_code}' \
+                  -H 'Content-Type: application/json' --data-binary "@$2" "$_url" \
+                  > "$RUN_DIR/ds41_${TAG}_smoke_${_rid}_$1.code" 2>/dev/null
+              echo $? > "$RUN_DIR/ds41_${TAG}_smoke_${_rid}_$1.rc"; } &
+        }
+        _fire 1 "$RUN_DIR/ds41_${TAG}_smoke_${_rid}_1.req"     # 先起 B（短 prompt，长解码）
+        sleep 0.3
+        _fire 2 "$RUN_DIR/ds41_${TAG}_smoke_${_rid}_2.req"     # 再起 A（长 prefill）
+        wait
+        _ok=0; _bad=""
+        for _n in 1 2; do
+            _c="$(cat "$RUN_DIR/ds41_${TAG}_smoke_${_rid}_${_n}.code" 2>/dev/null)"
+            _r="$(cat "$RUN_DIR/ds41_${TAG}_smoke_${_rid}_${_n}.rc" 2>/dev/null)"
+            # 判据：http=200 **且** curl 退出码 0（只有 200 会漏「头发完、body 断流」= rc 18）
+            if [ "$_c" = "200" ] && [ "$_r" = "0" ]; then
+                _ok=$((_ok + 1))
+            else
+                _bad="${_bad} ${_n}(http=${_c:-none},rc=${_r:-none})"
+            fi
+        done
+        _line="[$(date +%H:%M:%S)] 混合并发冒烟(1=短解/2=长prefill) ok=${_ok} bad=[${_bad# }]"
+        sm "$_line"
+        if [ -n "$_bad" ]; then
+            printf '[ds41] ⛔ 启动冒烟失败:%s ⇒ 详见 %s\n' "$_line" "$RUN_DIR/ds41_${TAG}_smoke.log" >> "$LOG_FILE"
+            printf '[ds41] ⛔ 启动冒烟失败:%s\n' "$_line" > "$RUN_DIR/ds41_${TAG}.smoke.fail"
+        fi
+        rm -f "$RUN_DIR/ds41_${TAG}_smoke_${_rid}_"*.req "$RUN_DIR/ds41_${TAG}.smoke.busy" 2>/dev/null
+    ) &
+    say "启动冒烟已在后台发起（混合并发；结果 $RUN_DIR/ds41_${TAG}_smoke.log，失败标记 $RUN_DIR/ds41_${TAG}.smoke.fail）"
+
     if [ "$WARMUP" = "1" ]; then
         if [ -f "$WARMUP_SCRIPT" ]; then
             say "形状预热开始（文本多长度 + 1/4 图 + 并发 2）…"
@@ -546,7 +618,7 @@ start() {
                 >> "$RUN_DIR/ds41_${TAG}_warmup.log" 2>&1 < /dev/null & )
             say "预热在后台跑，日志 $RUN_DIR/ds41_${TAG}_warmup.log"
         else
-            die "WARMUP=1 但 $WARMUP_SCRIPT 不存在 ⇒ 拒绝以「已预热」口径继续（改 WARMUP=0 或补脚本）" 3
+            die "WARMUP=1 但 $WARMUP_SCRIPT 不存在 ⇒ 拒绝以「已预热」口径继续（改 WARMUP=0 或修路径）" 3
         fi
     fi
 }
@@ -610,6 +682,14 @@ status() {
     [ -f "$PID_FILE" ] && pid="$(tr -dc '0-9' < "$PID_FILE" 2>/dev/null || true)"
     ps="$(port_state "$PORT")"
     say "TAG=$TAG PID文件=${pid:-无} 端口归属=${ps}"
+    # ⛔ 启动冒烟状态（审计 B · H3/M-4）：**必须**在下面的"未运行"早退之前，
+    #    否则服务已经死掉时永远看不到冒烟失败标记 —— 而那正是最需要它的场景。
+    if [ -s "$RUN_DIR/ds41_${TAG}.smoke.fail" ]; then
+        say "⛔ 冒烟失败: $(tr -d '\n' < "$RUN_DIR/ds41_${TAG}.smoke.fail" | cut -c1-160)"
+    fi
+    if [ -f "$RUN_DIR/ds41_${TAG}.smoke.busy" ]; then
+        say "⏳ 启动冒烟进行中（占 2 槽；测速请等它结束）: $(tr -d '\n' < "$RUN_DIR/ds41_${TAG}.smoke.busy" | cut -c1-80)"
+    fi
     if ! verify_owns "$pid"; then
         case "$ps" in
             owned:*) say "⚠️ PID 文件与端口归属不一致（疑似陈旧 PID 文件）；端口实际拥有者=${ps#owned:}" ;;

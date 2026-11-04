@@ -286,7 +286,14 @@ def prealloc_fp8_buffers(device, n_experts: int, hidden: int, inter: int) -> Non
     #    ⇒ `staging_tile_experts` 现在**永不返回 E** ⇒ 下面**不再有**整层分支 ✓
     #    ⇒ 整层的 `raw13`/`raw2`/`km13`/`km2` **一个都不分配** ✓(那是 §601 里永不释放的整层槽)
     tile = staging_tile_experts(E)
-    _fp8_tile_ring(device, E, H, I, tile)
+    # ⭐ profile 期预分配必须与运行期同一个 nslots 键；否则运行期会再分配一整环。
+    # 历史 bug：这里不读 XIAOTU_GPF_STAGE_NSLOTS，默认 2 ⇒ env=3 时两份环。
+    try:
+        _ns = int(os.environ.get("XIAOTU_GPF_STAGE_NSLOTS", "2") or 2)
+    except (TypeError, ValueError):
+        print("[gp-tile] bad XIAOTU_GPF_STAGE_NSLOTS, fallback nslots=2", flush=True)
+        _ns = 2
+    _fp8_tile_ring(device, E, H, I, tile, nslots=max(2, _ns))
 
 
 def fp8_staging_bytes(n_experts: int, hidden: int, inter: int, ns: int = 2) -> int:
@@ -625,8 +632,98 @@ def gpu_moe_layer(x, topk_ids, topk_weights, w13t, s13t, w2t, s2t,
 
 
 
+
+
+def _stream_ctx(stream):
+    """MUSA 下必须用 torch.musa.stream；torch.cuda.stream 对 MUSA Stream 不切流。"""
+    import torch as _t
+    if hasattr(_t, "musa"):
+        return _t.musa.stream(stream)
+    return _t.cuda.stream(stream)
+
+def _stream_ptr(stream) -> int:
+    """MUSA Stream 的 native handle；cuda_stream 在该 shim 上可能是 0。"""
+    for name in ("musa_stream", "cuda_stream"):
+        try:
+            v = getattr(stream, name)
+        except Exception:
+            continue
+        if v:
+            return int(v)
+    try:
+        p = getattr(stream, "_as_parameter_", None)
+        if p is not None:
+            v = getattr(p, "value", p)
+            if v:
+                return int(v)
+    except Exception:
+        pass
+    return 0
+
+
+_HOST_KM_CACHE = {}
+
+
+def _host_km_enabled() -> bool:
+    import os as _os
+    return _os.environ.get("XIAOTU_GPF_HOST_KM", "0") == "1"
+
+
+def _host_km_fill(engine, device, H: int, I: int, e0: int, e1: int, w13t, w2t):
+    # alloc-audit: bounded _HOST_KM_CACHE —— 键 = (hostbuf ptr, stage, n, e0, Et)，
+    #   全部由**配置**决定（缓冲数 × stage × nslice × 专家块 × 专家数），不随请求长度/形状变化；
+    #   值是 pinned CVT 视图（宿主内存），每键只写一次、命中即复用。
+    """CPU 一次性转置 host shard 并直接写 K-major ring；缓存按源指针。
+
+    这条路省掉每个 band 的 GPU `ktranspose_into`。首轮转置约 0.2s/层，
+    之后同一层/同一 tile 直接命中缓存。源指针由 C++ `hostbuf_ptr` 暴露。
+    """
+    import ctypes
+    import numpy as _np
+    import torch as _t
+    try:
+        geo = engine.shard_geometry()
+        ns = int(geo["ns"])
+        Et = int(e1) - int(e0)
+        if Et <= 0:
+            return True
+        cr13, c13 = int(geo["w13_crows"]), int(geo["w13_cbytes"])
+        cr2, c2 = int(geo["w2_crows"]), int(geo["w2_cbytes"])
+        for which, node in ((0, n) for n in range(ns)):
+            pass
+        for n in range(ns):
+            ptr = int(engine.hostbuf_ptr(0, n))
+            key = (ptr, 0, n, int(e0), Et)
+            t = _HOST_KM_CACHE.get(key)
+            if t is None:
+                nb = Et * 2 * c13
+                arr = _np.ctypeslib.as_array(
+                    (ctypes.c_uint8 * nb).from_address(ptr + int(e0) * 2 * c13))
+                t = _t.from_numpy(arr).view(Et, 2, cr13, H).permute(0, 3, 1, 2).contiguous()
+                t = t.pin_memory()
+                _HOST_KM_CACHE[key] = t
+            w13t[:, :, n * cr13:(n + 1) * cr13].copy_(t[:, :, 0, :])
+            w13t[:, :, I + n * cr13:I + (n + 1) * cr13].copy_(t[:, :, 1, :])
+        for n in range(ns):
+            ptr = int(engine.hostbuf_ptr(1, n))
+            key = (ptr, 1, n, int(e0), Et)
+            t = _HOST_KM_CACHE.get(key)
+            if t is None:
+                nb = Et * c2
+                arr = _np.ctypeslib.as_array(
+                    (ctypes.c_uint8 * nb).from_address(ptr + int(e0) * c2))
+                t = _t.from_numpy(arr).view(Et, cr2, I).permute(0, 2, 1).contiguous()
+                t = t.pin_memory()
+                _HOST_KM_CACHE[key] = t
+            w2t[:, :, n * cr2:(n + 1) * cr2].copy_(t)
+        return True
+    except Exception as exc:  # noqa: BLE001
+        print("[gpf-hostkm] failed: %r" % (exc,), flush=True)
+        return False
+
 def _fp8_kmajor_tiled_impl(engine, device, hidden: int, inter: int, n_experts: int,
-                      e0: int, e1: int, dst):
+                      e0: int, e1: int, dst, slot: int = 0,
+                      stream: "int | None" = None):
     """把专家区间 `[e0, e1)` 的 K-major FP8 权重**逐 NUMA node 直填**进 `dst`。
 
     ⭐ **无 raw 缓冲**(noraw):每个 node 的切片直接转置进目标的 K-major 列区间
@@ -678,14 +775,17 @@ def _fp8_kmajor_tiled_impl(engine, device, hidden: int, inter: int, n_experts: i
     _k0 = _evt_new()
     if _k0 is not None:
         _k0.record()
+    _host_km = _host_km_enabled()
+    _km_b = __import__("time").perf_counter()
     # w13:每个 node 的切片 = [gate c13 B][up c13 B];K-major 目标行区间 [c0,c0+cr13) ✓
-    for n in range(ns):
+    for n in range(0 if _host_km else ns):
         import time as _kmt
         _km_a = _kmt.perf_counter()
         _ke_a = _evt_new()
         if _ke_a is not None:
             _ke_a.record()
-        buf = _dma_hostbuf_range(engine, 0, n, device, int(e0) * 2 * c13, Et * 2 * c13)
+        buf = _dma_hostbuf_range(engine, 0, n, device, int(e0) * 2 * c13,
+                                 Et * 2 * c13, slot=int(slot), stream=stream)
         _ke_b = _evt_new()
         if _ke_b is not None:
             _ke_b.record()
@@ -718,8 +818,10 @@ def _fp8_kmajor_tiled_impl(engine, device, hidden: int, inter: int, n_experts: i
         _kt_a = _evt_new()
         if _kt_a is not None:
             _kt_a.record()
-        if _w13tn():
+        if _w13tn() and int(w13t.shape[1]) == 2 * I and int(w13t.shape[2]) == H:
             # N-major 环：宿主分片本来就是 `[cr13, H]` 连续 ⇒ **纯拷贝**（无转置）。
+            # 形状守卫：若环因历史缓存仍是 K-major，不能按 N-major 切片（会静默错/报错），
+            # 应退回下面的 ktranspose_into。
             # ⚠️ 与 W2TN **不同**：w13 的环是 `_fp8_tile_ring` 里**按本开关换轴分配**的
             #    （`(t, 2I, H)`）⇒ 这里**直接用 `w13t`，不需要再 view 换轴**。
             #    （第一次我就照 W2TN 抄了一遍 `.view(shape[0], shape[2], shape[1])`，
@@ -738,12 +840,13 @@ def _fp8_kmajor_tiled_impl(engine, device, hidden: int, inter: int, n_experts: i
             _evt_add("km13_tr", _kt_a, _kt_b)
         del buf, blk
     # w2:每个 node 的切片 = (cr2, I) 连续 ✓
-    for n in range(ns):
+    for n in range(0 if _host_km else ns):
         _w2a = __import__("time").perf_counter()
         _kw_a = _evt_new()
         if _kw_a is not None:
             _kw_a.record()
-        buf = _dma_hostbuf_range(engine, 1, n, device, int(e0) * c2, Et * c2)
+        buf = _dma_hostbuf_range(engine, 1, n, device, int(e0) * c2,
+                                 Et * c2, slot=int(slot), stream=stream)
         _kw_b = _evt_new()
         if _kw_b is not None:
             _kw_b.record()
@@ -766,13 +869,17 @@ def _fp8_kmajor_tiled_impl(engine, device, hidden: int, inter: int, n_experts: i
         _PH['w2_k'] = _PH.get('w2_k', 0.0) + (__import__("time").perf_counter() - _w2a)
         del buf
     # 尺度:整块按专家维连续,不按 node 切(与整层路径同一假设)✓
+    if _host_km and not _host_km_fill(engine, device, H, I, int(e0), int(e1), w13t, w2t):
+        return None
     s13_per = int(geo["w13_scale_bytes"]) // E
     s2_per = int(geo["w2_scale_bytes"]) // E
     _PH['tr_k'] = _PH.get('tr_k', 0.0) + (__import__('time').perf_counter() - _km_b)
     _km_c = __import__('time').perf_counter()
     _sda = __import__("time").perf_counter()
-    b13 = _dma_hostbuf_range(engine, 2, 0, device, int(e0) * s13_per, Et * s13_per)
-    b2 = _dma_hostbuf_range(engine, 3, 0, device, int(e0) * s2_per, Et * s2_per)
+    b13 = _dma_hostbuf_range(engine, 2, 0, device, int(e0) * s13_per,
+                             Et * s13_per, slot=int(slot), stream=stream)
+    b2 = _dma_hostbuf_range(engine, 3, 0, device, int(e0) * s2_per,
+                            Et * s2_per, slot=int(slot), stream=stream)
     _PH['scd_k'] = _PH.get('scd_k', 0.0) + (__import__("time").perf_counter() - _sda)
     if b13 is None or b2 is None:
         return None
@@ -993,7 +1100,7 @@ def _evt_report(layer_ms: float) -> None:
 
 
 _PH = {"decode": 0.0, "gather": 0.0, "bmm1": 0.0, "act": 0.0, "bmm2": 0.0,
-       "scatter": 0.0, "n": 0}
+       "scatter": 0.0, "wait_ready": 0.0, "wait_free": 0.0, "n": 0}
 
 
 # ── 逐调用调试（`XIAOTU_GPF_DMA_DEBUG=1`）：打印**前 8 次** DMA 的 host 墙钟 ──
@@ -1048,7 +1155,7 @@ def _ph_on() -> bool:
 
 def _ph_add(key: str, dt: float) -> None:
     if _ph_on():
-        _PH[key] += dt
+        _PH[key] = _PH.get(key, 0.0) + dt
 
 
 def _ph_tick() -> None:
@@ -1064,11 +1171,11 @@ def _ph_tick() -> None:
     if _PH["n"] % 8:
         return
     n = _PH["n"]
-    tot = sum(_PH[k] for k in ("decode", "gather", "bmm1", "act", "bmm2", "scatter"))
+    tot = sum(_PH[k] for k in ("decode", "gather", "bmm1", "act", "bmm2", "scatter", "wait_ready", "wait_free"))
     print("[gpf-ph] n=%d decode=%.1fms gather=%.1fms bmm1=%.1fms act=%.1fms "
-          "bmm2=%.1fms scatter=%.1fms total=%.1fms"
+          "bmm2=%.1fms scatter=%.1fms wait_ready=%.1fms wait_free=%.1fms total=%.1fms"
           % (n, *(_PH[k] * 1000 for k in ("decode", "gather", "bmm1", "act",
-                                          "bmm2", "scatter")), tot * 1000),
+                                          "bmm2", "scatter", "wait_ready", "wait_free")), tot * 1000),
           flush=True)
     print("[gpf-tile2] tile_ms_per_bandgroup=%.1f" % (_PH.get("tile", 0.0) * 1000.0),
           flush=True)
@@ -1089,9 +1196,95 @@ def _ph_tick() -> None:
           % (_PH["seq"], _PH.get("dma_k", 0.0) * 1000, _PH.get("tr_k", 0.0) * 1000,
              _PH.get("sc_k", 0.0) * 1000), flush=True)
     _PH["dma_k"] = _PH["tr_k"] = _PH["sc_k"] = 0.0
-    for k in ("decode", "gather", "bmm1", "act", "bmm2", "scatter"):
+    for k in ("decode", "gather", "bmm1", "act", "bmm2", "scatter",
+              "wait_ready", "wait_free"):
         _PH[k] = 0.0
 
+
+
+
+def _grouped_chunk(x, tok_all, wts_all, seg_start, e0, e1, w13_bf, w2_bf, H, I, *,
+                   out, w_sorted, tok_sorted, row0, row1, base_e, seg_l):
+    """变长 grouped GEMM：一次 gather / 两次 grouped_mm / 一次 scatter。
+
+    只用于大 M prefill（qfn 门槛 >=2048）；无 padding，不逐专家循环。
+    由 `XIAOTU_GPF_BMM_MODE=grouped` 显式开启，默认路径不变。
+
+    ⚠️ `_moe_tile_launch_bmm` 会按 BMM_CHUNK 切子块；本函数收到的是**子块** e0:e1，
+    但 row0/row1 是**整 tile**边界。必须用 seg_l[e0]/seg_l[e1] 取子块自己的行区间，
+    权重也要偏移 `o=e0-base_e`；否则 tile=48/CHUNK=32 时第二块会静默用错专家。
+    """
+    import torch as _t
+    dev = x.device
+    ne = int(e1 - e0)
+    if ne <= 0:
+        return
+    o = int(e0 - base_e)
+    if seg_l is not None and int(e1) < len(seg_l):
+        r0, r1 = int(seg_l[int(e0)]), int(seg_l[int(e1)])
+        cnt = [int(seg_l[int(e0) + i + 1]) - int(seg_l[int(e0) + i]) for i in range(ne)]
+    else:
+        r0 = int(seg_start[int(e0)].item())
+        r1 = int(seg_start[int(e1)].item())
+        cnt = None
+    if r1 <= r0:
+        return
+    import time as _gt
+    _tg = _gt.perf_counter()
+    rows = tok_sorted[r0:r1].long()
+    gx = x[rows]
+    _ph_add("gather", _gt.perf_counter() - _tg)
+    # grouped_mm 的 offs 是每个专家的【结束行号】，长度 = batch；零计数专家不能留重复值。
+    keep = None
+    if cnt is not None and any(c == 0 for c in cnt):
+        keep = [i for i, c in enumerate(cnt) if c > 0]
+        if not keep:
+            return
+        offs_h = []
+        acc = 0
+        for i in keep:
+            acc += cnt[i]
+            offs_h.append(acc)
+        offs = _t.tensor(offs_h, dtype=_t.int32, device=dev)
+    else:
+        offs = (seg_start[int(e0) + 1:int(e1) + 1] - r0).to(dtype=_t.int32, device=dev)
+    if _w13tn() and not getattr(_grouped_chunk, "_tn_dbg", False):
+        _grouped_chunk._tn_dbg = True
+        print("[gpf-tn] w13_bf=%s w2_bf=%s e0=%s e1=%s base=%s o=%s ne=%s nslots=%s"
+              % (tuple(w13_bf.shape), tuple(w2_bf.shape), e0, e1, base_e, o, ne,
+                 globals().get("nslots")), flush=True)
+    w13 = w13_bf[o:o + ne]
+    w2 = w2_bf[o:o + ne]
+    if keep is not None:
+        idx = _t.tensor(keep, dtype=_t.long, device=dev)
+        w13 = w13.index_select(0, idx)
+        w2 = w2.index_select(0, idx)
+    # N-major 环（W13TN/W2TN=1）无需每 band 的 ktranspose：
+    # `_grouped_mm` 直接接受转置视图（已用独立 probe 验证数值与速度）。
+    _neff = int(w13.shape[0])   # keep 过滤零计数专家后的实际 batch
+    if _w13tn():
+        w13 = w13.reshape(_neff, 2 * I, H).transpose(1, 2)
+    if _w2tn():
+        w2 = w2.reshape(_neff, H, I).transpose(1, 2)
+    _tg = _gt.perf_counter()
+    gu = _t._grouped_mm(gx, w13, offs=offs)
+    _ph_add("bmm1", _gt.perf_counter() - _tg)
+    g, u = gu[..., :I], gu[..., I:]
+    lim = float(getattr(_moe_tile_launch_bmm, "limit", 0.0))
+    _ta = _gt.perf_counter()
+    if lim > 0.0:
+        g = _t.clamp(g, max=lim)
+        u = _t.clamp(u, min=-lim, max=lim)
+    act = (g * _t.sigmoid(g)) * u
+    _ph_add("act", _gt.perf_counter() - _ta)
+    _tb = _gt.perf_counter()
+    dn = _t._grouped_mm(act, w2, offs=offs)
+    _ph_add("bmm2", _gt.perf_counter() - _tb)
+    _ts = _gt.perf_counter()
+    w = w_sorted[r0:r1].to(_t.float32)
+    out.index_add_(0, rows, dn.to(_t.float32) * w[:, None])
+    _ph_add("scatter", _gt.perf_counter() - _ts)
+    _ph_tick()
 
 def _moe_tile_launch_bmm(x, tok_all, wts_all, seg_start, e0, e1,
                          w13_bf, w2_bf, H, I, *, out, w_sorted, tok_sorted,
@@ -1232,6 +1425,12 @@ def _bmm_chunk(x, tok_all, wts_all, seg_start, e0, e1, w13_bf, w2_bf, H, I, *,
               f"cap={_os.environ.get('XIAOTU_GPF_BMM_MAXROWS', '8192')}", flush=True)
     # 峰值保护：ne*R 过大就二分（R 异常时也能跑起来而不是 OOM）
     _mode = _os.environ.get("XIAOTU_GPF_BMM_MODE", "auto").lower()
+    if _mode in ("grouped", "gmm"):
+        _grouped_chunk(x, tok_all, wts_all, seg_start, e0, e1, w13_bf, w2_bf, H, I,
+                       out=out, w_sorted=w_sorted, tok_sorted=tok_sorted,
+                       row0=row0, row1=row1, base_e=base_e,
+                       seg_l=_hb if _hb is not None else seg_start.tolist())
+        return
     if _hb is not None and int(e1) + 1 <= len(_hb):
         _avg = (sum(_cnt) / float(len(_cnt))) if _cnt else 0.0
     else:
@@ -1404,30 +1603,25 @@ def _d2h_stream(device):
 
 
 def _w2tn() -> bool:
-    """XIAOTU_GPF_W2TN=1：w2 环存 N-major（[E,H,I]），用 TN matmul 代替 1280x384 转置。"""
+    """XIAOTU_GPF_W2TN=1：w2 环存 N-major（[E,H,I]），用 TN matmul 代替转置。
+
+    The ring shape and the consumer must make the same decision.  Keep this
+    purely env-driven; `_use_bmm()` is the consumer's contract and must not be
+    re-evaluated at assembly time (doing so let the ring be allocated K-major
+    while the copy branch attempted an N-major slice).
+    """
     import os as _os
-    if _os.environ.get("XIAOTU_GPF_W2TN", "0") != "1":
-        return False
-    # ⛔ 只对 bmm 后端成立：Triton 的 `down_kernel_fp8` 直接读 w2 环并按 `stride(1)` 定 K/N，
-    #    N-major 环会让它读到转置的数据（静默错，不报错）⇒ 显式拦掉，宁可不省。
-    if not _use_bmm():
-        return False
-    return True
+    return _os.environ.get("XIAOTU_GPF_W2TN", "0") == "1"
 
 
 def _w13tn() -> bool:
     """XIAOTU_GPF_W13TN=1：w13 环存 N-major（[E,2I,H]），用 TN matmul 代替每 band 的转置。
 
-    与 `_w2tn()` 同一模式；量级更大（`[gpf-km] tr` 实测 140–173 ms/8band）。
-    ⚠️ 同时**必须**把环槽形状换轴（`_fp8_tile_ring` 里按本开关分配），否则 `view` 只是
-    把同一块内存换个名字、数据仍是 K-major ⇒ 数值静默错 ✗
+    The ring shape and the consumer must make the same decision.  Keep this
+    purely env-driven; see `_w2tn()` for the shape-mismatch incident.
     """
     import os as _os
-    if _os.environ.get("XIAOTU_GPF_W13TN", "0") != "1":
-        return False
-    if not _use_bmm():
-        return False
-    return True
+    return _os.environ.get("XIAOTU_GPF_W13TN", "0") == "1"
 
 
 def _use_bmm() -> bool:
@@ -1436,14 +1630,23 @@ def _use_bmm() -> bool:
 
 
 def _bmm_bufs(ne: int, H: int, I: int, device):
+    # tile/chunk 边界可能让 w13_bf 按 26 行分配、却按 32 行视图切片；
+    # 统一按 BMM_CHUNK 向上取整，避免 N-major 视图尺寸不匹配。
+    ne = max(int(ne), int(__import__("os").environ.get("XIAOTU_GPF_BMM_CHUNK", "32")))
     key = (int(ne), int(H), int(I), str(device))
     buf = _BMM_BUF.get(key)
     if buf is None:
         import torch as _t
-        buf = (
-            _t.empty(int(ne), int(H), 2 * int(I), dtype=_t.bfloat16, device=device),
-            _t.empty(int(ne), int(I), int(H), dtype=_t.bfloat16, device=device),
-        )
+        # TN 环下缓冲本身按 N-major 分配；否则保持 K-major。
+        if _w13tn():
+            _w13 = _t.empty(int(ne), 2 * int(I), int(H), dtype=_t.bfloat16, device=device)
+        else:
+            _w13 = _t.empty(int(ne), int(H), 2 * int(I), dtype=_t.bfloat16, device=device)
+        if _w2tn():
+            _w2 = _t.empty(int(ne), int(H), int(I), dtype=_t.bfloat16, device=device)
+        else:
+            _w2 = _t.empty(int(ne), int(I), int(H), dtype=_t.bfloat16, device=device)
+        buf = (_w13, _w2)
         _BMM_BUF[key] = buf
     return buf
 
@@ -1558,20 +1761,22 @@ def _gmlet_impl(engine, x, topk_ids, topk_weights,
                 if job is None:
                     return
                 i, e0, e1, s, fev = job
+                _sd = _prefetch_stream(device, s)
                 try:
                     if fev is not None:
-                        side.wait_event(fev)
+                        _sd.wait_event(fev)
                     # ⛔ 必须在**本线程**再进一次 `inference_mode()`：
                     #   vLLM 的 forward 在主线程的 `torch.inference_mode()` 里跑，
                     #   而"inference tensor 的 inplace 保护"是**线程局部**的 ⇒
                     #   本线程若不在 inference_mode 里，写环缓冲会抛
                     #   `Inplace update to inference tensor outside InferenceMode is not allowed`（已踩）
                     with torch.inference_mode():
-                        with torch.cuda.stream(side):
+                        with _stream_ctx(_sd):
                             km = _fp8_kmajor_tiled(engine, device, H, I, E, e0, e1,
-                                                   tuple(b[:e1 - e0] for b in ring[s]))
+                                                   tuple(b[:e1 - e0] for b in ring[s]),
+                                                   slot=s, stream=_stream_ptr(_sd))
                             ev = torch.cuda.Event()
-                            ev.record(side)
+                            ev.record(_sd)
                     _cpt["done"][i] = (km, ev)
                 except BaseException as _exc:      # noqa: BLE001
                     _cpt["exc"] = _exc
@@ -1625,7 +1830,7 @@ def _gmlet_impl(engine, x, topk_ids, topk_weights,
         _tot_mb = 0.0
         for _rep in range(2):
             _t0 = _bt.perf_counter()
-            with torch.cuda.stream(side):
+            with _stream_ctx(side):
                 for (_e0, _e1) in tiles:
                     _fp8_kmajor_tiled(engine, device, H, I, E, _e0, _e1,
                                       tuple(b[:_e1 - _e0] for b in ring[0]))
@@ -1643,14 +1848,18 @@ def _gmlet_impl(engine, x, topk_ids, topk_weights,
             _cpt_post(i)
             return True
         if free[s] is not None:
+            import time as _wt
+            _tw = _wt.perf_counter()
             side.wait_event(free[s])          # 该槽上次的使用者(主流内核)必须先完成
+            _ph_add("wait_free", _wt.perf_counter() - _tw)
         # 事件起点记在 **wait 之后** ⇒ dma 段只含"拷贝+组装"，不含等槽（否则会把它读成 DMA 时间）
         _da = _evt_new()
         if _da is not None:
             _da.record(side)
-        with torch.cuda.stream(side):
+        with _stream_ctx(side):
             km = _fp8_kmajor_tiled(engine, device, H, I, E, e0, e1,
-                                   tuple(b[:e1 - e0] for b in ring[s]))
+                                   tuple(b[:e1 - e0] for b in ring[s]), slot=s,
+                                   stream=_stream_ptr(side))
             ev = torch.cuda.Event()
             ev.record(side)
         _db = _evt_new()
@@ -1710,7 +1919,13 @@ def _gmlet_impl(engine, x, topk_ids, topk_weights,
             print(f"[gpf-tile] slot {s} DMA not issued -> give up (layer)", flush=True)
             _cpt_close()
             return None
+        import time as _wt
+        _tw = _wt.perf_counter()
         cur.wait_event(ready[s])
+        _ph_add("wait_ready", _wt.perf_counter() - _tw)
+        # CPT：在 compute(i) 之前把 i+1 的 DMA 排进 producer，才能真正双槽重叠。
+        if _cpt_on and i + 1 < len(tiles):
+            _issue(i + 1)
         row0, row1 = int(_bounds[e0]), int(_bounds[e1])
         if row1 > row0:
             seg_local = (seg_start[e0:e1 + 1] - row0).contiguous()
@@ -1756,7 +1971,7 @@ def _gmlet_impl(engine, x, topk_ids, topk_weights,
         fe.record(cur)
         free[s] = fe
         ready[s] = None
-        if i + 1 < len(tiles):
+        if i + 1 < len(tiles) and not _cpt_on:
             if not _issue(i + 1):
                 _cpt_close()
                 return None

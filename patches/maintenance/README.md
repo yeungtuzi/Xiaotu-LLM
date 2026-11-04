@@ -27,3 +27,9 @@ git apply -R patches/maintenance/<name>.patch
 git diff --stat -- vllm/v1/worker/gpu/spec_decode/dflash/speculator.py
 git show HEAD:vllm/v1/worker/gpu/spec_decode/dflash/speculator.py | grep -n main_norm
 ```
+
+## 撤回记录（**不要重新加回来**）
+
+| 位置 | 撤回内容 | 原因 |
+|---|---|---|
+| `vllm/models/deepseek_v41/common/ops/cache_utils.py` `compute_global_topk_indices_and_lens` | `assert token_to_req_indices.max() < block_table.shape[0]` | 调用点传的是 `attn_metadata.block_table[:num_decodes]`（按 decode 数切片），而 `token_to_req_indices` 是**全局请求号** ⇒ 混合 prefill+decode 时 `num_decodes=1` 但 token 覆盖 2 个请求 ⇒ 假报。2026-11-04 14:17 把生产 assert 死（单请求正常、加第二路并发即崩）。本函数只能断言**结构性契约**（`stride(1)==1`、`stride(0)==shape[1]*stride(1)`），取值上界取决于调用方切片语义。 |

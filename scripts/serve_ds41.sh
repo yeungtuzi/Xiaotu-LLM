@@ -403,6 +403,10 @@ start() {
         export XIAOTU_PIN="$PIN" XIAOTU_PIN_MAX_PER_LAYER="$PIN_SLOTS" XIAOTU_PIN_MAXQ="$PIN_MAXQ"
         export XIAOTU_MOE_THREADS="$THREADS" OMP_NUM_THREADS=1
         export XIAOTU_PIN_CUDA_MOE=0 XIAOTU_ENGRAM_LAST=1
+        # ⛔ 2026-11-04 用户：**GPU0 独立 MTP（DSpark remote）已废除**。
+        #    这里显式关死，防父环境里残留 XIAOTU_DSPARK_REMOTE=1 把已废除的路径复活
+        #    （它会 connect GPU0 socket，失败后回落 identity draft ⇒ 启动即崩）。
+        export XIAOTU_DSPARK_REMOTE=0
         export GPU_UTIL="$GPU_UTIL" MAXSEQS="$MAXSEQS" MBT="$MBT" MAXLEN="$MAXLEN"
         export COMPILE_RANGES="$COMPILE_RANGES"
         # 碎片治理（2026-11-01 用户指示，默认关、显式开）：

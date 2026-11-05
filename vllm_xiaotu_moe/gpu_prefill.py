@@ -899,6 +899,11 @@ def _release_once_if_worth(why: str) -> bool:
             if _r0 == 0:
                 continue
             torch.cuda.synchronize(_d)
+            # ⭐ [2026-11-05 审计 B ②] 捕获判定入口只查了一次，而 `empty_cache()` 是
+            #    **每台设备**在下面调的 ⇒ 每台设备再查一次，把"捕获窗口内归还"压到最小。
+            if torch.cuda.is_current_stream_capturing():
+                print("[xtu-idle-ec] 仍在图捕获中 ⇒ 放弃本次归还", flush=True)
+                return False
             # 同步后再确认：这段时间里若引擎又跑了（有活动），放弃本次
             if time.monotonic() - _LAST_ACTIVITY[0] < 5.0 and _t_before > 0:
                 print("[xtu-idle-ec] 同步期间又有活动 ⇒ 放弃本次归还", flush=True)

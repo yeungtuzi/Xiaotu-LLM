@@ -864,6 +864,101 @@ def maybe_idle_release(why: str = "") -> None:
               flush=True)
 
 
+def _release_once_if_worth(why: str) -> bool:
+    """一次受控归还（供"预热收尾"触发器使用）。返回是否真的做了归还。"""
+    try:
+        if _IDLE_EC_STATE["done"] or _IN_STARTUP[0]:
+            return False
+        if torch.cuda.is_current_stream_capturing():
+            return False
+        try:
+            _min_frag = float(os.environ.get("XIAOTU_IDLE_EC_MIN_FRAG", "3") or 3)
+        except (TypeError, ValueError):
+            _min_frag = 3.0
+        _frag = 0
+        for _i in range(torch.cuda.device_count()):
+            _d = torch.device(f"cuda:{_i}")
+            _a = int(torch.cuda.memory_allocated(_d))
+            _r = int(torch.cuda.memory_reserved(_d))
+            if _a == 0 and _r == 0:
+                continue
+            _frag = max(_frag, _r - _a)
+        if _frag < int(_min_frag * 2**30):
+            return False
+        _t_before = time.monotonic()
+        for _i in range(torch.cuda.device_count()):
+            _d = torch.device(f"cuda:{_i}")
+            _r0 = int(torch.cuda.memory_reserved(_d))
+            if _r0 == 0:
+                continue
+            torch.cuda.synchronize(_d)
+            # 同步后再确认：这段时间里若引擎又跑了（有活动），放弃本次
+            if time.monotonic() - _LAST_ACTIVITY[0] < 5.0 and _t_before > 0:
+                print("[xtu-idle-ec] 同步期间又有活动 ⇒ 放弃本次归还", flush=True)
+                return False
+            torch.cuda.empty_cache()
+            _r1 = int(torch.cuda.memory_reserved(_d))
+            _f1, _ = torch.cuda.mem_get_info(_d)
+            print(f"[xtu-idle-ec] {why} ⇒ cuda:{_i} 归还 {(_r0 - _r1) / 2**30:.2f} GiB"
+                  f"（reserved {_r0 / 2**30:.2f}→{_r1 / 2**30:.2f}，"
+                  f"free {int(_f1) / 2**30:.2f} GiB）", flush=True)
+        # alloc-audit: bounded _IDLE_EC_STATE —— 固定两键，单例状态机（见上）
+        _IDLE_EC_STATE["done"] = True
+        return True
+    except Exception as _e:                        # noqa: BLE001
+        print(f"[xtu-idle-ec] {why} 归还失败(不掩盖): {type(_e).__name__}: {_e}", flush=True)
+        return False
+
+
+def watch_release_trigger() -> bool:
+    """**预热收尾触发器**：预热/冒烟一结束就归还一次（不依赖 60 s 空闲窗口）。
+
+    背景（实测）：那 10.8 GiB 高水位 100% 由形状预热造成；而"空闲 ≥60 s"的窗口在持续
+    流量下根本不存在（今天 5 次全部放弃）⇒ 只能在**预热收尾、真实流量到来之前**动手。
+
+    触发源（二选一，都是只读文件，不改预热脚本）：
+      * `XIAOTU_RELEASE_MARKER=<path>`     文件存在即触发；
+      * `XIAOTU_RELEASE_AFTER_LOG=<path>`  该日志出现 "完成:" 即触发（预热脚本的收尾行）。
+    """
+    marker = os.environ.get("XIAOTU_RELEASE_MARKER", "")
+    logp = os.environ.get("XIAOTU_RELEASE_AFTER_LOG", "")
+    if not marker and not logp:
+        return False
+    if os.environ.get("XIAOTU_IDLE_EMPTY_CACHE", "0") != "1":
+        return False
+
+    def _loop():
+        t0 = time.monotonic()
+        while time.monotonic() - t0 < 7200:
+            time.sleep(2.0)
+            try:
+                if _IDLE_EC_STATE["done"]:
+                    return
+                hit = False
+                if marker and os.path.exists(marker):
+                    hit = True
+                elif logp and os.path.exists(logp):
+                    try:
+                        with open(logp, "r", errors="ignore") as f:
+                            hit = "完成:" in f.read()[-4000:]
+                    except OSError:
+                        hit = False
+                if not hit:
+                    continue
+                if _IN_STARTUP[0]:
+                    continue
+                if _release_once_if_worth("预热收尾"):
+                    return
+            except Exception:                      # noqa: BLE001
+                return
+
+    import threading
+    threading.Thread(target=_loop, name="xtu-release-watch", daemon=True).start()
+    print(f"[xtu-idle-ec] 预热收尾触发器已布防（marker={marker or '-'} log={logp or '-'}）",
+          flush=True)
+    return True
+
+
 def mark_activity() -> None:
     """记一次"引擎真的在跑"（`EngineCore.step` 每步调用）。
 

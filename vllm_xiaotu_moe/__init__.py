@@ -208,5 +208,7 @@ except Exception as _e:                      # noqa: BLE001
 try:
     from . import gpu_prefill as _gpu_prefill2
     _gpu_prefill2.start_idle_empty_cache()
+    # ⭐ [2026-11-05] 预热收尾触发器：预热一结束就归还一次（不依赖空闲窗口）
+    _gpu_prefill2.watch_release_trigger()
 except Exception as _e:                      # noqa: BLE001
     print(f"[xtu-idle-ec] 未启用: {type(_e).__name__} {_e}", flush=True)

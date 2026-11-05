@@ -540,3 +540,20 @@ nvidia-smi: 37,385 → 26,395 MiB
 
 `26,315 → 28,095 → 35,835 → 37,855 MiB 且不回落` —— 这张表是"归还的是 allocator 缓存、
 不改变峰值"的最好证据，也解释了为什么 (b) 类收益不成立。
+
+## 二十四、治理缺口（待修，长稳后处理）：`status` 读不到新的触发开关
+
+`scripts/serve_ds41.sh:759` 的 environ grep 白名单里有
+`XIAOTU_IDLE_EMPTY_CACHE` / `XIAOTU_IDLE_EC_SECONDS`，但**没有 `XIAOTU_RELEASE_AFTER_LOG`**。
+
+后果：运维用 `serve_ds41.sh status` 看不出"预热收尾触发"是否配置 ——
+而这正是整套归还机制**唯一**的生产触发源。按项目纪律
+（"新增任何参数/开关，必须同时更新 `check_ds41_entry.sh` 的口径检查，让 `status` 能读出自洽口径，
+否则该参数不得进生产"），这是一个合规缺口。
+
+**修法**：白名单加一项 `XIAOTU_RELEASE_AFTER_LOG`（1 处正则），并让 `check_ds41_entry.sh` 校验
+`IDLE_EC=1` 时该变量**存在且指向 `$RUN_DIR/ds41_${TAG}_warmup.log`**（存在性校验，避免"设了但写错路径"
+——写错路径的后果是永不触发，且日志上只会显示"已布防"，很难发现）。
+
+**为什么不在长稳期间改**：改了脚本 md5 就与正在跑的实例所依据的版本不一致，
+"部署 == HEAD == 已审计"这条链会断；等长稳收口后单独提交 + 审计。

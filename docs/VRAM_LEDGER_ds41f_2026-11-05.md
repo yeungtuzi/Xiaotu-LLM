@@ -1502,3 +1502,44 @@ shared 流量 = 输入字节的 **4 倍**（4-bit → bf16），且 ldmatrix 跨
 1. **回退到"raw 字节进 shared + 寄存器解包 + raw mma"**（shared 流量降到 1×，且无 ldmatrix），
    但必须带 LUT、K 切分、pad —— 之前的失败版本没有这些；
 2. 或保持 wmma 但把 sB 的写入改成 `stmatrix`（若工具链支持）以减少 wavefront。
+
+## 五十一、第 21 轮：raw 字节 + 寄存器解包 + raw mma 重做（带 LUT/KSPLIT/pad）——仍差一倍
+
+### 动机（ncu 依据）
+
+shared 流量 = 输入字节的 8 倍（写 4× + ldmatrix 读 4×），且 Mem Busy 84%。
+只放**原始 4-bit 字节**可把 shared 流量降到 2×（写 1× + 字节读 1×），并彻底去掉 ldmatrix。
+
+### 实现
+
+`sW[KC/2][NT+PAD]` 存原始字节（合并 16B 加载），每线程从 shared 取 **2 字节**，
+用 shared LUT 解包成 4 个 bf16（2 个 packed uint32），再发 `mma.sync.aligned.m16n8k16`。
+带 K 切分（原子累加）、pad=16、LUT、A 从 global 取。
+
+### 数值：正确
+
+| ksplit | 相对误差 |
+|---:|---:|
+| 1 | 5.33e-06 |
+| 4 | **9.25e-07** |
+
+### 性能：仍差一倍
+
+| 实现 | 每层（15 专家） | 带宽 |
+|---|---:|---:|
+| **wmma + bf16 进 shared（v20）** | **0.372 ms** | **226 GB/s** |
+| raw 字节 + raw mma（ksplit=1） | 1.106 ms | 74 GB/s |
+| raw 字节 + raw mma（ksplit=4） | 0.761 ms | 108 GB/s |
+| raw 字节 + raw mma（ksplit=12） | 0.763 ms | 108 GB/s |
+
+⇒ **shared 流量降到 1/4 并没有换来提速**，反而慢一倍。
+
+### 结论（这条分支可以关闭了）
+
+减少 shared 流量不是当前的主要矛盾。raw mma 的代价是：
+1. 每线程每个 k-tile 要做 2 次字节读 + 2 次 LUT + 4 次打包 + 2 次 hmul2，才换 **1 个 mma**；
+   而 wmma 的 `ldmatrix` + `mma_sync` 一条指令就处理 8 个 bf16，指令效率高一个量级；
+2. 字节级 shared 读天然有 bank 冲突（8 个线程读 8 个连续字节只落在 2 个 bank）。
+
+⇒ **wmma + bf16 进 shared + LUT + KSPLIT（0.372 ms）仍是唯一正确的主线**；
+后续应在**同一结构**内继续压（例如减少每字节指令、提高 ldmatrix 效率），不再走 raw mma。

@@ -700,8 +700,16 @@ def maybe_report(period_s: float = 60.0, tag: str = "steady") -> None:
 _IDLE_EC_STATE = {"done": False, "armed": False}
 
 
-def _idle_empty_cache_loop(idle_s: float, wait_max_s: float) -> None:
+def _idle_empty_cache_loop(idle_s: float, wait_max_s: float,
+                           max_try: int = 3, min_frag: float = 3.0) -> None:
+    """每 idle_s 秒检查一次：**完全空闲且碎片超阈值**才归还，最多试 max_try 次。
+
+    ⚠️ 为什么要多次：首次布防往往落在**预热之前**，那时 reserved 还没被推高
+    （实测 2026-11-05：45s 时 reserved=23.76 ⇒ 归还 0.00 GiB；之后预热把 reserved
+    推到 34.98）。⇒ "归还一次就收工"会白跑，必须按碎片阈值重试。
+    """
     t0 = time.monotonic()
+    tries = 0
     while time.monotonic() - t0 < wait_max_s:
         time.sleep(5.0)
         try:
@@ -713,6 +721,21 @@ def _idle_empty_cache_loop(idle_s: float, wait_max_s: float) -> None:
                 continue
             if time.monotonic() - _LAST_REPORT[0] < idle_s:
                 continue
+            _frag_max = 0
+            for _i in range(torch.cuda.device_count()):
+                _d = torch.device(f"cuda:{_i}")
+                _a = int(torch.cuda.memory_allocated(_d))
+                _r = int(torch.cuda.memory_reserved(_d))
+                if _a == 0 and _r == 0:
+                    continue
+                _frag_max = max(_frag_max, _r - _a)
+            if _frag_max < int(min_frag * 2**30):
+                _IDLE_EC_STATE["done"] = True
+                print(f"[xtu-idle-ec] 碎片 {_frag_max / 2**30:.2f} GiB < 阈值 "
+                      f"{min_frag:g} GiB ⇒ 无需归还，收工", flush=True)
+                return
+            tries += 1
+            _reclaimed = 0
             for _i in range(torch.cuda.device_count()):
                 _d = torch.device(f"cuda:{_i}")
                 _a0 = int(torch.cuda.memory_allocated(_d))
@@ -723,15 +746,20 @@ def _idle_empty_cache_loop(idle_s: float, wait_max_s: float) -> None:
                 torch.cuda.empty_cache()
                 _r1 = int(torch.cuda.memory_reserved(_d))
                 _f1, _ = torch.cuda.mem_get_info(_d)
-                print(f"[xtu-idle-ec] cuda:{_i} 归还 {(_r0 - _r1) / 2**30:.2f} GiB"
+                _reclaimed = max(_reclaimed, _r0 - _r1)
+                print(f"[xtu-idle-ec] 第{tries}次 cuda:{_i} 归还 {(_r0 - _r1) / 2**30:.2f} GiB"
                       f"（reserved {_r0 / 2**30:.2f}→{_r1 / 2**30:.2f}，"
                       f"free {int(_f1) / 2**30:.2f} GiB）", flush=True)
             # alloc-audit: bounded _IDLE_EC_STATE —— 固定两键（done/armed），单例状态机，
             #   不是缓存、不随请求增长；此处只是把 done 置位。
-            # alloc-audit: bounded _IDLE_EC_STATE —— 固定两键（done/armed），单例状态机，
-            #   不是缓存、不随请求增长；此处只是把 done 置位。
-            _IDLE_EC_STATE["done"] = True
-            return
+            if _reclaimed > 1 * 2**30:
+                _IDLE_EC_STATE["done"] = True
+                print("[xtu-idle-ec] 已归还有效容量 ⇒ 收工", flush=True)
+                return
+            if tries >= max_try:
+                _IDLE_EC_STATE["done"] = True
+                print(f"[xtu-idle-ec] 已试 {tries} 次仍无有效归还 ⇒ 收工", flush=True)
+                return
         except Exception as _e:                    # noqa: BLE001  绝不能影响主流程
             print(f"[xtu-idle-ec] 失败(不掩盖): {type(_e).__name__}: {_e}", flush=True)
             return
@@ -746,13 +774,15 @@ def start_idle_empty_cache() -> bool:
     try:
         idle_s = float(os.environ.get("XIAOTU_IDLE_EC_SECONDS", "30") or 30)
         wait_max = float(os.environ.get("XIAOTU_IDLE_EC_WAIT", "1800") or 1800)
+        max_try = int(os.environ.get("XIAOTU_IDLE_EC_TRIES", "3") or 3)
+        min_frag = float(os.environ.get("XIAOTU_IDLE_EC_MIN_FRAG", "3") or 3)
     except (TypeError, ValueError):
-        idle_s, wait_max = 30.0, 1800.0
+        idle_s, wait_max, max_try, min_frag = 30.0, 1800.0, 3, 3.0
     import threading
-    th = threading.Thread(target=_idle_empty_cache_loop, args=(idle_s, wait_max),
+    th = threading.Thread(target=_idle_empty_cache_loop,
+                          args=(idle_s, wait_max, max_try, min_frag),
                           name="xtu-idle-ec", daemon=True)
     th.start()
-    # alloc-audit: bounded _IDLE_EC_STATE —— 固定两键，单例状态机（见上）
     # alloc-audit: bounded _IDLE_EC_STATE —— 固定两键，单例状态机（见上）
     _IDLE_EC_STATE["armed"] = True
     print(f"[xtu-idle-ec] 已布防：启动完成且空闲 {idle_s:g}s 后归还一次（最长等 {wait_max:g}s）",

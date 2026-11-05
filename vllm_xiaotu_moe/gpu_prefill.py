@@ -799,6 +799,13 @@ def start_idle_empty_cache() -> bool:
     """开关：`XIAOTU_IDLE_EMPTY_CACHE=1`。只归还一次，且只在启动完成后空闲时。"""
     if os.environ.get("XIAOTU_IDLE_EMPTY_CACHE", "0") != "1":
         return False
+    # ⛔ [2026-11-05 审计 B] 与 `watch_release_trigger()` 共用同一个 `done` 标记：
+    #    若已设"预热收尾触发"（确定性、每次一次），就**不要**再起空闲线程，
+    #    否则空闲线程可能先满足并吃掉唯一一次机会（例如 WARMUP=0 + 启动后真空闲 60 s）。
+    if os.environ.get("XIAOTU_RELEASE_AFTER_LOG") or os.environ.get("XIAOTU_RELEASE_MARKER"):
+        print("[xtu-idle-ec] 已设预热收尾触发 ⇒ 空闲线程不布防（避免抢同一次机会）",
+              flush=True)
+        return False
     if _IDLE_EC_STATE["armed"]:
         return True
     try:
@@ -927,6 +934,15 @@ def watch_release_trigger() -> bool:
     if os.environ.get("XIAOTU_IDLE_EMPTY_CACHE", "0") != "1":
         return False
 
+    # ⛔ [2026-11-05 审计 B] `_warmup.log` 是 `>>` **追加**、且不在 LOG_KEEP 归档范围 ⇒
+    #    从第 2 次 start 起，文件末尾本来就躺着上一次的"完成:" ⇒ 一布防就命中，
+    #    把唯一一次归还机会**提前吃掉**（真正预热后那次永不发生，日志上却"看起来成功"）。
+    #    ⇒ 布防时记下 EOF，只匹配**新增**内容。
+    try:
+        _eof0 = os.path.getsize(logp) if logp and os.path.exists(logp) else 0
+    except OSError:
+        _eof0 = 0
+
     def _loop():
         t0 = time.monotonic()
         while time.monotonic() - t0 < 7200:
@@ -940,7 +956,8 @@ def watch_release_trigger() -> bool:
                 elif logp and os.path.exists(logp):
                     try:
                         with open(logp, "r", errors="ignore") as f:
-                            hit = "完成:" in f.read()[-4000:]
+                            f.seek(_eof0)          # 只看布防之后新增的部分
+                            hit = "完成:" in f.read()
                     except OSError:
                         hit = False
                 if not hit:

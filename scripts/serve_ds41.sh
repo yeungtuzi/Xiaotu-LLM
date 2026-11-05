@@ -453,6 +453,12 @@ start() {
         export XIAOTU_PIN_CUDA_MOE="$PIN_CUDA_MOE" XIAOTU_ENGRAM_LAST=1
         if [ "$IDLE_EC" = "1" ]; then
             export XIAOTU_IDLE_EMPTY_CACHE=1 XIAOTU_IDLE_EC_SECONDS="$IDLE_EC_SECONDS"
+            # ⭐ 预热收尾即归还：实测 10.8 GiB 高水位 100% 来自形状预热，
+            #    且"空闲 ≥60 s"窗口在持续流量下不存在 ⇒ 以**预热日志收尾**为触发源。
+            export XIAOTU_RELEASE_AFTER_LOG="$RUN_DIR/ds41_${TAG}_warmup.log"
+            # 插件里 marker **优先于** log：父环境若残留 XIAOTU_RELEASE_MARKER 且指向
+            # 任一已存在文件，就会在启动结束瞬间触发、盖过日志触发源 ⇒ 显式清掉。
+            unset XIAOTU_RELEASE_MARKER 2>/dev/null || true
         else
             unset XIAOTU_IDLE_EMPTY_CACHE 2>/dev/null || true
         fi

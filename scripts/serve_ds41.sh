@@ -18,7 +18,7 @@
 # 可覆盖的 NAME=VAL（白名单外一律拒绝）：
 #   TAG=prod PORT=8700 TP=2 GPU_UTIL=0.90 MAXSEQS=4 MBT=8192 MAXLEN=524288
 #   THREADS=60 IMAGE_MAX=128 COMPILE_RANGES=32,256,8192
-#   PIN=1 PIN_SLOTS=15 PIN_MAXQ=16 CED=1 WARMUP=1 KV_DTYPE=fp8_ds_mla
+#   PIN=1 PIN_SLOTS=15 PIN_MAXQ=16 PIN_CUDA_MOE=0 CED=1 WARMUP=1 KV_DTYPE=fp8_ds_mla
 #   SPEC=1 MODEL_DIR=<路径>
 #   LOG_KEEP=3     启动时保留几份历史日志（环境变量；归档命名 <log>.<时间戳>，上限 50）
 #   EXPANDABLE=1   1=expandable_segments:True（**默认**，碎片治理）；0=关 + 追加 --disable-custom-all-reduce；
@@ -52,7 +52,7 @@ VLLM_DIR="${VLLM_DIR:-/home/user/lvllm/process_data/ref/repos/vllm-mainline/vllm
 
 TAG="prod"; PORT=8700; TP=2; GPU_UTIL=0.9; MAXSEQS=4; MBT=8192; MAXLEN=524288
 THREADS=60; IMAGE_MAX=128; COMPILE_RANGES="32,256,8192"
-PIN=1; PIN_SLOTS=15; PIN_MAXQ=16; CED=1; WARMUP=1
+PIN=1; PIN_SLOTS=15; PIN_MAXQ=16; PIN_CUDA_MOE=0; CED=1; WARMUP=1
 PC=0; PC_GB=64; PC_BLOCKS=16; PC_ROOT="/home/user/.cache/prefix-cache"
 PC_FREE_MIN_MIB="${PC_FREE_MIN_MIB:-524288}"
 PC_WRITE_WAIT="${PC_WRITE_WAIT:-900}"
@@ -86,6 +86,7 @@ while [ $# -gt 0 ]; do
                 COMPILE_RANGES) COMPILE_RANGES="$v" ;;
                 PIN) PIN="$v" ;;
                 PIN_SLOTS) PIN_SLOTS="$v" ;;
+                PIN_CUDA_MOE) PIN_CUDA_MOE="$v" ;;
                 PIN_MAXQ) PIN_MAXQ="$v" ;;
                 CED) CED="$v" ;;
                 WARMUP) WARMUP="$v" ;;
@@ -184,6 +185,7 @@ validate() {
         || die "PIN_SLOTS/PIN_MAXQ/IMAGE_MAX 必须是非负整数"
     [ "$IMAGE_MAX" -le 128 ] || die "IMAGE_MAX 上限 128（得到 '$IMAGE_MAX'）"
     [ "$PIN_SLOTS" -le 64 ] || die "PIN_SLOTS 上限 64（得到 '$PIN_SLOTS'）"
+    case "$PIN_CUDA_MOE" in 0|1) ;; *) die "PIN_CUDA_MOE 只能是 0/1（得到 '$PIN_CUDA_MOE'）" ;; esac
     [ "$PIN_MAXQ" -le 256 ] || die "PIN_MAXQ 上限 256（得到 '$PIN_MAXQ'）"
     awk -v u="$GPU_UTIL" 'BEGIN{exit !(u+0>0.05 && u+0<=1.0)}' || die "GPU_UTIL 必须在 (0.05,1.0]（得到 '$GPU_UTIL'）"
     case "$CED" in 0|1) ;; *) die "CED 只能是 0/1" ;; esac
@@ -376,7 +378,13 @@ start() {
 
     build_args
     say "启动 TAG=$TAG PORT=$PORT TP=$TP util=$GPU_UTIL seqs=$MAXSEQS MBT=$MBT maxlen=$MAXLEN"
-    say "线程=$THREADS PIN=$PIN/$PIN_SLOTS MAXQ=$PIN_MAXQ CED=$CED SPEC=$SPEC image=$IMAGE_MAX"
+    say "线程=$THREADS PIN=$PIN/$PIN_SLOTS MAXQ=$PIN_MAXQ CUDA_MOE=$PIN_CUDA_MOE CED=$CED SPEC=$SPEC image=$IMAGE_MAX"
+    # ⛔ [2026-11-05 审计 B · M] 小 M 内核**只走 PIN 常驻槽位**（gpu_prefill.py:3017
+    #    `slot is not None and _moe4_ok`）；`PIN=0` 时 slot 恒为 None ⇒ 内核永不生效。
+    #    不提示的话会白烧一次启动，且 A/B 结论会被误读成"内核无效"。
+    if [ "$PIN_CUDA_MOE" = "1" ] && [ "$PIN" != "1" ]; then
+        say "⚠️ PIN_CUDA_MOE=1 但 PIN=0 ⇒ 小 M 内核不会生效（需 PIN 常驻槽）"
+    fi
     if [ -n "$COMPILE_RANGES" ]; then
         say "compile_ranges=[$COMPILE_RANGES] ⇒ 要求生效配置含 compile_ranges_endpoints"
     else
@@ -432,7 +440,7 @@ start() {
         export CUDA_VISIBLE_DEVICES=1,2
         export XIAOTU_PIN="$PIN" XIAOTU_PIN_MAX_PER_LAYER="$PIN_SLOTS" XIAOTU_PIN_MAXQ="$PIN_MAXQ"
         export XIAOTU_MOE_THREADS="$THREADS" OMP_NUM_THREADS=1
-        export XIAOTU_PIN_CUDA_MOE=0 XIAOTU_ENGRAM_LAST=1
+        export XIAOTU_PIN_CUDA_MOE="$PIN_CUDA_MOE" XIAOTU_ENGRAM_LAST=1
         # ⛔ 2026-11-04 用户：**GPU0 独立 MTP（DSpark remote）已废除**。
         #    这里显式关死，防父环境里残留 XIAOTU_DSPARK_REMOTE=1 把已废除的路径复活
         #    （它会 connect GPU0 socket，失败后回落 identity draft ⇒ 启动即崩）。
@@ -566,7 +574,7 @@ start() {
             | grep -qE 'enable-custom-all-reduce'; then
         die "EXPANDABLE=1 但生效命令行里出现 enable-custom-all-reduce ⇒ 绑定被破坏" 4
     fi
-    { echo "[ds41] [口径] EXPANDABLE=$EXPANDABLE PYTORCH_CUDA_ALLOC_CONF=${ALLOC_CONF_EFFECTIVE:-unset} custom-AR=$([ "$EXPANDABLE" = "1" ] && echo off || echo on) PC=$PC PC_GB=$PC_GB PC_BLOCKS=$PC_BLOCKS PC_ROOT=$PC_ROOT GPU_UTIL=$GPU_UTIL PC_FILES_BASE=${_pc_base:-na}"; } >> "$LOG_FILE"
+    { echo "[ds41] [口径] CUDA_MOE=$PIN_CUDA_MOE EXPANDABLE=$EXPANDABLE PYTORCH_CUDA_ALLOC_CONF=${ALLOC_CONF_EFFECTIVE:-unset} custom-AR=$([ "$EXPANDABLE" = "1" ] && echo off || echo on) PC=$PC PC_GB=$PC_GB PC_BLOCKS=$PC_BLOCKS PC_ROOT=$PC_ROOT GPU_UTIL=$GPU_UTIL PC_FILES_BASE=${_pc_base:-na}"; } >> "$LOG_FILE"
     say "显存: $(nvidia-smi --query-gpu=index,memory.used --format=csv,noheader | tr '\n' ' ')"
 
     # ⛔ 2026-11-04 审计 B 后重写：启动健康闸。
@@ -724,7 +732,7 @@ status() {
     say "GPU: $(nvidia-smi --query-gpu=index,memory.used --format=csv,noheader | tr '\n' ' ')"
     say "实际口径:"
     tr '\0' '\n' < "/proc/$pid/environ" 2>/dev/null \
-        | grep -E '^(XIAOTU_MOE_THREADS|XIAOTU_PIN|XIAOTU_PIN_MAXQ|GPU_UTIL|MAXSEQS|COMPILE_RANGES|PYTORCH_CUDA_ALLOC_CONF|EXPANDABLE)=' \
+        | grep -E '^(XIAOTU_MOE_THREADS|XIAOTU_PIN|XIAOTU_PIN_CUDA_MOE|XIAOTU_PIN_MAXQ|GPU_UTIL|MAXSEQS|COMPILE_RANGES|PYTORCH_CUDA_ALLOC_CONF|EXPANDABLE)=' \
         | sed 's/^/    /'
     cc="$(eff_compilation_config "$pid")"
     say "    [生效] --compilation-config $cc"

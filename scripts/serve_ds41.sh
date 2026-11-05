@@ -20,6 +20,7 @@
 #   THREADS=60 IMAGE_MAX=128 COMPILE_RANGES=32,256,8192
 #   PIN=1 PIN_SLOTS=15 PIN_MAXQ=16 CED=1 WARMUP=1 KV_DTYPE=fp8_ds_mla
 #   SPEC=1 MODEL_DIR=<路径>
+#   LOG_KEEP=3     启动时保留几份历史日志（环境变量；归档命名 <log>.<时间戳>，上限 50）
 #   EXPANDABLE=1   1=expandable_segments:True（**默认**，碎片治理）；0=关 + 追加 --disable-custom-all-reduce；
 #                  0=显式 expandable_segments:False（自定义 allreduce 保持开启）
 #
@@ -108,6 +109,7 @@ case "$TAG" in ''|*[!A-Za-z0-9_-]*) die "TAG 只允许 [A-Za-z0-9_-]（得到 '$
 
 PID_FILE="$RUN_DIR/ds41_${TAG}.pid"
 LOG_FILE="$RUN_DIR/ds41_${TAG}.log"
+LOG_KEEP="${LOG_KEEP:-3}"   # 启动时保留几份历史日志（归档命名 <log>.<时间戳>）
 LOCK_FILE="$RUN_DIR/ds41_${TAG}.lock"
 
 # ══ 端口归属三态：free / owned:PID / unknown —— unknown 一律按拒绝处理 ════════
@@ -188,6 +190,12 @@ validate() {
     case "$PIN" in 0|1) ;; *) die "PIN 只能是 0/1" ;; esac
     case "$SPEC" in 0|1) ;; *) die "SPEC 只能是 0/1" ;; esac
     case "$WARMUP" in 0|1) ;; *) die "WARMUP 只能是 0/1（得到 '$WARMUP'）" ;; esac
+    # ⛔ [2026-11-05 审计 B] LOG_KEEP 是**按 glob 删文件**的旋钮，比别的数值旋钮更危险：
+    #    0 ⇒ `tail -n +1` 会把**刚归档的那份也删掉**（正好以新方式丢崩溃现场）；
+    #    abc/1x ⇒ 算术展开失败，bash 在中途 abort，启动没做、退出码也不是文档里的那几个。
+    case "$LOG_KEEP" in ''|0*|*[!0-9]*) die "LOG_KEEP 必须是正整数（得到 '$LOG_KEEP'）" ;; esac
+    [ "$LOG_KEEP" -ge 1 ] && [ "$LOG_KEEP" -le 50 ] \
+        || die "LOG_KEEP 越界 1..50（得到 $LOG_KEEP）"
     case "$EXPANDABLE" in 0|1) ;; *) die "EXPANDABLE 只能是 0/1" ;; esac
     case "$PC" in 0|1) ;; *) die "PC 只能是 0/1（得到 '$PC'）" ;; esac
     if [ "$PC" = "0" ]; then
@@ -402,6 +410,21 @@ start() {
         _pc_bins="$(find "$PC_ROOT" -name '*.bin' 2>/dev/null | wc -l)"
         say "PC 预检 ✓ root=$PC_ROOT 可写、/dev/shm 余量 ${_shm_avail:-?}MiB、已有块文件 ${_pc_bins} 个"
         say "⚠️ fs 层无淘汰无配额（实测 ≈115 GB/日）⇒ 已挂运行时磁盘守护，阈值 ${PC_FREE_MIN_MIB}MiB"
+    fi
+    # ⛔ 2026-11-05 事故教训（台账 #396）：原来这里 `: > "$LOG_FILE"` **直接截断**旧日志，
+    #    于是 11-04 20:06 那次 Xid31 崩溃后一重启，7579 行现场（含 188 个 [xtu-vram] 快照
+    #    与完整栈）**全部丢失**，无法复盘。
+    #    ⇒ 启动前先归档，保留最近 LOG_KEEP 份（默认 3）。
+    if [ -s "$LOG_FILE" ]; then
+        _arch="$LOG_FILE.$(date +%Y%m%d-%H%M%S)"
+        if mv "$LOG_FILE" "$_arch" 2>/dev/null; then
+            say "旧日志已归档：$_arch"
+            # 只保留最近 LOG_KEEP 份，防无限增长
+            ls -1t "$LOG_FILE".* 2>/dev/null | tail -n +"$(( LOG_KEEP + 1 ))" \
+                | while read -r _old; do rm -f "$_old"; done
+        else
+            say "⚠️ 旧日志归档失败（继续，但会覆盖 $LOG_FILE）"
+        fi
     fi
     : > "$LOG_FILE" || die "日志不可写：$LOG_FILE" 4
     (

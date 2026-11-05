@@ -267,10 +267,12 @@ def moe_layer(
             except Exception as _em:  # noqa: BLE001
                 _M4.disable(f"运行期异常：{_em}")
             if _r is not None:
+                # ⚠️ 与生产快路径一致：不做 out_dtype 转换（生产也返回 fp32）。
+                #    若在此转换，两臂 dtype 不同，A/B 量到的会是类型差。
                 if out is not None:
                     out.copy_(_r)
                     return out
-                return _r if _r.dtype == out_dtype else _r.to(out_dtype)
+                return _r
 
     # 【2026-10-31】优先走**内核内 dispatch**（无主机侧分段，省 ~157 µs/层）。
     #   `XIAOTU_MOE4_FAST=0` 可回退到段表版（两版都已对 fp64 验证）。

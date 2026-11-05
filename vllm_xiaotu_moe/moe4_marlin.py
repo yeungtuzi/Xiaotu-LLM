@@ -165,6 +165,13 @@ def gemm(x, topk_ids, topk_weights, w13, s13, w2, s2, num_experts, H, I) -> Opti
     return b["out"]
 
 
+def out_dtype_note() -> str:
+    """生产 `moe4_smallm` 的快路径返回 **fp32**（`res2`），不看 `out_dtype`。
+    本模块保持同一行为，由调用方决定是否转换 —— 否则两臂 dtype 不一致，
+    A/B 对比会变成"fp32 vs bf16"，量到的是类型差不是实现差。"""
+    return "fp32"
+
+
 def disable(reason: str = "") -> None:
     global _failed
     if not _failed:

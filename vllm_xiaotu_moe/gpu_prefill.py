@@ -759,6 +759,14 @@ def _idle_empty_cache_loop(idle_s: float, wait_max_s: float,
                 if _a0 == 0 and _r0 == 0:
                     continue
                 torch.cuda.synchronize(_d)
+                # ⛔ [2026-11-05 实测教训] 门是"先检查后执行"，而 `synchronize` 可能被
+                #    在检查之后才进来的请求阻塞几十秒（实测 age=7.8s 时仍执行了归还，
+                #    正是审计担心的 check-then-act 竞态）。⇒ 真正 `empty_cache()` 之前
+                #    再确认一次：自上次检查以来若又有任何活动，立刻放弃本轮。
+                if time.monotonic() - _LAST_ACTIVITY[0] < idle_s:
+                    print("[xtu-idle-ec] 同步期间又有流量 ⇒ 放弃本次归还（竞态保护）",
+                          flush=True)
+                    return
                 torch.cuda.empty_cache()
                 _r1 = int(torch.cuda.memory_reserved(_d))
                 _f1, _ = torch.cuda.mem_get_info(_d)

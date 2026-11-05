@@ -28,8 +28,20 @@ def main():
     cfg.stride = 32; cfg.group_min_len = 10; cfg.group_max_len = 4096 + 128
     cfg.groupN = 1; cfg.groupK = 32; cfg.activation_type = 0
     eng = m.MOE_MXFP4(cfg, w13, w2, s13, s2, 0, 0)
-    ids = rng.integers(0, E, size=(B, K)).astype(np.int32)
+    # COVER=1：让 B*K 个槽位**正好覆盖全部 E 个专家**（与 GPU 内核固定算满 E 个专家对齐）；
+    # COVER=0：随机路由（旧口径，只命中约 2/3 的专家，会低估 CPU 工作量）
+    cover = int(os.environ.get("COVER", "1"))
+    if cover and B * K >= E:
+        perm = rng.permutation(E)
+        flat = np.zeros(B * K, dtype=np.int32)
+        flat[:E] = perm
+        flat[E:] = rng.integers(0, E, size=B * K - E)
+        ids = flat.reshape(B, K)
+    else:
+        ids = rng.integers(0, E, size=(B, K)).astype(np.int32)
     wts = rng.uniform(-1, 1, size=(B, K)).astype(np.float32)
+    n_distinct = len(np.unique(ids))
+    print(f"[cpu-perrank] 不同专家数 = {n_distinct} / {E}（COVER={cover}）", flush=True)
     x = f32_to_bf16_bits(rng.standard_normal((B, H)).astype(np.float32))
     out = np.zeros((B, H), dtype=np.float32)
     for _ in range(3):

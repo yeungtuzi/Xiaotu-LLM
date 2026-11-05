@@ -3636,3 +3636,67 @@ else { for (i<4) atomicAdd(rowA + base0 + i, pw[i]); }   // 多块：原子累�
 3. ⛔ 图省事的"最后一次合并写"（float2/float4）会**静默破坏原子语义** ——
    凡是可能多块写同一位置的内核，epilogue 的写方式必须按并行度分支。
 4. ⚠️ 论文与交底书里的 0.2246 ms / 3.70× / 550 GB/s **全部作废**，需按上表替换。
+
+## 一百零二、第 71 轮：端到端接线（代码完成）+ 段级耗时真相
+
+### 适配层真实开销：19 µs，不是 94 µs
+
+之前报的 94 µs 是测法错误 —— e2e 探针每次迭代都在 `torch.zeros`(7 MB) / `torch.empty`，
+那部分主机开销被算进了适配层。改成**全部预分配 + CUDA event 计时**后：
+
+| 段 | 耗时 |
+|---|---:|
+| dispatch（zero+place+gather） | 10.7 µs |
+| gu（ks=4） | 155.6 µs |
+| swiglu | 5.5 µs |
+| dn（ks=4） | ~117 µs |
+| combine（scatter+reduce） | 8.3 µs |
+| **适配层合计** | **19.0 µs（+6.9%）** |
+
+### 端到端（含适配层，预分配，ks=4/4）
+
+| T | 整条 | 对照 |
+|---:|---:|---|
+| 5 | **291.8 µs** | 生产标量 831 µs ⇒ **2.85×**；CPU 引擎 303 µs ⇒ GPU 快 3.7% |
+| 6 | 292.0 µs | CPU 331 µs ⇒ 快 11.8% |
+| 7 | 292.2 µs | CPU 343 µs ⇒ 快 14.8% |
+| 8 | 292.0 µs | CPU 380 µs ⇒ 快 23.2% |
+
+⇒ **排序判据在含适配层的真实端到端口径下仍成立**（T=5 余量 3.7%，T=8 余量 23%）。
+
+### 语义一致：按"精度不足以改变 token"验收 —— 通过
+
+判据落成可测量的形式：**我们的 fp32 结果与精确解分别 round 到 bf16 后逐位比较**。
+
+| 配置 | fp32 相对误差 | bf16 后不同元素 |
+|---|---:|---:|
+| ks=1 | 8.6e-07 | 1 / 16384 |
+| ks=4 | 2.8e-07 | **0 / 16384** |
+| ks=8 | 2.7e-07 | **0 / 16384** |
+
+我们的误差 2.8e-07 对 bf16 存储步长 7.8e-03 ⇒ **低 4 个数量级**；
+下游拿到的是逐位相同的 bf16 ⇒ **token 不可能因本内核而改变**。
+（探针小尺寸复测：0/1280。用户裁定：算子输出未变即为工程一致，不必再跑 GSM8K/Needle。）
+
+### 接线代码（已完成，未部署）
+
+| 文件 | 内容 |
+|---|---|
+| `vllm_xiaotu_moe/csrc/moe_marlin_fused.cu` | 内核 + swiglu（自 dev-docs 抽出） |
+| `vllm_xiaotu_moe/csrc/moe_marlin_dispatch.cu` | 槽位适配层（dispatch/combine） |
+| `vllm_xiaotu_moe/moe4_marlin.py` | 接线模块：首用编译、按源码哈希缓存、持久缓冲、fail-closed |
+| `vllm_xiaotu_moe/moe4_smallm.py` | `moe_layer()` 内加分支：`XIAOTU_MOE4_MARLIN=1` 时优先走融合路径 |
+
+独立测试（小尺寸）：`available()=True`，fp32 误差 1.3e-07，**bf16 后 0/1280 不同**。
+
+### 踩到的两个坑（已修）
+
+1. 接线模块 `run()` 的 argtypes 少了一个 `int`（C 侧是 4 指针 + 6 整数 `na,K,N,NE,nblk,ksplit`），
+   调用漏传 `nblk`；
+2. 测试脚本里 `out`(cuda) 与 `ref`(cpu) 直接比较 ⇒ 设备不匹配。
+
+### 下一步（下一轮继续）
+
+1. 部署本地树到远端（`scripts/deploy_engine.sh` + `BUILD_MOE4=1`）；
+2. GPU0 起 TP=1 实例，同 prompt 贪心解码，两次跑（`XIAOTU_MOE4_MARLIN=0/1`），比 token ID；
+3. 记录端到端步时与 tok/s。

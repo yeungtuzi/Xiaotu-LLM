@@ -249,6 +249,29 @@ def moe_layer(
         num_experts = max(int(topk_ids.max().item()) + 1 if topk_ids.numel() else 1,
                           int(w13.shape[0]))
     num_experts = int(num_experts)
+
+    # 【2026-11-05】融合 MXFP4 路径（默认关闭）：`XIAOTU_MOE4_MARLIN=1` 时优先尝试。
+    #   与本路径数值等价（fp32 结果经 bf16 取整后逐位相同），差别只在实现：
+    #   权重不经扩展进 shared、置换并入写入（无需离线重排）、寄存器内查表展开。
+    #   任何前置条件不满足或运行期异常 ⇒ 返回 None 并回退，行为与未接入时一致。
+    if swiglu_limit <= 0.0:
+        try:
+            from vllm_xiaotu_moe import moe4_marlin as _M4
+        except Exception:  # noqa: BLE001
+            _M4 = None
+        if _M4 is not None and _M4.available():
+            _r = None
+            try:
+                _r = _M4.gemm(x, topk_ids, topk_weights, w13, s13, w2, s2,
+                              num_experts, int(H), int(I))
+            except Exception as _em:  # noqa: BLE001
+                _M4.disable(f"运行期异常：{_em}")
+            if _r is not None:
+                if out is not None:
+                    out.copy_(_r)
+                    return out
+                return _r if _r.dtype == out_dtype else _r.to(out_dtype)
+
     # 【2026-10-31】优先走**内核内 dispatch**（无主机侧分段，省 ~157 µs/层）。
     #   `XIAOTU_MOE4_FAST=0` 可回退到段表版（两版都已对 fp64 验证）。
     TOPSEL = int(topk_ids.shape[1])

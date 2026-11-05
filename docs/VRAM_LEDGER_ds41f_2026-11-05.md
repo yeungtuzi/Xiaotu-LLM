@@ -3991,3 +3991,32 @@ if (limit > 0.f) { g = fminf(g, limit); u = fminf(fmaxf(u, -limit), limit); }
 
 口径已在真实服务上确认：`XIAOTU_PIN_CUDA_MOE=1`、`XIAOTU_MOE4_MARLIN=0`，
 `check_ds41_entry.sh` 判**合规** ⇒ 新增的 MARLIN 口径检查在真实服务上工作正常。
+
+## 一百零九、第 78 轮：B 臂完成 —— moe4 路径质量零影响，吞吐拿到
+
+### 测量协议（两臂同一脚本，保证可比）
+
+预热 3 短 + 1 长（不计入）→ GSM8K（N=128，temp 0，MAXTOK=640，8-shot CoT）
+→ 固定协议吞吐（`bench_fixed_protocol.py`，n=16，outlen=512，15k 长 prompt，C=1 与 C=4）。
+
+### 结果
+
+| 指标 | A（`PIN_CUDA_MOE=0`，现状） | B（`PIN_CUDA_MOE=1 MARLIN=0`） |
+|---|---:|---:|
+| GSM8K-128 | **123/128 = 96.09%** | **123/128 = 96.09%** |
+| prefill tok/s @C=1 | 未测 | 607.0 |
+| decode tok/s @C=1 | 未测 | 45.8 |
+| step ms（中位）@C=1 | 未测 | 74.43 |
+| prefill tok/s @C=4 | 未测 | 2457.0 |
+| decode tok/s @C=4 | 未测 | 78.4 |
+| step ms（中位）@C=4 | 未测 | 170.11 |
+
+⭐ **B 与 A 的 GSM8K 完全相同（123/128），且逐题正确模式一致**
+（20→19、40→39、80→78、100→97、120→115）⇒
+**启用 moe4 路径本身对质量零影响**。这同时补上了 `MOE4_SMALLM_STATUS.md`
+自述缺失的第 ⑤ 项质量部分（已就地更新该文档）。
+
+### 待补
+
+A 臂的吞吐没在切换前测（当时只跑了 GSM8K），是本次方案的缺口。
+C 臂测完后，A 臂吞吐需再重启一次补齐；否则只能做 B↔C 的内核对比，无法回答"相对现状快多少"。

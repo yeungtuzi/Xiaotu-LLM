@@ -820,6 +820,50 @@ def start_idle_empty_cache() -> bool:
     return True
 
 
+def maybe_idle_release(why: str = "") -> None:
+    """在**引擎确实没有未完成请求**的时刻，做一次性缓存归还（默认关闭）。
+
+    与空闲线程的区别：不依赖"空闲计时"，而是由 `EngineCore.step` 在
+    `scheduler.has_requests() == False` 时调用 ⇒ 判据是**引擎状态**，不是墙钟。
+    """
+    if os.environ.get("XIAOTU_IDLE_EMPTY_CACHE", "0") != "1":
+        return
+    if _IDLE_EC_STATE["done"] or _IN_STARTUP[0]:
+        return
+    try:
+        if os.environ.get("XIAOTU_IDLE_EC_MIN_FRAG"):
+            _min_frag = float(os.environ["XIAOTU_IDLE_EC_MIN_FRAG"])
+        else:
+            _min_frag = 3.0
+        _frag_max = 0
+        for _i in range(torch.cuda.device_count()):
+            _d = torch.device(f"cuda:{_i}")
+            _a = int(torch.cuda.memory_allocated(_d))
+            _r = int(torch.cuda.memory_reserved(_d))
+            if _a == 0 and _r == 0:
+                continue
+            _frag_max = max(_frag_max, _r - _a)
+        if _frag_max < int(_min_frag * 2**30):
+            return
+        for _i in range(torch.cuda.device_count()):
+            _d = torch.device(f"cuda:{_i}")
+            _r0 = int(torch.cuda.memory_reserved(_d))
+            if _r0 == 0:
+                continue
+            torch.cuda.synchronize(_d)
+            torch.cuda.empty_cache()
+            _r1 = int(torch.cuda.memory_reserved(_d))
+            _f1, _ = torch.cuda.mem_get_info(_d)
+            print(f"[xtu-idle-ec] 引擎无请求({why}) ⇒ cuda:{_i} 归还 "
+                  f"{(_r0 - _r1) / 2**30:.2f} GiB（reserved {_r0 / 2**30:.2f}→"
+                  f"{_r1 / 2**30:.2f}，free {int(_f1) / 2**30:.2f} GiB）", flush=True)
+        # alloc-audit: bounded _IDLE_EC_STATE —— 固定两键，单例状态机（见上）
+        _IDLE_EC_STATE["done"] = True
+    except Exception as _e:                        # noqa: BLE001
+        print(f"[xtu-idle-ec] 引擎空闲归还失败(不掩盖): {type(_e).__name__}: {_e}",
+              flush=True)
+
+
 def mark_activity() -> None:
     """记一次"引擎真的在跑"（`EngineCore.step` 每步调用）。
 
@@ -2011,7 +2055,18 @@ def install_profile_guard() -> list[str]:
                     mark_activity()
                 except Exception:                      # noqa: BLE001
                     pass
-                return _o(self, *a, **kw)
+                _out = _o(self, *a, **kw)
+                # ⭐ [2026-11-05] **真正的安全归还点**：step 边界 + 引擎无任何未完成请求。
+                #   实测"空闲 ≥60 s"在持续流量下几乎永不成立（一天里 3 次都是放弃），
+                #   而 step 边界且 has_requests()=False 时，GPU 上没有任何用户请求的 kernel
+                #   在飞 ⇒ 这是比"空闲计时"更硬的判据。
+                try:
+                    _sch = getattr(self, "scheduler", None)
+                    if _sch is not None and not _sch.has_requests():
+                        maybe_idle_release("engine-idle")
+                except Exception:                      # noqa: BLE001
+                    pass
+                return _out
             _wrapped._xtu_activity = True
             return _wrapped
 

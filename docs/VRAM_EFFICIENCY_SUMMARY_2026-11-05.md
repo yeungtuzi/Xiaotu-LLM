@@ -36,7 +36,7 @@
   只匹配**新增**内容（`_warmup.log` 是追加型，否则第 2 次启动会命中旧收尾行）；
 - 安全门：`frag ≥ 3 GiB` 才动手；`synchronize` 后、`empty_cache()` **前**再确认最近
   5 s 无活动，否则放弃本轮（实测确实会放弃——第 3 次启动放弃了 6 次才等到安静窗口）；
-- 只做一次；受 `XIAOTU_IDLE_EMPTY_CACHE=1` 控制，默认关（`IDLE_EC=1` 才开）。
+- 只做一次；受 `XIAOTU_IDLE_EMPTY_CACHE=1` 控制，**`IDLE_EC` 默认已为 1**（要关用 `IDLE_EC=0`）。
 
 实测：`预热收尾 ⇒ cuda:X 归还 10.40~10.73 GiB（reserved 35.0→24.6）`。
 
@@ -77,8 +77,8 @@ XTier 把专家搬上卡是"从慢 CPU 搬到极快张量核"；本项目的 CPU
 ## 7. 复现
 
 ```bash
-# 生产（开启归还；默认 IDLE_EC=0）
-bash scripts/serve_ds41.sh restart IDLE_EC=1 PIN_SLOTS=15
+# 生产（默认就开启归还；要关掉用 IDLE_EC=0）
+bash scripts/serve_ds41.sh restart PIN_SLOTS=15
 
 # 观察
 grep -E "预热收尾 ⇒|放弃本轮" ~/run/ds41_prod.log | tail

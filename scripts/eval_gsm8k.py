@@ -46,10 +46,14 @@ def ask(p, retry=True):
                                headers={"Content-Type":"application/json"})
     with urllib.request.urlopen(req, timeout=600) as r:
         msg = json.loads(r.read())["choices"][0]["message"]
-    # ⚠️ V4.1-Flash 是推理模型:content 可能为 None(内容在 reasoning_content ✓)
+    # ⚠️ V4.1-Flash 是推理模型:content 可能为 None(内容在思维链字段里)
+    #    ⛔ 2026-11-05 勘误：字段名是 `reasoning`，**不是** `reasoning_content`。
+    #       此前写错 ⇒ 撞到 max_tokens 时 content=None 且 reasoning_content=None
+    #       ⇒ 取到空串、判错。实测第 88 题：completion=640 全在 reasoning（2648 字符），
+    #       content=None ⇒ 被误判。这不是模型答错，是**预算耗尽被截断**。
     out = msg.get("content")
     if not out:
-        out = msg.get("reasoning_content") or ""
+        out = msg.get("reasoning") or msg.get("reasoning_content") or ""
     return out or ""
 
 def gold(ans):

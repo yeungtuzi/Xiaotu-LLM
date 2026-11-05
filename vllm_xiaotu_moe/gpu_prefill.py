@@ -499,6 +499,11 @@ _LAST_REPORT = [0.0]
 #    要把它压下来，必须先知道峰值出现在**哪个阶段**（权重/建池/KV/图捕获/预热）。
 #    用法：`XIAOTU_VRAM_TRACE=2`（秒，0=关）⇒ 每 2 s 打一行 allocated/reserved/max_alloc。
 _VRAM_TRACE_LAST = [0.0]
+# ⛔ [2026-11-05 审计 B · B-1b] **"空闲"必须有真实来源**：原实现用 `_LAST_REPORT[0]` 当空闲判据，
+#    但它只在 `maybe_report()` 真正打印时才更新（受 60 s 限频）⇒ 持续有流量时也可能已过期 60 s
+#    ⇒ "空闲 ≥60 s" 判据近似恒真。权威活动源见 `mark_activity()`（由 EngineCore.step 每步调用）。
+# alloc-audit: bounded _LAST_ACTIVITY —— 单元素容器，只写一个 monotonic 时间戳；长度恒为 1
+_LAST_ACTIVITY = [0.0]
 _VRAM_TRACE_THREAD = [None]
 
 
@@ -671,6 +676,10 @@ def maybe_report(period_s: float = 60.0, tag: str = "steady") -> None:
 
     判据：与启动那次 `startup-before-kv` 的 total_bytes **完全相等**即为"不涨"。
     """
+    # ⛔ [P1] 打点必须在**所有 early-return 之前**：原写法在 `XIAOTU_VRAM_REPORT=0`
+    #    的 return 之后 ⇒ 一关诊断日志，活动戳永不更新，空闲门退回"恒真"。
+    # alloc-audit: bounded _LAST_ACTIVITY —— 单元素容器，只写一个 monotonic 时间戳；长度恒为 1
+    _LAST_ACTIVITY[0] = time.monotonic()
     if os.environ.get("XIAOTU_VRAM_REPORT", "1") != "1":
         return
     now = time.monotonic()
@@ -754,9 +763,10 @@ def _idle_empty_cache_loop(idle_s: float, wait_max_s: float,
                 _r1 = int(torch.cuda.memory_reserved(_d))
                 _f1, _ = torch.cuda.mem_get_info(_d)
                 _reclaimed = max(_reclaimed, _r0 - _r1)
+                _age = time.monotonic() - _LAST_ACTIVITY[0]
                 print(f"[xtu-idle-ec] 第{tries}次 cuda:{_i} 归还 {(_r0 - _r1) / 2**30:.2f} GiB"
                       f"（reserved {_r0 / 2**30:.2f}→{_r1 / 2**30:.2f}，"
-                      f"free {int(_f1) / 2**30:.2f} GiB）", flush=True)
+                      f"free {int(_f1) / 2**30:.2f} GiB，空闲 age={_age:.1f}s）", flush=True)
             # alloc-audit: bounded _IDLE_EC_STATE —— 固定两键（done/armed），单例状态机，
             #   不是缓存、不随请求增长；此处只是把 done 置位。
             if _reclaimed > 1 * 2**30:
@@ -795,6 +805,18 @@ def start_idle_empty_cache() -> bool:
     print(f"[xtu-idle-ec] 已布防：启动完成且空闲 {idle_s:g}s 后归还一次（最长等 {wait_max:g}s）",
           flush=True)
     return True
+
+
+def mark_activity() -> None:
+    """记一次"引擎真的在跑"（`EngineCore.step` 每步调用）。
+
+    ⛔ [P2] 活动戳若只靠 `maybe_report()`（调用点在 `mixed_experts.apply()`），则 decode 稳态
+    走 CUDA graph 回放、Python `apply()` 不执行时，时间戳会冻结在最后一次 eager 调用 ⇒
+    **长 decode 被判成"空闲"**，正好在最坏时刻触发 `empty_cache`。`EngineCore.step()`
+    每个 iteration 都执行（与图无关），故以它为权威活动源。
+    """
+    # alloc-audit: bounded _LAST_ACTIVITY —— 单元素容器，只写一个 monotonic 时间戳；长度恒为 1
+    _LAST_ACTIVITY[0] = time.monotonic()
 
 
 def persistent_bytes() -> int:
@@ -1961,6 +1983,27 @@ def install_profile_guard() -> list[str]:
     _initialize_kv_caches._xtu_shim = True  # type: ignore[attr-defined]
     EngineCore._initialize_kv_caches = _initialize_kv_caches
     applied.append("EngineCore._initialize_kv_caches")
+
+    # ⭐ [P2] **权威活动源**：`EngineCore.step` 每个 iteration 都执行（与是否走 CUDA graph
+    #    回放无关）⇒ 用它给空闲门提供真实活动时刻。只装一次；异常绝不影响主流程。
+    for _mname in ("step", "step_with_batch_queue"):
+        _orig_step = getattr(EngineCore, _mname, None)
+        if _orig_step is None or getattr(_orig_step, "_xtu_activity", False):
+            continue
+
+        def _make(_o):
+            @functools.wraps(_o)
+            def _wrapped(self, *a, **kw):
+                try:
+                    mark_activity()
+                except Exception:                      # noqa: BLE001
+                    pass
+                return _o(self, *a, **kw)
+            _wrapped._xtu_activity = True
+            return _wrapped
+
+        setattr(EngineCore, _mname, _make(_orig_step))
+        applied.append(f"EngineCore.{_mname}(activity)")
 
     # 【§589 修】**必须同时给每个 worker 进程装一个锚点!**
     # `_IN_STARTUP` 是**进程级**标志,而门控 `_gpu_pf` 是在 **worker 进程**里求值的;

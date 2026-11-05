@@ -688,6 +688,78 @@ def maybe_report(period_s: float = 60.0, tag: str = "steady") -> None:
         _start_cleaner_thread()
 
 
+# ⛔ [xtu 2026-11-05] 空闲期一次性归还缓存（**默认关闭**，`XIAOTU_IDLE_EMPTY_CACHE=1` 才开）。
+#    背景（docs/VRAM_LEDGER_ds41f_2026-11-05.md §六）：profile 后我们已经释放过一次
+#    （reserved 35.49→22.71 GiB），但**预热/图捕获**把 reserved 又推到 35.45，稳态
+#    allocated 只有 23.58 ⇒ 11.86 GiB（单卡 30%）成了永不使用的缓存。
+#    ⇒ 在"启动完成 + 完全空闲"时归还一次，把这块还给驱动（可用于加专家或加 KV）。
+#    ⚠️ 安全前提（都是硬门，任一不满足就不动手）：
+#      ① 启动已完成（KV 已定容）  ② 距最近一次 forward > IDLE_S 秒（默认 30）
+#      ③ 当前不在 CUDA graph 捕获中  ④ 只做一次
+#    历史上运行期 empty_cache 引发过 Xid31，所以这里**必须**先 synchronize 且严格空闲。
+_IDLE_EC_STATE = {"done": False, "armed": False}
+
+
+def _idle_empty_cache_loop(idle_s: float, wait_max_s: float) -> None:
+    t0 = time.monotonic()
+    while time.monotonic() - t0 < wait_max_s:
+        time.sleep(5.0)
+        try:
+            if _IDLE_EC_STATE["done"]:
+                return
+            if _IN_STARTUP[0]:
+                continue
+            if torch.cuda.is_current_stream_capturing():
+                continue
+            if time.monotonic() - _LAST_REPORT[0] < idle_s:
+                continue
+            for _i in range(torch.cuda.device_count()):
+                _d = torch.device(f"cuda:{_i}")
+                _a0 = int(torch.cuda.memory_allocated(_d))
+                _r0 = int(torch.cuda.memory_reserved(_d))
+                if _a0 == 0 and _r0 == 0:
+                    continue
+                torch.cuda.synchronize(_d)
+                torch.cuda.empty_cache()
+                _r1 = int(torch.cuda.memory_reserved(_d))
+                _f1, _ = torch.cuda.mem_get_info(_d)
+                print(f"[xtu-idle-ec] cuda:{_i} 归还 {(_r0 - _r1) / 2**30:.2f} GiB"
+                      f"（reserved {_r0 / 2**30:.2f}→{_r1 / 2**30:.2f}，"
+                      f"free {int(_f1) / 2**30:.2f} GiB）", flush=True)
+            # alloc-audit: bounded _IDLE_EC_STATE —— 固定两键（done/armed），单例状态机，
+            #   不是缓存、不随请求增长；此处只是把 done 置位。
+            # alloc-audit: bounded _IDLE_EC_STATE —— 固定两键（done/armed），单例状态机，
+            #   不是缓存、不随请求增长；此处只是把 done 置位。
+            _IDLE_EC_STATE["done"] = True
+            return
+        except Exception as _e:                    # noqa: BLE001  绝不能影响主流程
+            print(f"[xtu-idle-ec] 失败(不掩盖): {type(_e).__name__}: {_e}", flush=True)
+            return
+
+
+def start_idle_empty_cache() -> bool:
+    """开关：`XIAOTU_IDLE_EMPTY_CACHE=1`。只归还一次，且只在启动完成后空闲时。"""
+    if os.environ.get("XIAOTU_IDLE_EMPTY_CACHE", "0") != "1":
+        return False
+    if _IDLE_EC_STATE["armed"]:
+        return True
+    try:
+        idle_s = float(os.environ.get("XIAOTU_IDLE_EC_SECONDS", "30") or 30)
+        wait_max = float(os.environ.get("XIAOTU_IDLE_EC_WAIT", "1800") or 1800)
+    except (TypeError, ValueError):
+        idle_s, wait_max = 30.0, 1800.0
+    import threading
+    th = threading.Thread(target=_idle_empty_cache_loop, args=(idle_s, wait_max),
+                          name="xtu-idle-ec", daemon=True)
+    th.start()
+    # alloc-audit: bounded _IDLE_EC_STATE —— 固定两键，单例状态机（见上）
+    # alloc-audit: bounded _IDLE_EC_STATE —— 固定两键，单例状态机（见上）
+    _IDLE_EC_STATE["armed"] = True
+    print(f"[xtu-idle-ec] 已布防：启动完成且空闲 {idle_s:g}s 后归还一次（最长等 {wait_max:g}s）",
+          flush=True)
+    return True
+
+
 def persistent_bytes() -> int:
     """**我们自己的**持久缓存总量（`evict_idle` 的可淘汰范围就是这个集合）。
 

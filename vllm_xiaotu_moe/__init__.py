@@ -202,3 +202,11 @@ try:
     _gpu_prefill.start_vram_trace()
 except Exception as _e:                      # noqa: BLE001
     print(f"[xtu-vram-trace] 未启用: {type(_e).__name__} {_e}", flush=True)
+
+# ⭐【2026-11-05】空闲期一次性归还缓存（`XIAOTU_IDLE_EMPTY_CACHE=1` 才生效）。
+#    把"预热/图捕获"留下的 ~11.86 GiB/卡 缓存还给驱动；严格空闲 + 只做一次 + 先 synchronize。
+try:
+    from . import gpu_prefill as _gpu_prefill2
+    _gpu_prefill2.start_idle_empty_cache()
+except Exception as _e:                      # noqa: BLE001
+    print(f"[xtu-idle-ec] 未启用: {type(_e).__name__} {_e}", flush=True)

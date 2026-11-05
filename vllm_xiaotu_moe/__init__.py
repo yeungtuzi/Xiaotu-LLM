@@ -192,3 +192,13 @@ try:
     _mem_trace.start()
 except Exception as _e:                      # noqa: BLE001
     print(f"[xtu-mem] 插桩未启用: {type(_e).__name__} {_e}", flush=True)
+
+# ⭐【2026-11-05】启动期显存采样（`XIAOTU_VRAM_TRACE=<秒>` 才生效）。
+#    目的：把 `max_alloc` 的**瞬时峰值**定位到具体阶段（权重/建池/KV/图捕获/预热）。
+#    实测 峰值 31.29 GiB vs 稳态 23.59 GiB ⇒ 7.7 GiB 被缓存住、热专家池只拿到 5.13 GiB。
+#    只读采样（不分配、不同步、不 empty_cache）；任何异常都吞掉。
+try:
+    from . import gpu_prefill as _gpu_prefill
+    _gpu_prefill.start_vram_trace()
+except Exception as _e:                      # noqa: BLE001
+    print(f"[xtu-vram-trace] 未启用: {type(_e).__name__} {_e}", flush=True)

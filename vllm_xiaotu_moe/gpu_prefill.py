@@ -493,6 +493,66 @@ _BOUND_BUF_LOGGED: dict = {}
 
 
 _LAST_REPORT = [0.0]
+# ⛔ [xtu 2026-11-05] 启动期显存采样：**只读**（不分配、不同步、不 empty_cache）。
+#    背景：实测稳态 allocated=23.59 而 max_alloc=31.29 GiB ⇒ 有 ~7.7 GiB 的**瞬时峰值**，
+#    之后被缓存住（reserved−allocated=11.86 GiB）再也用不上，热专家池只能拿到 5.13 GiB。
+#    要把它压下来，必须先知道峰值出现在**哪个阶段**（权重/建池/KV/图捕获/预热）。
+#    用法：`XIAOTU_VRAM_TRACE=2`（秒，0=关）⇒ 每 2 s 打一行 allocated/reserved/max_alloc。
+_VRAM_TRACE_LAST = [0.0]
+_VRAM_TRACE_THREAD = [None]
+
+
+def _vram_trace_loop(period, stop_after):
+    t0 = time.monotonic()
+    while time.monotonic() - t0 < stop_after:
+        time.sleep(period)
+        try:
+            _el = int(time.monotonic() - t0)   # torch 的 memory_stats 本身线程安全
+            for _i in range(torch.cuda.device_count()):
+                _d = torch.device(f"cuda:{_i}")
+                _a = int(torch.cuda.memory_allocated(_d))
+                _r = int(torch.cuda.memory_reserved(_d))
+                _m = int(torch.cuda.max_memory_allocated(_d))
+                if _a == 0 and _r == 0:
+                    continue
+                _free, _tot = torch.cuda.mem_get_info(_d)
+                print(f"[xtu-vram-trace] t={_el:4d}s cuda:{_i} "
+                      f"alloc={_a / 2**30:6.2f} res={_r / 2**30:6.2f} "
+                      f"max={_m / 2**30:6.2f} frag={(_r - _a) / 2**30:6.2f} "
+                      f"free={int(_free) / 2**30:5.2f} GiB", flush=True)
+        except Exception as _e:                    # noqa: BLE001  采样绝不能影响主流程
+            print(f"[xtu-vram-trace] 采样失败: {type(_e).__name__}: {_e}", flush=True)
+            return
+
+
+def start_vram_trace():
+    """启动期显存采样开关（`XIAOTU_VRAM_TRACE=<秒>`；0/未设 = 关）。
+
+    ⚠️ 只在**启动阶段**有意义：它记录的是"峰值出现在哪一步"，
+    稳态之后由 `maybe_report()` 的 `steady` 那条负责。
+    """
+    try:
+        period = float(os.environ.get("XIAOTU_VRAM_TRACE", "0") or 0)
+    except (TypeError, ValueError):
+        print("[xtu-vram-trace] XIAOTU_VRAM_TRACE 非数字 ⇒ 关闭", flush=True)
+        return False
+    if period <= 0:
+        return False
+    if _VRAM_TRACE_THREAD[0] is not None and _VRAM_TRACE_THREAD[0].is_alive():
+        return True
+    try:
+        import threading
+        stop_after = float(os.environ.get("XIAOTU_VRAM_TRACE_SECONDS", "1800") or 1800)
+    except (TypeError, ValueError):
+        stop_after = 1800.0
+    th = threading.Thread(target=_vram_trace_loop, args=(period, stop_after),
+                          name="xtu-vram-trace", daemon=True)
+    th.start()
+    # alloc-audit: bounded _VRAM_TRACE_THREAD —— 单元素容器，只存那一个 daemon 线程句柄；
+    #   长度恒为 1（进程内最多一条采样线程），故无需上限判据。
+    _VRAM_TRACE_THREAD[0] = th
+    print(f"[xtu-vram-trace] 已启动：每 {period:g}s 一行，最长 {stop_after:g}s", flush=True)
+    return True
 _LAST_EMPTY_CACHE = [0.0]   # 【2026-10-27】`XIAOTU_EMPTY_CACHE_EVERY_S` 的限频游标
 
 # ⭐【2026-10-27 · 软/硬上限的配套】按"最近使用步号"做**选择性**淘汰。

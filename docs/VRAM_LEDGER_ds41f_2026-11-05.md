@@ -699,3 +699,24 @@ nvidia-smi: 37,385 → 26,395 MiB
    对 98 ms 的步时是 **0.4%**，同时要付 **≈13 GiB 显存**（当前空闲上限约 13.8 GiB）。
 ⇒ **结论：内核优化的端到端上限是 0.4%，不值得做**；与 2026-10-31 服务级 −0.6%/+0.3% 相互印证。
 ⇒ 真正的瓶颈在别处：`REJECTED_ROUTES.md` 记录 step ≈81 ms 中 **CPU 引擎约 48%、GPU 约 25%、gaps 约 27%**。
+
+## 二十八、运维陷阱存档：`BUILD_MOE4` 默认关
+
+**现象**：`scripts/build_engine_variants.sh` 的 `BUILD_MOE4` 默认 **0** ⇒ 重建后
+`_xiaotu_moe_C_<最高变体>.so` 里 `moe4_smallm_*` 符号数为 0；服务**能正常启动**，
+只在日志里打一行 `[xtu-moe4] 内核不在当前变体 .so 里（需要重编译引擎），已禁用`。
+⇒ 此后所有"GPU 热专家"实验都在**内核未执行**的状态下进行，且从 `status`/显存/健康检查**看不出来**。
+
+**复现**：`bash scripts/build_engine_variants.sh`（不带 `BUILD_MOE4=1`）后
+`nm -D xiaotu_moe/build/_xiaotu_moe_C_avx512_bf16_vbmi*.so | grep -c moe4_smallm` ⇒ **0**。
+
+**机械判据（重建后必跑）**：
+```bash
+for so in xiaotu_moe/build/_xiaotu_moe_C_*.so; do
+  echo "$(nm -D "$so" | grep -c moe4_smallm)  $(basename "$so")"
+done   # 若要用 GPU 热专家路径：最高优先变体必须 ≥5
+```
+
+**建议修法（未实施，需 R38 审计）**：把 `BUILD_MOE4` 默认改为 1（缺 nvcc 时已有告警分支），
+或在 `check_ds41_entry.sh` 里加"当前变体符号数 ≥5"的校验。两条都属**默认值放行 ⇒ 全档**，
+故本次只存档、不改代码。

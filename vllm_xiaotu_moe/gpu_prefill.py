@@ -730,10 +730,17 @@ def _idle_empty_cache_loop(idle_s: float, wait_max_s: float,
                     continue
                 _frag_max = max(_frag_max, _r - _a)
             if _frag_max < int(min_frag * 2**30):
-                _IDLE_EC_STATE["done"] = True
-                print(f"[xtu-idle-ec] 碎片 {_frag_max / 2**30:.2f} GiB < 阈值 "
-                      f"{min_frag:g} GiB ⇒ 无需归还，收工", flush=True)
-                return
+                # ⛔ 实测教训（2026-11-05 10:01，实例 547220）：这里若直接 `done=True`，
+                #    就会在**预热之前**退出（那时 frag 才 1.16 GiB）；等预热把 reserved
+                #    推高、frag 涨到 11 GiB 时线程早已结束 ⇒ 整个特性等于没做。
+                #    ⇒ 碎片低只表示"此刻不值得动手"，**不代表以后也不值得** ⇒ 继续等。
+                _waits = _IDLE_EC_STATE.get("waits", 0) + 1
+                _IDLE_EC_STATE["waits"] = _waits
+                if _waits == 1 or _waits % 20 == 0:
+                    print(f"[xtu-idle-ec] 碎片 {_frag_max / 2**30:.2f} GiB < 阈值 "
+                          f"{min_frag:g} GiB（第{_waits}次观察）⇒ 继续等预热/图捕获抬高水位",
+                          flush=True)
+                continue
             tries += 1
             _reclaimed = 0
             for _i in range(torch.cuda.device_count()):

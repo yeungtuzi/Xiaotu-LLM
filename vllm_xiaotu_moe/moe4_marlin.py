@@ -83,7 +83,7 @@ def _build():
         lib = ctypes.CDLL(so)
         lib.run.argtypes = [ctypes.c_void_p] * 4 + [ctypes.c_int] * 6 + [ctypes.c_void_p]
         lib.run.restype = ctypes.c_int
-        lib.swiglu.argtypes = [ctypes.c_void_p] * 2 + [ctypes.c_int] * 3 + [ctypes.c_void_p]
+        lib.swiglu.argtypes = [ctypes.c_void_p] * 2 + [ctypes.c_int] * 3 + [ctypes.c_float, ctypes.c_void_p]
         lib.swiglu.restype = ctypes.c_int
         lib.e2e_dispatch.argtypes = [ctypes.c_void_p] * 8 + [ctypes.c_int] * 4 + [ctypes.c_void_p]
         lib.e2e_combine.argtypes = [ctypes.c_void_p] * 6 + [ctypes.c_int] * 4 + [ctypes.c_void_p]
@@ -123,7 +123,8 @@ def _bufs(T: int, K: int, E: int, H: int, I: int, dev) -> dict:
     return b
 
 
-def gemm(x, topk_ids, topk_weights, w13, s13, w2, s2, num_experts, H, I) -> Optional[torch.Tensor]:
+def gemm(x, topk_ids, topk_weights, w13, s13, w2, s2, num_experts, H, I,
+         swiglu_limit: float = 0.0) -> Optional[torch.Tensor]:
     """融合路径：返回 `[T, H]` fp32；任何前置条件不满足则返回 None（调用方回退）。"""
     lib = _build()
     if lib is None:
@@ -156,7 +157,7 @@ def gemm(x, topk_ids, topk_weights, w13, s13, w2, s2, num_experts, H, I) -> Opti
     b["Cg"].zero_()
     lib.run(p(b["As"]), p(w13), p(s13), p(b["Cg"]), SLOT, H, 2 * I, E,
             nblk_gu, _KSPLIT_GU, stream)
-    lib.swiglu(p(b["Cg"]), p(b["A2"]), SLOT, I, E, stream)
+    lib.swiglu(p(b["Cg"]), p(b["A2"]), SLOT, I, E, float(swiglu_limit or 0.0), stream)
     b["Cd"].zero_()
     lib.run(p(b["A2"]), p(w2), p(s2), p(b["Cd"]), SLOT, I, H, E,
             nblk_dn, _KSPLIT_DN, stream)

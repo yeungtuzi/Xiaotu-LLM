@@ -124,6 +124,15 @@ else
     echo "⚠️ XIAOTU_MOE_THREADS=${threads:-未设}（非 60，性能数据须标注口径）"
 fi
 
+# MARLIN：融合 MXFP4 内核开关（缺省 0）。必须能从 status 读出自洽口径，
+# 否则性能数据无法判断跑的是哪条路径（AGENTS.md「新增开关必须同步口径检查」）。
+marlin="$(printf '%s\n' "$environ" | grep '^XIAOTU_MOE4_MARLIN=' | cut -d= -f2)"
+case "${marlin:-}" in
+    0) echo "✓ XIAOTU_MOE4_MARLIN=0（生产标量路径）" ;;
+    1) echo "⚠️ XIAOTU_MOE4_MARLIN=1（融合内核路径，性能/精度数据须标注该口径）" ;;
+    *) echo "✗ XIAOTU_MOE4_MARLIN=${marlin:-未设}（非 0/1，口径不明）" >&2; rc=1 ;;
+esac
+
 alloc="$(printf '%s\n' "$environ" | grep '^PYTORCH_CUDA_ALLOC_CONF=' | cut -d= -f2-)"
 case "${alloc:-}" in
     *expandable_segments:True*)

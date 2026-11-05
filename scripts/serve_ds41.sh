@@ -18,7 +18,7 @@
 # 可覆盖的 NAME=VAL（白名单外一律拒绝）：
 #   TAG=prod PORT=8700 TP=2 GPU_UTIL=0.90 MAXSEQS=4 MBT=8192 MAXLEN=524288
 #   THREADS=60 IMAGE_MAX=128 COMPILE_RANGES=32,256,8192
-#   PIN=1 PIN_SLOTS=15 PIN_MAXQ=16 PIN_CUDA_MOE=0 CED=1 WARMUP=1 KV_DTYPE=fp8_ds_mla
+#   PIN=1 PIN_SLOTS=15 PIN_MAXQ=16 PIN_CUDA_MOE=0 MARLIN=0 CED=1 WARMUP=1 KV_DTYPE=fp8_ds_mla
 #   IDLE_EC=0 IDLE_EC_SECONDS=60   预热收尾即归还 torch 缓存（**默认关**；1=开）
 #                                  ⚠️ 2026-11-05 回退：C 判据（≥2h 带流量）未通过 ——
 #                                  实测窗口内无推理流量、且时长仅 1h50m，无证据支撑默认开启。
@@ -59,7 +59,7 @@ VLLM_DIR="${VLLM_DIR:-/home/user/lvllm/process_data/ref/repos/vllm-mainline/vllm
 
 TAG="prod"; PORT=8700; TP=2; GPU_UTIL=0.9; MAXSEQS=4; MBT=8192; MAXLEN=524288
 THREADS=60; IMAGE_MAX=128; COMPILE_RANGES="32,256,8192"
-PIN=1; PIN_SLOTS=15; PIN_MAXQ=16; PIN_CUDA_MOE=0; CED=1; WARMUP=1
+PIN=1; PIN_SLOTS=15; PIN_MAXQ=16; PIN_CUDA_MOE=0; MARLIN=0; CED=1; WARMUP=1
 IDLE_EC=0; IDLE_EC_SECONDS=60   # 预热收尾即归还显存缓存（实测单卡归还 10.4–10.73 GiB；默认开）
 PC=0; PC_GB=64; PC_BLOCKS=16; PC_ROOT="/home/user/.cache/prefix-cache"
 PC_FREE_MIN_MIB="${PC_FREE_MIN_MIB:-524288}"
@@ -95,6 +95,7 @@ while [ $# -gt 0 ]; do
                 PIN) PIN="$v" ;;
                 PIN_SLOTS) PIN_SLOTS="$v" ;;
                 PIN_CUDA_MOE) PIN_CUDA_MOE="$v" ;;
+                MARLIN) MARLIN="$v" ;;
                 IDLE_EC) IDLE_EC="$v" ;;
                 IDLE_EC_SECONDS) IDLE_EC_SECONDS="$v" ;;
                 PIN_MAXQ) PIN_MAXQ="$v" ;;
@@ -196,6 +197,7 @@ validate() {
     [ "$IMAGE_MAX" -le 128 ] || die "IMAGE_MAX 上限 128（得到 '$IMAGE_MAX'）"
     [ "$PIN_SLOTS" -le 64 ] || die "PIN_SLOTS 上限 64（得到 '$PIN_SLOTS'）"
     case "$PIN_CUDA_MOE" in 0|1) ;; *) die "PIN_CUDA_MOE 只能是 0/1（得到 '$PIN_CUDA_MOE'）" ;; esac
+    case "$MARLIN" in 0|1) ;; *) die "MARLIN 只能是 0/1（得到 '$MARLIN'）" ;; esac
     case "$IDLE_EC" in 0|1) ;; *) die "IDLE_EC 只能是 0/1（得到 '$IDLE_EC'）" ;; esac
     # 与 PC=0 的先例一致：不用的参数不该拦启动
     if [ "$IDLE_EC" = "1" ]; then
@@ -394,12 +396,18 @@ start() {
 
     build_args
     say "启动 TAG=$TAG PORT=$PORT TP=$TP util=$GPU_UTIL seqs=$MAXSEQS MBT=$MBT maxlen=$MAXLEN"
-    say "线程=$THREADS PIN=$PIN/$PIN_SLOTS MAXQ=$PIN_MAXQ CUDA_MOE=$PIN_CUDA_MOE IDLE_EC=$IDLE_EC/$IDLE_EC_SECONDS CED=$CED SPEC=$SPEC image=$IMAGE_MAX"
+    say "线程=$THREADS PIN=$PIN/$PIN_SLOTS MAXQ=$PIN_MAXQ CUDA_MOE=$PIN_CUDA_MOE MARLIN=$MARLIN IDLE_EC=$IDLE_EC/$IDLE_EC_SECONDS CED=$CED SPEC=$SPEC image=$IMAGE_MAX"
     # ⛔ [2026-11-05 审计 B · M] 小 M 内核**只走 PIN 常驻槽位**（gpu_prefill.py:3017
     #    `slot is not None and _moe4_ok`）；`PIN=0` 时 slot 恒为 None ⇒ 内核永不生效。
     #    不提示的话会白烧一次启动，且 A/B 结论会被误读成"内核无效"。
     if [ "$PIN_CUDA_MOE" = "1" ] && [ "$PIN" != "1" ]; then
         say "⚠️ PIN_CUDA_MOE=1 但 PIN=0 ⇒ 小 M 内核不会生效（需 PIN 常驻槽）"
+    fi
+    # ⛔ [2026-11-05 审计 A · A] MARLIN=1 是**两段门**：先要 PIN=1 且 PIN_CUDA_MOE=1
+    #    才进 moe4_smallm.moe_layer，再由 MARLIN 选内核。缺任一 ⇒ 融合内核静默不生效，
+    #    而 status/check 仍会显示"已请求 MARLIN=1"，是**假口径**。这里必须显式告警。
+    if [ "$MARLIN" = "1" ] && { [ "$PIN" != "1" ] || [ "$PIN_CUDA_MOE" != "1" ]; }; then
+        say "⚠️ MARLIN=1 但 PIN=$PIN / PIN_CUDA_MOE=$PIN_CUDA_MOE ⇒ 融合内核**不会生效**（需 PIN=1 且 PIN_CUDA_MOE=1）"
     fi
     if [ -n "$COMPILE_RANGES" ]; then
         say "compile_ranges=[$COMPILE_RANGES] ⇒ 要求生效配置含 compile_ranges_endpoints"
@@ -456,7 +464,7 @@ start() {
         export CUDA_VISIBLE_DEVICES=1,2
         export XIAOTU_PIN="$PIN" XIAOTU_PIN_MAX_PER_LAYER="$PIN_SLOTS" XIAOTU_PIN_MAXQ="$PIN_MAXQ"
         export XIAOTU_MOE_THREADS="$THREADS" OMP_NUM_THREADS=1
-        export XIAOTU_PIN_CUDA_MOE="$PIN_CUDA_MOE" XIAOTU_ENGRAM_LAST=1
+        export XIAOTU_PIN_CUDA_MOE="$PIN_CUDA_MOE" XIAOTU_MOE4_MARLIN="$MARLIN" XIAOTU_ENGRAM_LAST=1
         if [ "$IDLE_EC" = "1" ]; then
             export XIAOTU_IDLE_EMPTY_CACHE=1 XIAOTU_IDLE_EC_SECONDS="$IDLE_EC_SECONDS"
             # ⭐ 预热收尾即归还：实测 10.8 GiB 高水位 100% 来自形状预热，
@@ -759,7 +767,7 @@ status() {
     say "GPU: $(nvidia-smi --query-gpu=index,memory.used --format=csv,noheader | tr '\n' ' ')"
     say "实际口径:"
     tr '\0' '\n' < "/proc/$pid/environ" 2>/dev/null \
-        | grep -E '^(XIAOTU_MOE_THREADS|XIAOTU_PIN|XIAOTU_PIN_CUDA_MOE|XIAOTU_IDLE_EMPTY_CACHE|XIAOTU_IDLE_EC_SECONDS|XIAOTU_PIN_MAXQ|GPU_UTIL|MAXSEQS|COMPILE_RANGES|PYTORCH_CUDA_ALLOC_CONF|EXPANDABLE)=' \
+        | grep -E '^(XIAOTU_MOE_THREADS|XIAOTU_PIN|XIAOTU_PIN_CUDA_MOE|XIAOTU_MOE4_MARLIN|XIAOTU_IDLE_EMPTY_CACHE|XIAOTU_IDLE_EC_SECONDS|XIAOTU_PIN_MAXQ|GPU_UTIL|MAXSEQS|COMPILE_RANGES|PYTORCH_CUDA_ALLOC_CONF|EXPANDABLE)=' \
         | sed 's/^/    /'
     cc="$(eff_compilation_config "$pid")"
     say "    [生效] --compilation-config $cc"
@@ -777,6 +785,8 @@ case "$CMD" in
     start) start ;;
     stop) stop ;;
     status) status ;;
-    restart) stop; start ;;
+    # ⛔ [2026-11-05 审计 A · B] 先 validate 再 stop：否则非法参数会**先把生产停掉**
+    #    再在 start 里被拒，留下无服务可用的现场。validate 无副作用，前置安全。
+    restart) validate; stop; start ;;
     *) usage; exit 2 ;;
 esac

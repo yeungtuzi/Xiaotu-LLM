@@ -144,16 +144,24 @@ __launch_bounds__(128, 12) __global__ void gemm(const __nv_bfloat16* __restrict_
 }
 
 __global__ void swiglu_kernel(const float* __restrict__ G, __nv_bfloat16* __restrict__ Out,
-                             int na, int I, int NE) {
+                             int na, int I, int NE, float limit) {
   int e = blockIdx.z, r = blockIdx.y, i = blockIdx.x * blockDim.x + threadIdx.x;
   if (i >= I || r >= na) return;
   float g = G[((int64_t)e*16 + r) * 2 * I + i];
   float u = G[((int64_t)e*16 + r) * 2 * I + I + i];
+  // swiglu_limit（ds41f 用 10）：与段表版 Triton 内核逐字一致 ——
+  //   gate = min(gate, LIMIT); up = clamp(up, -LIMIT, LIMIT)
+  // 缺省会熔掉（limit <= 0 时无分支差异），故不传 limit 的旧调用行为不变。
+  if (limit > 0.f) {
+    g = fminf(g, limit);
+    u = fminf(fmaxf(u, -limit), limit);
+  }
   Out[((int64_t)e*16 + r) * I + i] = __float2bfloat16((g / (1.f + __expf(-g))) * u);
 }
-extern "C" int swiglu(const void* G, void* Out, int na, int I, int NE, cudaStream_t s) {
+extern "C" int swiglu(const void* G, void* Out, int na, int I, int NE, float limit,
+                      cudaStream_t s) {
   dim3 g((I + 127) / 128, na, NE);
-  swiglu_kernel<<<g, 128, 0, s>>>((const float*)G, (__nv_bfloat16*)Out, na, I, NE);
+  swiglu_kernel<<<g, 128, 0, s>>>((const float*)G, (__nv_bfloat16*)Out, na, I, NE, limit);
   cudaError_t e = cudaGetLastError();
   if (e != cudaSuccess) printf("[cu sw] %s\n", cudaGetErrorString(e));
   return (int)e;

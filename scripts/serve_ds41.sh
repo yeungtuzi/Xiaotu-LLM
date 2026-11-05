@@ -19,7 +19,9 @@
 #   TAG=prod PORT=8700 TP=2 GPU_UTIL=0.90 MAXSEQS=4 MBT=8192 MAXLEN=524288
 #   THREADS=60 IMAGE_MAX=128 COMPILE_RANGES=32,256,8192
 #   PIN=1 PIN_SLOTS=15 PIN_MAXQ=16 PIN_CUDA_MOE=0 CED=1 WARMUP=1 KV_DTYPE=fp8_ds_mla
-#   IDLE_EC=1 IDLE_EC_SECONDS=60   预热收尾即归还 torch 缓存（默认开；0=关）
+#   IDLE_EC=0 IDLE_EC_SECONDS=60   预热收尾即归还 torch 缓存（**默认关**；1=开）
+#                                  ⚠️ 2026-11-05 回退：C 判据（≥2h 带流量）未通过 ——
+#                                  实测窗口内无推理流量、且时长仅 1h50m，无证据支撑默认开启。
 #                                  ⚠️ IDLE_EC_SECONDS 在本入口**不生效**：本入口总是设
 #                                  XIAOTU_RELEASE_AFTER_LOG（预热日志收尾触发），此时空闲线程
 #                                  主动让位、该参数用不到；仅"未设触发器的兜底臂"才用它。
@@ -58,7 +60,7 @@ VLLM_DIR="${VLLM_DIR:-/home/user/lvllm/process_data/ref/repos/vllm-mainline/vllm
 TAG="prod"; PORT=8700; TP=2; GPU_UTIL=0.9; MAXSEQS=4; MBT=8192; MAXLEN=524288
 THREADS=60; IMAGE_MAX=128; COMPILE_RANGES="32,256,8192"
 PIN=1; PIN_SLOTS=15; PIN_MAXQ=16; PIN_CUDA_MOE=0; CED=1; WARMUP=1
-IDLE_EC=1; IDLE_EC_SECONDS=60   # 预热收尾即归还显存缓存（实测单卡归还 10.4–10.73 GiB；默认开）
+IDLE_EC=0; IDLE_EC_SECONDS=60   # 预热收尾即归还显存缓存（实测单卡归还 10.4–10.73 GiB；默认开）
 PC=0; PC_GB=64; PC_BLOCKS=16; PC_ROOT="/home/user/.cache/prefix-cache"
 PC_FREE_MIN_MIB="${PC_FREE_MIN_MIB:-524288}"
 PC_WRITE_WAIT="${PC_WRITE_WAIT:-900}"

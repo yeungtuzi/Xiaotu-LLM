@@ -71,7 +71,10 @@ def _build():
         so = os.path.join(cdir, f"moe4_marlin_{tag}.so")
         if not os.path.exists(so):
             nvcc = os.environ.get("NVCC", "/usr/local/cuda/bin/nvcc")
-            tmp = so + ".tmp"
+            # ⚠️ TP=2 时两个 worker 进程会同时首次编译：若共用同一个 .tmp，
+            #    一方会把另一方**写到一半的文件** os.replace 成正式产物。
+            #    tmp 必须按 pid 唯一；os.replace 是原子的，最后一名胜出即可。
+            tmp = f"{so}.tmp.{os.getpid()}"
             cmd = [nvcc, "-O3", "-arch=sm_80", "-shared", "-Xcompiler", "-fPIC",
                    "-o", tmp, _CU_FUSED, _CU_DISP]
             r = subprocess.run(cmd, capture_output=True, text=True)
@@ -79,7 +82,15 @@ def _build():
                 print(f"[xtu-marlin] 编译失败，回退原路径：{r.stderr[:400]}", flush=True)
                 _failed = True
                 return None
-            os.replace(tmp, so)
+            try:
+                os.replace(tmp, so)
+            except OSError:
+                try:
+                    os.unlink(tmp)
+                except OSError:
+                    pass
+                if not os.path.exists(so):
+                    raise
         lib = ctypes.CDLL(so)
         lib.run.argtypes = [ctypes.c_void_p] * 4 + [ctypes.c_int] * 6 + [ctypes.c_void_p]
         lib.run.restype = ctypes.c_int
@@ -178,3 +189,12 @@ def disable(reason: str = "") -> None:
     if not _failed:
         print(f"[xtu-marlin] 已禁用，后续走原路径。{reason}", flush=True)
     _failed = True
+
+
+# ⛔ 导入即编译（仅当开关为 1）：`_build()` 会调 nvcc，约 10 秒。
+#    若留到首次 `gemm()` 再编译，那一调用**可能落在 CUDA graph 捕获期**
+#    ⇒ 捕获期内的 host 侧编译/同步会破坏捕获；即使不在捕获期，也会让首个
+#    decode 请求莫名卡 10 秒。这里在引擎导入阶段一次做完，两害皆免。
+#    失败已在 `_build()` 内部 fail-closed（返回 None，后续一律回退）。
+if enabled():
+    _build()

@@ -3496,3 +3496,143 @@ dev-docs/report/decode_pipeline_20261030/kernel/fused_v2/
 目标是"做到硬件级最高效率，并用三条路径的排序作正确性判据"，验收四项已作为可测量的定义。
 四项**全部达成**，故结项。剩余的 60% 纯读空间**不是参数问题**，是 A100 缺少 FP4 tensor core
 的硬件事实，已在 §七十三 / §八十七 / §九十六 / §九十七 四处论证并有实测支撑。
+
+## 九十九、第 68 轮：端到端接线开工（tag 已打 + 适配层就位）
+
+### tag
+
+`mxfp4-fused-tc-kernel`（annotated，指向 9022a39）。
+⚠️ 注意：内核源码在 `dev-docs/`（按仓库约定 gitignored），**tag 只覆盖台账**；
+源码将在接线完成、进入 `vllm_xiaotu_moe/csrc/` 时随代码入库。
+
+### 接线的真实难点：接口不匹配
+
+| | 生产 `moe4_smallm_gu2/dn2` | 本内核 `fused_moe_kernel_marlin` |
+|---|---|---|
+| 输入 | `[T,H]` + `topk_ids/wts` | `[E,16,H]` 槽位式 |
+| 路由 | **内核内 dispatch**（atomics，无主机同步） | 调用方负责 |
+| 输出 | `[T,H]`（已按 topk 加权归约） | `[E,16,H]` 未归约 |
+
+⇒ 直接比速度**不公平**：生产内核把 dispatch/gather/combine 藏在里面，本内核没有。
+必须补一层适配，否则"0.2246 vs 0.831"这个对比在端到端口径下不成立。
+
+### 已写：槽位适配层 `e2e/dispatch.cu`
+
+| kernel | 作用 |
+|---|---|
+| `place_kernel` | 对每个 (t,k) 用 `atomicAdd(cnt[e],1)` 取专家内序号，写 `slot_tok/slot_w/slot_of` |
+| `gather_kernel` | `[T,H]` → `[E*16,H]`，未命中槽位填 0（bf16，uint4 向量化） |
+| `scatter_kernel` | `[E*16,H]` × 槽位权重 → `partial[t*K+k, H]`（**无原子**，避免 TK×H 次 atomicAdd） |
+| `reduce_kernel` | `partial` 沿 topk 归约 → `[T,H]` |
+
+全程 GPU、**零主机同步**，与生产内核同前提。
+
+### 已写：`e2e/e2e_probe.py`
+
+真实权重（15 专家，全部从 checkpoint 载入）+ 合成路由，跑
+`dispatch → gu → swiglu → dn → combine`，对**逐 (t,k) 手算的 fp64 参照**校验相对误差，
+并计时（含 dispatch 与 combine）。后台已启动。
+
+## 一百、第 69 轮：⚠️ 先例核查 —— 本方案的"核心思路"**不是新的**
+
+> 触发：用户提问"这个创新是否有其他项目已经实现了"。按纪律先跑本地 preflight，
+> 再查外部。结论对本文档此前若干处的"创新"措辞构成**勘误**。
+
+### 外部先例（全部给出 URL）
+
+| 先例 | 做了什么 | 与本方案的关系 |
+|---|---|---|
+| **Marlin / GPTQ-Marlin** | 4-bit 权重打包进 shared，`ldmatrix` 取片段，**在 GEMM 内部反量化**后喂 `mma.bf16` | **完全同构**。本方案就是 Marlin 式 |
+| **tokenspeed `marlin_mxfp4_apply`** | **MXFP4** 的 Marlin MoE，"dequantizes the packed E2M1 weights inside the GEMM"，输出对齐 bf16 反量化参照 | **同一目标、同一手法**；标注 **SM90+** |
+| **Marlin FP4 根因分析（dgx-spark 仓库）** | "B reference 用 `ldmatrix.x2.trans` 从 shared 读取；B manual 用 Marlin 风格的两个 BF16 pair 寄存器直接喂 `mma...m16n8k16.bf16`" | **与本方案的数据流逐项一致**（含 `ldmatrix.trans` + 两个 bf16 pair） |
+| **TorchAO / TensorRT** | "Native MXFP4xMXFP4 kernels need B200/B300"；A100/H100 用"weight DQ prologue into a high-precision GEMM" | 说明 A100 上无原生 FP4，只能用 bf16 模拟 |
+
+⇒ **"bf16 高效算 MXFP4"这个思路是业界标准做法（Marlin 系），不是本项目首创。**
+
+### 但存在一个真实的空白
+
+**vLLM issue #35922**（Marlin MoE 在 A100 上崩溃）：
+
+```
+Mode: W4A16 MXFP4; Kernel path: FP4 Marlin MoE
+SM80 (A100): no kernel image;  SM89 (Ada): works;  SM90 (Hopper): works
+```
+
+⇒ **vLLM 的 FP4 Marlin MoE 根本不编译到 SM80**。本项目的内核**在 SM80 上跑通并达到 550 GB/s**，
+这一条是**真实的、可验证的差异**（不是"首创算法"，是"把已知手法落到一块上游不支持的硬件上"）。
+
+### 本文档的措辞勘误
+
+§八十七 / §九十四 / §九十六 / `FUSED_MXFP4_KERNEL.md` 里凡以"关键创新"称呼以下各项，应降级为**"工程实现要点"**：
+1. 4-bit 直进 shared（Marlin 的常规做法）
+2. `ldmatrix.trans` 取 B 片段（Marlin 的常规做法）
+3. 寄存器内查表解包（Marlin 用位运算 + magic constant，本方案用 256 项表；**实现不同，思路同类**）
+
+**真正只属于本项目的**（可验证、未在外部找到等价描述）：
+1. **SM80 上的可运行实现 + 实测数字**（上游明确不支持）；
+2. **两列原始字节压进一个 uint16**（不零扩展）⇒ shared 流量 2× 而非 4×；未在外部的
+   Marlin 实现描述中找到同一布局（Marlin 常规是 uint32 装 8 nibble + 位移抽取）；
+3. **整层融合（gu + SwiGLU + dn）+ per-rank 生产形状的端到端带宽账**。
+
+⚠️ 纪律引用：本项目 `REJECTED_ROUTES.md:209` 早已写下"要赢必须走张量核交织反量化
+（marlin/cutlass 类）"——**方向在本地是已知的**，本次是把这条落地并量化，不是提出新方向。
+
+## 一百零一、第 70 轮：⚠️ 严重勘误 —— KSPLIT>1 的 epilogue 用普通写而非原子累加
+
+### 根因
+
+第 50 轮 marlin 重写时，输出 epilogue 写的是 `C[...] = acc`（**普通写**）。
+而 `KSPLIT > 1` 时，不同 k 分块的线程块会写**同一个** C 位置，必须原子累加。
+
+**数值校验一直只用 `ksplit=1`**（那条路径正确），整层基准却用 `KSGU=16 / KSDN=6`。
+⇒ 第 50~66 轮所有 `KSPLIT>1` 的性能数字，对应的都是**错误的计算结果**。
+第 63/64 轮把 epilogue 合并成 float2/float4，进一步掩盖了这个问题（合并写无法原子）。
+
+### 暴露途径
+
+端到端探针数值误差 ~1.0（不是 1e-6 量级）。小尺寸隔离测试证明 dispatch 层完全正确，
+才回头查内核 epilogue。
+
+### 修复
+
+```cuda
+if (KSPLIT == 1) { *(float4*)(rowA + base0) = w0; }      // 单块：快速向量写
+else { for (i<4) atomicAdd(rowA + base0 + i, pw[i]); }   // 多块：原子累加
+```
+
+### 修复后校验（首次覆盖 KSPLIT）
+
+| 场景 | ks=1 | ks=2 | ks=4 | ks=8 | ks=16 |
+|---|---:|---:|---:|---:|---:|
+| 小尺寸 vs fp64 | 9.2e-07 | 3.8e-07 | 2.6e-07 | 3.1e-07 | — |
+| 真实形状 vs ks=1 | 基准 | — | — | 5.8e-07 | 5.8e-07 |
+
+### 修正后的性能（KSPLIT 最优点也移了）
+
+| 段 | 旧（错误） | **修正后** |
+|---|---:|---:|
+| gu 最优 | 0.147 ms @ ks=16 | **0.165 ms @ ks=4** |
+| dn 最优 | 0.090 ms @ ks=6 | **0.117 ms @ ks=4** |
+| **整层** | **0.2246 ms / 550 GB/s** | **0.3011 ms / 411 GB/s** |
+
+### 修正后的对照（这是诚实的数字）
+
+| 项 | 旧（无效） | **修正后** |
+|---|---:|---:|
+| 每层耗时 | 0.2246 ms | **0.3011 ms** |
+| 有效带宽 | 550 GB/s | **411 GB/s** |
+| 相对生产标量（0.831 ms） | 3.70× | **2.76×** |
+| 纯读利用率（1366 GB/s） | 40% | **30%** |
+| vs CPU T=5（0.303 ms） | 快 25.9% | **快 0.7%** |
+| vs CPU T=8（0.380 ms） | 快 40.3% | **快 20.7%** |
+
+⇒ **排序判据仍然成立（T=5..8 GPU 全胜），但 T=5 的优势从 25.9% 塌到 0.7%，几乎打平。**
+
+### 纪律教训
+
+1. ⛔ **性能基准必须与数值校验用同一配置**。此前的模式是"数值用 ks=1、性能用 ks=16"，
+   等于从未验证过被报告的那个配置；
+2. ⛔ **参数扫描必须覆盖正确性**，不能只扫速度；
+3. ⛔ 图省事的"最后一次合并写"（float2/float4）会**静默破坏原子语义** ——
+   凡是可能多块写同一位置的内核，epilogue 的写方式必须按并行度分支。
+4. ⚠️ 论文与交底书里的 0.2246 ms / 3.70× / 550 GB/s **全部作废**，需按上表替换。

@@ -1629,3 +1629,47 @@ shared 流量 = 输入字节的 8 倍（写 4× + ldmatrix 读 4×），且 Mem 
 | 累计优化（gu 单段） | 3.317 → 0.372 ms（**8.9×**） |
 
 排序判据：GPU 181 GB/s vs CPU 435 GB/s ⇒ 仍差 2.4×，**不通过**。
+
+## 五十四、第 24 轮：延迟受限被证实；但降 shared / 提占用率的两条路都不奏效
+
+### ncu 调度器数据（关键新维度）
+
+| 指标 | 值 |
+|---|---:|
+| Active Warps Per Scheduler | 8.53（上限 16） |
+| **No Eligible（无 warp 可发射的周期占比）** | **39.9%** |
+| Warp Cycles Per Issued Instruction | **14.19** |
+| Issued Warp Per Scheduler | 0.60 |
+
+⇒ **延迟受限**：每个 warp 每条指令等 14 个周期，需要 ~14 个 warp 才能填满流水，实测只有 8.5 个。
+受限于 shared 用量：sB 9.2 KB + sA 2.3 + sC 4 + lut 1 ≈ 16.5 KB/块 ⇒ 6 块/SM ⇒ 24 warps。
+
+### 尝试 1：union(sB, sC) 复用 shared
+
+| 配置 | 每层 |
+|---|---:|
+| **v20 基线（独立 sB/sC）** | **0.372 ms** |
+| v30（union，KSPLIT=4） | 0.454 ms |
+| v30（union，KSPLIT=12） | 0.449 ms |
+
+⚠️ 且第一次做时**漏了同步**（k 循环结束后直接写 sC，而 sC 与 sB 共用内存，
+其他 warp 可能仍在读 sB 做 mma）⇒ 数据竞争。补 `__syncthreads()` 后数值正常
+（4.77e-07 / 1.24e-07），但**性能仍差 20%** ⇒ 多出来的一次全块同步抵消了占用率收益。
+
+### 尝试 2：去掉 sA（A 回 global）以再省 2.3 KB
+
+v29（union + A 回 global）0.611 ms ⇒ **更差**，说明在当前结构下 A 进 shared 是有价值的。
+
+### 结论
+
+占用率从 53% 往上的空间被"每块固定 shared 开销"（sA+sC+lut ≈ 7.3 KB）锁死：
+- 4 warps：16.5 KB → 6 块 → 24 warps
+- 8 warps：23.7 KB → 4 块 → 32 warps（实测 0.380 ms，无收益）
+
+⇒ **0.372 ms（226 GB/s）是当前结构的平台**；连续四轮的"减流量/提占用"都无收益。
+
+### 下一步（换口径，而非换实现）
+
+排序判据的对照口径仍有瑕疵：CPU 的 0.61 ms 是**全分片 I=2304**（265 MB），
+而本内核是 **per-rank I=1152**（127 MiB）。要真正同口径，需要让 CPU 引擎跑 **I=1152**。
+下一轮用合成权重建一个 per-rank 的 CPU 引擎探针，拿到真正可比的 CPU 数字。

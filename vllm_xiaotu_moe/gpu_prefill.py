@@ -764,9 +764,11 @@ def _idle_empty_cache_loop(idle_s: float, wait_max_s: float,
                 #    正是审计担心的 check-then-act 竞态）。⇒ 真正 `empty_cache()` 之前
                 #    再确认一次：自上次检查以来若又有任何活动，立刻放弃本轮。
                 if time.monotonic() - _LAST_ACTIVITY[0] < idle_s:
-                    print("[xtu-idle-ec] 同步期间又有流量 ⇒ 放弃本次归还（竞态保护）",
+                    # 放弃**本轮**而不是整个线程：等下一次真正空闲时仍要归还
+                    print("[xtu-idle-ec] 同步期间又有流量 ⇒ 放弃本轮（竞态保护，稍后重试）",
                           flush=True)
-                    return
+                    _aborted = True
+                    break
                 torch.cuda.empty_cache()
                 _r1 = int(torch.cuda.memory_reserved(_d))
                 _f1, _ = torch.cuda.mem_get_info(_d)
@@ -777,6 +779,9 @@ def _idle_empty_cache_loop(idle_s: float, wait_max_s: float,
                       f"free {int(_f1) / 2**30:.2f} GiB，空闲 age={_age:.1f}s）", flush=True)
             # alloc-audit: bounded _IDLE_EC_STATE —— 固定两键（done/armed），单例状态机，
             #   不是缓存、不随请求增长；此处只是把 done 置位。
+            if locals().get("_aborted"):
+                _aborted = False
+                continue
             if _reclaimed > 1 * 2**30:
                 _IDLE_EC_STATE["done"] = True
                 print("[xtu-idle-ec] 已归还有效容量 ⇒ 收工", flush=True)

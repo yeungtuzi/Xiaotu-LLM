@@ -3859,3 +3859,51 @@ bf16 是 tensor core mma 的前提 ⇒ 用 1 次激活舍入换 2.85×。
 
 `README.md`、`FUSED_MXFP4_KERNEL.md`、`paper/mxfp4_ampere_moe.{tex,pdf}` 全部改为上表口径；
 论文重编译 6 页、0 Overfull、0 残留旧数字。
+
+## 一百零六、第 75 轮：上生产前的两个关键发现 + GSM8K 基线
+
+### ★ 发现一（严重，已修）：形状门缺失会静默丢 token
+
+本内核槽位是**每专家 16 个**（`SLOT=16`），生产内核是 `kMaxA=8`。
+我在 `moe_layer()` 里插入的分支位于生产 `T>8` 形状门**之前** ⇒ 对所有 T 生效。
+若某专家收到超过 16 个 token，`gather_kernel` 会**静默截断** —— 结果错但不报错，
+**prefill 时必然发生**（T 可达上百）。
+
+修法：与生产同一道门 —— `if swiglu_limit <= 0.0 and T <= 8 and topk <= 8:`，其余一律回退。
+
+验证（同进程切换两臂，记录本内核被调用次数）：
+
+| T | 走本内核 | 结果 |
+|---:|---|---|
+| 5 | 是 | 正常 |
+| 8 | 是 | 正常 |
+| 9 / 16 / 64 | **否** | 两臂均返回 None ⇒ 回退段表版（**与生产行为一致**） |
+
+### ★ 发现二：生产根本没有启用 moe4 内核
+
+`/proc/675450/environ` 实测：`XIAOTU_PIN_CUDA_MOE=0`
+⇒ `moe4_smallm.available()` 为假 ⇒ `moe_layer` 立即返回 None
+⇒ **`MARLIN` 设成什么都不会被调用**。
+
+要启用必须同时给 **`PIN_CUDA_MOE=1 MARLIN=1`**。
+
+⇒ 副作用：GSM8K 基线（123/128）是在 `PIN_CUDA_MOE=0`（**当前生产路径**）下测的，
+不是 moe4 路径。因此要归因"是我们的内核还是 moe4 路径本身影响质量"，需要三臂：
+
+| 臂 | 配置 | 状态 |
+|---|---|---|
+| A | `PIN_CUDA_MOE=0`（现状） | ✅ 已测 **123/128 = 96.09%**（571 s，N=128，MAXTOK=640，温度 0） |
+| B | `PIN_CUDA_MOE=1 MARLIN=0` | 待测（隔离 moe4 路径本身） |
+| C | `PIN_CUDA_MOE=1 MARLIN=1` | 待测（本内核） |
+
+### 交付一致性
+
+14 个 ISA 变体的 `.so` **全部含 5 个 `moe4_smallm` 符号** ✓
+服务 CWD = `/home/user/lvllm/vllm-xiaotu-moe`，`vllm_xiaotu_moe` **不在 site-packages**
+⇒ 服务从树里导入，部署的 `moe4_marlin.py` / `moe4_smallm.py` 会被使用 ✓
+
+### 踩坑
+
+* 首次 GSM8K 启动**静默失败**：`dev-docs/eval/gsm8k_test.jsonl` 在远端不存在（gitignore 未部署），
+  `&&` 链断在 `cd` 后；已部署（1319 行）；
+* 我用 `pgrep -f eval_gsm8k.py` 查进程时**匹配到自己的命令行**（纪律里明令禁止的自杀陷阱），改用 PID 文件。

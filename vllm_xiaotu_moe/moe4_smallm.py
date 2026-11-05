@@ -254,7 +254,11 @@ def moe_layer(
     #   与本路径数值等价（fp32 结果经 bf16 取整后逐位相同），差别只在实现：
     #   权重不经扩展进 shared、置换并入写入（无需离线重排）、寄存器内查表展开。
     #   任何前置条件不满足或运行期异常 ⇒ 返回 None 并回退，行为与未接入时一致。
-    if swiglu_limit <= 0.0:
+    # ⚠️ 与生产快路径同一道形状门（见下方 T>8 的注释）：生产内核 kMaxA=8，
+    #    本内核 SLOT=16。若本分支对更大的 T 生效，`gather` 会在某专家收到超过
+    #    SLOT 个 token 时**静默丢弃**——结果错但不报错（prefill 时必然发生）。
+    #    ⇒ 只在生产快路径同一窗口内接管，其余一律回退（段表版负责大 T）。
+    if swiglu_limit <= 0.0 and int(x.shape[0]) <= 8 and int(topk_ids.shape[1]) <= 8:
         try:
             from vllm_xiaotu_moe import moe4_marlin as _M4
         except Exception:  # noqa: BLE001

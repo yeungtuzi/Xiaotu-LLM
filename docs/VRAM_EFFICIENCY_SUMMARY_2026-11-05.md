@@ -99,3 +99,23 @@ nvidia-smi --query-gpu=memory.used --format=csv,noheader
 | 显存（每 60 s 采样） | 26,453 MiB 连续不变 | 稳态无漂移 |
 
 ⇒ 支撑"不需要再加 KV / 加并发"的判断：KV 既没被抢占，空闲占用也是 0。
+
+## 9. 变更清单（本节所列提交都在 `main`，可逐条复核）
+
+| 提交 | 内容 |
+|---|---|
+| `f8be427` | 预热收尾即归还（初版：日志收尾触发 + 安全门） |
+| `aca4c04` | 按审计要求修：布防记 EOF 只匹配**新增**内容、设了触发器就不起空闲线程、`unset XIAOTU_RELEASE_MARKER` |
+| `9ea5052` / `95fe09f` | 空闲归还补"二次确认"，消除 check-then-act 竞态；放弃后改为本轮跳过、稍后重试 |
+| `3511dee` | **`IDLE_EC` 默认 0 → 1**；每设备 `is_current_stream_capturing()` 复检；usage 写清 `IDLE_EC_SECONDS` 在本入口不生效、`WARMUP=0` 不归还 |
+| `770d9d5` / `711edce` / `4305c01` | 本文档（验收摘要）及其证据补充、默认值同步 |
+
+审计记录：`dev-docs/report/tuning/logs/_launch_audit.log`（含 `CONDITIONAL-PASS` 行与 A/B/C/D 四类判据原文）。
+
+## 10. 边界与已知限制
+
+1. **不改变峰值**：归还的是 allocator 缓存，大预填时会重新向驱动申请（实测可回到约 37.8 GiB）。
+2. **只在启动时那一次**：服务起来后一直有流量时不会归还（设计选择：宁可放弃，也不在有人使用时归还）。
+3. **`WARMUP=0` 不归还**：没有预热高水位，且空闲线程已被让位。
+4. **`IDLE_EC_SECONDS` 在本入口不生效**：入口总是设 `XIAOTU_RELEASE_AFTER_LOG`，该参数只在"未设触发器的兜底臂"有效。
+5. 长稳（≥2 h 带流量）仍在进行，结果以 `docs/VRAM_LEDGER_ds41f_2026-11-05.md` 的判据表为准。

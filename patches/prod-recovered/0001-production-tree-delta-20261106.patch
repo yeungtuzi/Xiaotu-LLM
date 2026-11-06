@@ -1,0 +1,2844 @@
+--- a/vllm/model_executor/layers/fused_moe/experts/marlin_moe.py	2026-11-06 14:37:18.708873592 +0800
++++ b/vllm/model_executor/layers/fused_moe/experts/marlin_moe.py	2026-10-23 06:05:20.869691445 +0800
+@@ -91,6 +91,9 @@
+     activation_config: ApplyMoEActivationConfig | None = None,
+ ) -> torch.Tensor:
+     assert hidden_states.ndim == 2
++    if __import__("os").environ.get("QFN_W1_DBG") == "1" and not getattr(_fused_marlin_moe, "_idseen", False):
++        _fused_marlin_moe._idseen = True
++        print(f"[qfn-w1] marlin w1_id={id(w1)} dev={w1.device} w2_id={id(w2)}", flush=True)
+     M, K = hidden_states.size()
+     N = marlin_moe_intermediate_size(w1, w2)
+     w13_num_shards = 2 if activation.is_gated else 1
+--- a/vllm/model_executor/layers/fused_moe/fused_moe_modular_method.py	2026-11-06 14:37:18.708873592 +0800
++++ b/vllm/model_executor/layers/fused_moe/fused_moe_modular_method.py	2026-10-23 06:00:12.698051779 +0800
+@@ -88,6 +88,9 @@
+         shared_experts_input: torch.Tensor | None,
+     ) -> torch.Tensor:
+         assert self.moe_kernel is not None
++        if __import__("os").environ.get("QFN_W1_DBG") == "1" and not getattr(type(self), "_w1_seen", False):
++            type(self)._w1_seen = True
++            print(f"[qfn-w1] apply layer_id={id(layer)} w13_id={id(layer.w13_weight)} dev={layer.w13_weight.device}", flush=True)
+         return self.moe_kernel.apply(
+             hidden_states=x,
+             w1=layer.w13_weight,
+--- a/vllm/model_executor/layers/quantization/compressed_tensors/compressed_tensors_moe/compressed_tensors_moe_w4a4_mxfp4.py	2026-11-06 14:37:21.720957618 +0800
++++ b/vllm/model_executor/layers/quantization/compressed_tensors/compressed_tensors_moe/compressed_tensors_moe_w4a4_mxfp4.py	2026-10-15 20:11:38.033715749 +0800
+@@ -65,17 +65,7 @@
+         # repacks weights and scales, and the megakernels take the checkpoint
+         # tensors as they are.
+         self.use_cutlass_mxfp4 = CutlassExpertsMxfp4._supports_current_device()
+-        # [xtu-9] 主机驻留(host-resident)的 MXFP4 专家必须走 **CPU 后端**,且**优先于一切** ✓
+-        #   本项目的 CPU 专家引擎直接吃检查点原始 MXFP4 打包,不做任何 GPU 重排 ✓
+-        #   ⚠️ 必须排在 `elif self.use_cutlass_mxfp4` **之前** —— 否则 SM100 上本分支永不可达 ✗
+-        #   ⚠️ 必须显式 `use_cutlass_mxfp4 = False` —— 否则加载链的首个分支仍按 CUTLASS 走 ✗
+-        #   ⇒ 语义逐条对齐 2026-10-05 实测可跑的 devpatch #9 ✓(B320 / qmx_cpu3.1778161.log)
+-        if envs.VLLM_EXPERTS_LOAD_DEVICE == "cpu":
+-            self.mxfp4_backend = Mxfp4MoeBackend.CPU
+-            self.experts_cls = CPUExpertsMxfp4
+-            self.use_cutlass_mxfp4 = False
+-            logger.info_once("[xtu-9] MXFP4 MoE -> CPU 后端, experts_cls=CPUExpertsMxfp4")
+-        elif moe.moe_backend == "b12x" or is_flashinfer_moe_ep_backend(moe.moe_backend):
++        if moe.moe_backend == "b12x" or is_flashinfer_moe_ep_backend(moe.moe_backend):
+             self.mxfp4_backend, experts_cls = select_mxfp4_moe_backend(moe)
+             assert experts_cls is not None
+             self.experts_cls = experts_cls
+@@ -87,6 +77,12 @@
+             self.mxfp4_backend = Mxfp4MoeBackend.XPU
+             self.experts_cls = XPUExpertsMxFp4
+             logger.info_once("Using XPUExpertsMxFp4 for MXFP4 MoE on XPU platform")
++        elif envs.VLLM_EXPERTS_LOAD_DEVICE == "cpu":
++            # [xtu-9] 主机驻留的 MXFP4 专家必须走 CPU 后端:否则会被喂给 Marlin 的
++            # GPU 重排(见 dev-docs/QFN_MXFP4_RESUME_2026-10-05.md §4 / EXPERIMENTS B320)
++            self.mxfp4_backend = Mxfp4MoeBackend.CPU
++            self.experts_cls = CPUExpertsMxfp4
++            logger.info_once("[xtu-9] MXFP4 MoE -> CPU 后端, experts_cls=CPUExpertsMxfp4")
+         else:
+             logger.info_once("Using MarlinExperts for MXFP4 MoE")
+             self.experts_cls = MarlinExperts
+@@ -240,13 +236,6 @@
+             replace_parameter(layer, "w2_weight_scale", w2_scale)
+         elif self.mxfp4_backend in B12X_BACKENDS or current_platform.is_xpu():
+             pass
+-        elif self.mxfp4_backend == Mxfp4MoeBackend.CPU:
+-            # [xtu-9] CPU 后端 = 树外引擎,直接吃检查点原始 uint8/e8m0 打包(block-32)✓
+-            #   ⇒ **必须跳过** Marlin 重打包,否则主机张量会被喂给 `_C::gptq_marlin_repack` ✗
+-            #   (2026-10-15 实证:`NotImplementedError: ... 'CPU' backend`,worker 起 2 分钟即死 ✗)
+-            #   ⇒ 与 shim5(`convert_weight_to_mxfp4_moe_kernel_format` 对 CPU 原样返回)**同语义** ✓
+-            #   ⇒ 对齐 devpatch #9 后半段(`process_weights_after_loading` 屏蔽该次重排)✓
+-            pass
+         else:
+             logger.warning_once(
+                 "Your GPU does not have native support for FP4 computation "
+--- a/vllm/model_executor/layers/quantization/utils/fp8_utils.py	2026-11-06 14:37:21.536952486 +0800
++++ b/vllm/model_executor/layers/quantization/utils/fp8_utils.py	2026-11-01 20:00:04.741253542 +0800
+@@ -1205,6 +1205,9 @@
+         import torch.nn.functional as F
+ 
+         weight = F.pad(weight, (0, num_pad), "constant", 0)[..., :-num_pad]
++        # alloc-audit: init-time —— 本函数只在**权重加载期**调用（F.pad 补 256 对齐），
++        # 此时没有任何请求在飞、也没有 CUDA graph 引用；服务期不会走到这里。
++        # （expandable_segments 下服务期解映射才是危险动作，见审计文档 §18）
+         torch.accelerator.empty_cache()
+     return weight
+ 
+@@ -1524,28 +1527,64 @@
+ def _f32_to_e4m3_uint8(x):
+     """Encode f32 -> ``e4m3fn`` (1-4-3, exp bias 7, max 448, no inf) raw uint8
+     bits, for Ampere (SM80/SM86) where Triton lacks the ``fp8e4nv`` type. Inverse
+-    of ``_e4m3_uint8_to_f32``. Round-to-nearest; saturates |x| > 448 and NaN/Inf
+-    to +/-448. RNE-vs-round-half differences are sub-ulp and below fp8 noise."""
++    of ``_e4m3_uint8_to_f32``. Satirates |x| > 448 and maps NaN/Inf to 448
++    (e4m3fn has no inf). Rounding is **strict RNE (round-half-to-even)** to match
++    the hardware ``cvt.rn.satfinite`` cast bit-for-bit, so SM80 (this encoder) and
++    SM90+ (hardware) produce identical bytes for the same input."""
+     x = x.to(tl.float32)
+     sign = tl.where(x < 0, 1, 0).to(tl.int32)
+     a = tl.abs(x)
+-    a = tl.where(a != a, 0.0, a)  # NaN -> 0 magnitude
++    # ⛔ [xtu 2026-11-01 第三方审计 F3] NaN 原先被抹成 0（与 docstring 相反），
++    #    上溢/NaN 会静默变成"看起来合理的 0"而不是饱和值 ⇒ 按 docstring 饱和到 448。
++    a = tl.where(a != a, 448.0, a)
+     a = tl.minimum(a, 448.0)
+     is_zero = a == 0.0
+     a_safe = tl.where(is_zero, 1.0, a)
+     # unbiased exponent, folded to the [-6, 8] e4m3 range (-6 covers subnormals)
+     e = tl.floor(tl.log2(a_safe))
++    # ⛔ [xtu 2026-11-01 第三方审计 F1·CRITICAL] binade 边界修正。
++    #    `log2f` 在 |x| ∈ [2^k(1-2^-23), 2^k) 上会四舍五入**回整 k**，于是
++    #    m = a / 2^k 略小于 1 ⇒ `is_norm` 为假 ⇒ 掉进次正规分支 ⇒ 编码成 0x08。
++    #    仿真验证：enc(31.999996) 原为 0x08（=0.015625），正确值 0x60（=32）——
++    #    相对误差 99.9%，且 k≥-5 全部命中（真机 KV 缓存字节会被写坏）。
++    #    修法：若 a < 2^e 则 e 减一，保证 m ∈ [1,2)。
++    e = tl.where(a < tl.exp2(e), e - 1.0, e)
+     e = tl.maximum(tl.minimum(e, 8.0), -6.0)
+     m = a / tl.exp2(e)  # normal: [1, 2); subnormal (a < 2^-6): [0, 1)
+     is_norm = m >= 1.0
+-    # normal: expfield = e + 7 in [1, 15], mant = round((m - 1) * 8), carry -> +1 exp
+-    mant_n = tl.floor((m - 1.0) * 8.0 + 0.5)
++    # ⛔ [xtu 2026-11-01 第三方审计 F2] 量化必须**严格 RNE（round-half-to-even）**，
++    #    否则本函数与硬件 `cvt.rn.satfinite.e4m3x2.f32` 的结果在"恰好半分"处差 1 ulp
++    #    （bf16 网格上约 6% 的输入是 tie，其中约一半会差）⇒ A100（走本函数）与
++    #    H100（走硬件）对同一输入产生**不同的 KV 字节**，口径不再可比。
++    #    RNE 用 floor + 比较实现（不依赖 libdevice 的 rintf）。
++    # ⛔ [xtu 2026-11-01 第三方审计·CRITICAL] **不能**在 @triton.jit 函数体内定义嵌套
++    #    `def`：Triton 的 CodeGenerator.visit_FunctionDef 一遇到就抛
++    #    "nested function definitions are not allowed inside a @triton.jit kernel"
++    #    ⇒ 整个 `_f32_to_e4m3_uint8` 无法编译，而它有 ~10 个调用点（含 KV 写入主路径），
++    #    重启后会立刻硬失败。这里改为**纯表达式内联**，不引入任何 def。
++    #    RNE = floor + 半分时取偶：`frac > .5 → 进位`；`frac < .5 → 舍`；`== .5 → 取偶`。
++    # normal: expfield = e + 7 in [1, 15], mant = RNE((m - 1) * 8), carry -> +1 exp
++    _tn = (m - 1.0) * 8.0
++    _fn = tl.floor(_tn)
++    _fracn = _tn - _fn
++    _oddn = (_fn.to(tl.int32) % 2) == 1
++    mant_n = _fn + tl.where(
++        _fracn > 0.5, 1.0,
++        tl.where(_fracn < 0.5, 0.0, tl.where(_oddn, 1.0, 0.0)),
++    )
+     expf_n = e + 7.0
+     carry_n = mant_n >= 8.0
+     mant_n = tl.where(carry_n, 0.0, mant_n)
+     expf_n = tl.where(carry_n, expf_n + 1.0, expf_n)
+-    # subnormal: expfield = 0, mant = round(m * 8); mant==8 promotes to min normal
+-    mant_s = tl.floor(m * 8.0 + 0.5)
++    # subnormal: expfield = 0, mant = RNE(m * 8); mant==8 promotes to min normal
++    _ts = m * 8.0
++    _fs = tl.floor(_ts)
++    _fracs = _ts - _fs
++    _odds = (_fs.to(tl.int32) % 2) == 1
++    mant_s = _fs + tl.where(
++        _fracs > 0.5, 1.0,
++        tl.where(_fracs < 0.5, 0.0, tl.where(_odds, 1.0, 0.0)),
++    )
+     promote_s = mant_s >= 8.0
+     expf_s = tl.where(promote_s, 1.0, 0.0)
+     mant_s = tl.where(promote_s, 0.0, mant_s)
+--- a/vllm/model_executor/layers/quantization/utils/marlin_utils_fp8.py	2026-11-06 14:37:18.732874262 +0800
++++ b/vllm/model_executor/layers/quantization/utils/marlin_utils_fp8.py	2026-10-23 05:18:01.933177630 +0800
+@@ -143,9 +143,9 @@
+     # WEIGHT SCALES
+     # Permute scales
+     if "weight_scale" in dir(layer):
+-        scales = layer.weight_scale.to(layer.orig_dtype)
++        scales = layer.weight_scale.to(getattr(layer, "orig_dtype", torch.bfloat16))
+     elif "weight_scale_inv" in dir(layer):
+-        scales = layer.weight_scale_inv.to(layer.orig_dtype)
++        scales = layer.weight_scale_inv.to(getattr(layer, "orig_dtype", torch.bfloat16))
+ 
+     # marlin kernel only support channel-wise and group-wise quantization
+     # we need to convert the scales
+@@ -280,7 +280,7 @@
+     # WEIGHT SCALES
+     # Permute scales (convert at the original size, then pad to the tile).
+     def permute_scales(scales: torch.Tensor, name: str) -> torch.Tensor:
+-        scales = scales.to(layer.orig_dtype)
++        scales = scales.to(getattr(layer, "orig_dtype", torch.bfloat16))
+         tensor_list = []
+         if "w13" in name:
+             size_n, size_k = w13_n, k
+--- a/vllm/model_executor/layers/sparse_attn_indexer.py	2026-11-06 14:37:18.732874262 +0800
++++ b/vllm/model_executor/layers/sparse_attn_indexer.py	2026-11-01 20:00:06.705208691 +0800
+@@ -247,6 +247,16 @@
+     assert cos_sin_cache.shape[-1] == 64
+     assert weights.shape == q.shape[:2]
+ 
++    # ⛔ [xtu 2026-11-01 审计 #5] 该内核以 `q_fp8.dtype.element_ty` 直接在 Triton 里
++    #    构造 fp8 值；SM80/SM86 无 fp8e4nv ⇒ 编译期崩溃且报错位置离根因很远。
++    #    这里 fail-fast 给出可诊断的错误（该路径在 SM80 上未提供 uint8 字节编码实现，
++    #    属已知限制；DeepSeek-V4.1 走 v41/common/ops/fused_indexer_q.py 的对应实现）。
++    if current_platform.is_cuda() and not current_platform.has_device_capability(89):
++        raise RuntimeError(
++            "fused_indexer_q_rope_quant 需要 Triton fp8e4nv（CUDA SM89+）；"
++            "当前 CUDA 设备不满足（SM80/SM86 无 fp8e4nv）。"
++            "请改用非 fused 的 indexer 量化路径。"
++        )
+     q_fp8 = torch.empty_like(q, dtype=current_platform.fp8_dtype())
+     weights_out = torch.empty_like(weights, dtype=torch.float32)
+     fp8_min, fp8_max = get_fp8_min_max()
+@@ -375,8 +385,14 @@
+         if use_pcp and dcp_world_size > 1:
+             # The PCP+DCP path takes an all-gather destination and a
+             # de-interleaved result.
++            # ⛔ [xtu 2026-11-01 内核资源审计] 预热预留按 `total_seq_lens` 行，
++            #    但运行时实际申请 `dcp_world_size * local_total_seq_lens`
++            #    （local ≈ total/pcp）⇒ 当 dcp > pcp 时**运行期需求大于预留**，
++            #    稳态第一次遇到长请求就会触发 workspace 扩容（正是 Xid 31 那一族）。
++            #    这里按最坏情况预留：dcp_world_size * total_seq_lens
++            #    （gather 缓冲约 rows×head_dim 字节，量级 MB，放大 dcp 倍可忽略）。
+             gather_spec = _gather_workspace_shapes(
+-                total_seq_lens, head_dim, fp8_dtype, use_fp4_cache
++                dcp_world_size * total_seq_lens, head_dim, fp8_dtype, use_fp4_cache
+             )
+             profile_specs.extend(gather_spec * 2)
+         current_workspace_manager().get_simultaneous(*profile_specs)
+@@ -916,7 +932,20 @@
+                 _UNPACK_SEQ_TRITON_KERNEL,
+             )
+ 
+-            pack_dtype = torch.uint8 if use_fp4_cache else current_platform.fp8_dtype()
++            # ⛔ [xtu 2026-11-01 内核资源审计 #5] SM80/SM86 的 Triton 没有 fp8e4nv 类型，
++            #    而 `current_platform.fp8_dtype()` 在 A100 上正是 float8_e4m3fn ⇒ 预热阶段
++            #    编译 PackSeq 内核即抛 `ValueError: type fp8e4nv not supported`，整机起不来
++            #    （这也是 enable_jit_warmup 长期只能在 SM89+ 用的原因）。
++            #    按能力门控：无 fp8e4nv 的架构用 uint8 按字节预热（与 0003 的编码写法一致）。
++            # 只看 CUDA：ROCm 的 has_device_capability 语义是 gfx 版本号，不适用
++            _no_fp8e4nv = (
++                current_platform.is_cuda()
++                and not current_platform.has_device_capability(89)
++            )
++            pack_dtype = (
++                torch.uint8 if (use_fp4_cache or _no_fp8e4nv)
++                else current_platform.fp8_dtype()
++            )
+             _PACK_SEQ_TRITON_KERNEL.register_warmup(
+                 dtype=pack_dtype,
+                 pad_value=0 if use_fp4_cache else -float("inf"),
+--- a/vllm/model_executor/models/utils.py	2026-11-06 14:37:18.760875044 +0800
++++ b/vllm/model_executor/models/utils.py	2026-10-15 20:44:51.958472841 +0800
+@@ -399,6 +399,14 @@
+         self._add_loadable_non_param_tensors(module, child_params)
+ 
+         for child_prefix, child_weights in self._groupby_prefix(weights):
++            # [xtu-10] CT 的 FP8 block scale:加载期参数名是 `weight_scale`,
++            # 而检查点给的是 `weight_scale_inv`(_inv 是 process_weights_after_loading
++            # 里【加载后】才改的名)⇒ 本层按模块树找名字会直接 raise(见 B492/B493)⇒
++            # 在此做别名,等价于检查点名字与模块参数名对齐 ✓
++            if child_prefix == "weight_scale_inv" and "weight_scale" in child_params:
++                child_prefix = "weight_scale"
++                prefix = self._get_qualname(base_prefix, child_prefix)
++
+             prefix = self._get_qualname(base_prefix, child_prefix)
+ 
+             if child_prefix in child_modules:
+@@ -421,6 +429,22 @@
+                     continue
+ 
+                 can_ignore_module = self._can_ignore_unexpected(prefix + ".")
++                # [xtu-11] 检查点/映射带来、但本模块【确实没有】的参数名(典型:未量化模块的
++                # `*_scale` / `weight_scale` / `input_scale` 残留)⇒ 跳过并告警 ✓
++                # 判据:名字以量化 scale 形态结尾 ⇒ 不是权重本体 ⇒ 跳过安全(可逆:见 --revert)。
++                _xtu_base = child_prefix.rsplit(".", 1)[-1]
++                if _xtu_base.endswith((
++                    "weight_scale", "weight_scale_inv", "input_scale",
++                    "weight_scale_2", "input_scale_2", "weight_scale_inv_2",
++                    "_scale_inv", "_scale", "scale",
++                )):
++                    import logging as _xtu_logging
++                    _xtu_logging.getLogger(__name__).warning(
++                        "[xtu-11] 跳过无法归位的量化项: %s(模块 %s 无此参数)",
++                        prefix, module._get_name(),
++                    )
++                    continue
++
+                 can_ignore_param = self._can_ignore_unexpected(prefix)
+                 if can_ignore_module or can_ignore_param:
+                     logger.debug("Ignoring missing %s", prefix)
+--- a/vllm/model_executor/parameter.py	2026-11-06 14:37:18.764875155 +0800
++++ b/vllm/model_executor/parameter.py	2026-10-23 05:14:42.582575712 +0800
+@@ -29,6 +29,13 @@
+ logger = init_logger(__name__)
+ 
+ 
++def _qfn_2d_to_4d(param_data, loaded_weight):
++    """modelopt 2D block scale -> vLLM 4D packed [n,1,k,1]."""
++    if loaded_weight.dim() == 2 and param_data.dim() == 4:
++        return loaded_weight.reshape(loaded_weight.shape[0], 1, loaded_weight.shape[1], 1)
++    return loaded_weight
++
++
+ class BasevLLMParameter(Parameter):
+     """Base parameter for vLLM linear layers. Extends the torch.nn.parameter
+     by taking in a linear weight loader. Will copy the loaded weight
+@@ -151,6 +158,7 @@
+         self.data.copy_(loaded_weight)
+ 
+     def load_merged_column_weight(self, loaded_weight: torch.Tensor, **kwargs):
++        loaded_weight = _qfn_2d_to_4d(self.data, loaded_weight)
+         shard_offset: int = kwargs["shard_offset"]
+         shard_size: int = kwargs["shard_size"]
+ 
+@@ -173,6 +181,7 @@
+         param_data.copy_(loaded_weight)
+ 
+     def load_qkv_weight(self, loaded_weight: torch.Tensor, **kwargs):
++        loaded_weight = _qfn_2d_to_4d(self.data, loaded_weight)
+         shard_offset: int = kwargs["shard_offset"]
+         shard_size: int = kwargs["shard_size"]
+         shard_id: str = kwargs["shard_id"]
+@@ -214,6 +223,7 @@
+         return self._input_dim
+ 
+     def load_row_parallel_weight(self, loaded_weight: torch.Tensor):
++        loaded_weight = _qfn_2d_to_4d(self.data, loaded_weight)
+         shard_size = self.data.shape[self.input_dim]
+         loaded_weight = loaded_weight.narrow(
+             self.input_dim, self.tp_rank * shard_size, shard_size
+--- a/vllm/models/deepseek_v4/common/ops/cache_utils.py	2026-11-06 14:37:21.540952598 +0800
++++ b/vllm/models/deepseek_v4/common/ops/cache_utils.py	2026-11-01 21:23:16.525656370 +0800
+@@ -60,7 +60,7 @@
+     quant_block: tl.constexpr,  # 64 (quantization block size)
+     cache_block_size: tl.constexpr,  # 64 (paged cache block size)
+     token_data_size: tl.constexpr,  # 576 bytes per token data
+-    block_stride: tl.constexpr,  # total bytes per block (padded)
++    block_stride,  # ⛔ 第6轮B1/第13轮：由 k_cache.stride(0) 中转 ⇒ 降级为运行时标量  # total bytes per block (padded)
+     fp8_max: tl.constexpr,
+     n_quant_blocks: tl.constexpr,  # 8 (7 real + 1 padding)
+     use_fnuz: tl.constexpr = False,
+@@ -169,6 +169,38 @@
+         tl.store(bf16_out_ptr + chunk_offsets, bf16_vals)
+ 
+ 
++# ⛔ [xtu 2026-11-01 第7轮审计阻断项②] `_bound_check_skip` 此前只在 v41 的 cache_utils 里定义，
++#    本文件直接调用 ⇒ `slot_ids.numel()>0` 时必然 NameError（潜伏必崩）。此处补齐本文件的副本。
++_BOUND_CHECKED: set = set()
++_BOUND_RECHECK: dict = {}
++_BOUND_CHECKED_MAX = 16
++
++
++def _bound_check_skip(sig) -> bool:
++    """capture 中或该签名已校验过 ⇒ 跳过（CUDA graph capture 期 `.max()` 属非法操作）。"""
++    try:
++        import torch as _t
++        if _t.cuda.is_current_stream_capturing():
++            return True
++    except Exception:  # noqa: BLE001
++        pass
++    if sig in _BOUND_CHECKED:
++        # ⛔ 第8轮审计 §4-3：只在首见签名校验一次 ⇒ decode 期 `seq_len` 单调增长而
++        #    `numel()` 不变，首调之后的越界**永远发现不了**。⇒ 每 256 次同类调用复检一次。
++        _c = _BOUND_RECHECK.get(sig, 0) + 1
++        _BOUND_RECHECK[sig] = _c
++        return (_c % 256) != 0
++    if len(_BOUND_CHECKED) < _BOUND_CHECKED_MAX:
++        _BOUND_CHECKED.add(sig)
++        _BOUND_RECHECK[sig] = 1
++        return False
++    # ⛔ 第9轮 §4-3 反向风险：集合满后旧逻辑对新签名恒返回 False ⇒ `.max()` 在**每个
++    #    decode step** 执行（设备同步）。改为：满集时同样走 256 次复检（最多多出少量签名）。
++    _c = _BOUND_RECHECK.get(sig, 0) + 1
++    _BOUND_RECHECK[sig] = _c
++    return (_c % 256) != 0
++
++
+ def quantize_and_insert_k_cache(
+     k: torch.Tensor,  # [num_tokens, 512] bf16
+     k_cache: torch.Tensor,  # [num_blocks, block_bytes] uint8
+@@ -177,6 +209,12 @@
+     is_ue8m0: bool = True,
+     use_fnuz: bool = False,
+ ):
++    # ⛔ [xtu 2026-11-01 用户收窄目标] '可疑地址'类：内核把 `slot_mapping` 当裸地址用，
++    #    此前无上界断言。容量推导：内核按 `slot // block_size` 取块 ⇒ 合法上界 = 块数×块大小。
++    if not _bound_check_skip(("addr_quantize_and_inser", int(slot_mapping.numel()))):
++        assert int(slot_mapping.max()) < int(k_cache.shape[0] * block_size), (
++            f"slot_mapping 越界：max={int(slot_mapping.max())} ≥ {int(k_cache.shape[0] * block_size)}"
++        )
+     """Quantize K tensor and insert into paged K cache.
+ 
+     K Cache block layout (block_size=64 tokens):
+@@ -260,14 +298,19 @@
+         offset,
+         gather_lens_ptr,
+         # Constants
+-        max_blocks_per_seq: tl.constexpr,
++            # ⛔ [xtu 2026-11-01 第三方审计] 实测 Triton 缓存里本内核有 **190 份变体**：
++    #    `max_blocks_per_seq` 被当 constexpr，取值 `block_table.shape[-1]`（随上下文
++    #    长度变化），而内核里它**只用于算 stride**
++    #    （`block_table_ptr + batch_idx * max_blocks_per_seq`），不是循环上界
++    #    ⇒ 特化零收益，纯属按上下文长度累积 cubin。降级为运行时标量。
++    max_blocks_per_seq,
+         fp8_dim: tl.constexpr,  # 448
+         bf16_dim: tl.constexpr,  # 64
+         scale_dim: tl.constexpr,  # 8
+         quant_block: tl.constexpr,  # 64 (quantization block size)
+         cache_block_size: tl.constexpr,  # 64 or 128 (paged cache block size)
+         token_data_size: tl.constexpr,  # 576 bytes per token data
+-        block_stride: tl.constexpr,  # total bytes per block (padded) int32
++        block_stride,  # ⛔ 第6轮B1/第13轮：由 k_cache.stride(0) 中转 ⇒ 降级为运行时标量  # total bytes per block (padded) int32
+         output_dim: tl.constexpr,  # 512
+         fp8_max: tl.constexpr,
+         n_quant_blocks: tl.constexpr,  # 7 real blocks
+@@ -518,7 +561,7 @@
+     ``current_platform.is_fp8_fnuz()`` for ``swa_k_cache`` (C++ encoder
+     writes FNUZ on gfx942 and OCP on gfx950).
+     """
+-    if has_cutedsl() and not is_ampere_or_ada():
++    if current_platform.is_cuda() and has_cutedsl() and not is_ampere_or_ada():
+         # lazily import, otherwise some tests fail due to CUDA driver init failure.
+         from vllm.models.deepseek_v4.nvidia.ops.dequant_gather_k_cutedsl import (
+             _DEQUANT_GATHER_K_CACHE_CUTEDSL_KERNEL,
+@@ -1764,7 +1807,7 @@
+     slot_ids_stride_slot,
+     cache_block_size: tl.constexpr,
+     token_data_size: tl.constexpr,
+-    block_stride: tl.constexpr,
++    block_stride,  # ⛔ 第6轮B1：由 .stride(0)/.shape[0] 派生 ⇒ 降级为运行时标量
+     fp8_dim: tl.constexpr,
+     bf16_dim: tl.constexpr,
+     scale_dim: tl.constexpr,
+@@ -1835,6 +1878,18 @@
+     )
+     assert out.shape[:2] == slot_ids.shape
+     assert out.shape[-1] == 512
++    # ⛔ [xtu 2026-11-01 第三方审计 C4] 内核按 slot 直接算裸地址（**无 mask**）：
++    #    必须保证所有 slot < num_blocks * block_size，否则越界访存（Xid31/FAULT_PDE 形态）。
++    #    纯主机侧 O(1) 校验；首见形状校验即可，但这里成本极低，每次调用都查。
++    # ⛔ [xtu 2026-11-01 第6轮审计 N4] capture 期 `.max()` 非法 + decode 热路径每步规约太贵
++    #    ⇒ 只在首见签名、非 capture 时校验一次。
++    if slot_ids.numel() > 0 and not _bound_check_skip(("slot", int(k_cache.shape[0]), int(block_size))):
++        # ⛔ 第9轮 C4：旧写法先算 _mx/_cap 再比较 ⇒ 断言文本里**没有 slot_ids**，
++        #    门禁的"必须引用块表/slot"判据认不出 ⇒ 改成一个表达式直接引用。
++        assert int(slot_ids.max()) < int(k_cache.shape[0]) * int(block_size), (
++            f"slot_ids 越界：max={int(slot_ids.max())} ≥ "
++            f"{int(k_cache.shape[0])}*{int(block_size)}（内核此处无 mask）"
++        )
+     assert out.dtype == torch.bfloat16
+     assert k_cache.dtype == torch.uint8
+ 
+--- a/vllm/models/deepseek_v4/common/ops/fused_compress_quant_cache.py	2026-11-06 14:37:21.540952598 +0800
++++ b/vllm/models/deepseek_v4/common/ops/fused_compress_quant_cache.py	2026-11-01 21:23:52.660889542 +0800
+@@ -46,6 +46,28 @@
+ from .fused_indexer_q import _fp32x2_to_fp4x2
+ 
+ 
++# ⛔ [xtu 2026-11-01 第11轮 N7] 本文件需要 capture 安全的 gate 才能加值域断言
++#    （`_bound_check_skip` 只定义在 cache_utils.py，**不能**直接调用 —— N4 曾因此 NameError）。
++_FCC_BOUND_SEEN: set = set()
++_FCC_BOUND_CALLS: dict = {}
++
++
++def _bound_check_skip(sig) -> bool:
++    """capture 中或本轮不需校验 ⇒ True（capture 期 `.max()` 属非法操作）。"""
++    try:
++        import torch as _t
++        if _t.cuda.is_current_stream_capturing():
++            return True
++    except Exception:  # noqa: BLE001
++        pass
++    if sig not in _FCC_BOUND_SEEN:
++        if len(_FCC_BOUND_SEEN) < 16:
++            _FCC_BOUND_SEEN.add(sig)
++            _FCC_BOUND_CALLS[sig] = 1
++            return False
++    _c = _FCC_BOUND_CALLS.get(sig, 0) + 1
++    _FCC_BOUND_CALLS[sig] = _c
++    return (_c % 256) != 0
+ def compress_norm_rope_store_triton(
+     state_cache: torch.Tensor,
+     num_actual: int,
+@@ -70,6 +92,12 @@
+     token_stride: int,
+     scale_dim: int,
+ ) -> None:
++    # ⛔ [xtu 2026-11-01 用户收窄目标] '可疑地址'类：内核把 `slot_mapping` 当裸地址用，
++    #    此前无上界断言。容量推导：内核按 `slot // block_size` 取块 ⇒ 合法上界 = 块数×块大小。
++    if not _bound_check_skip(("addr_compress_norm_rope", int(slot_mapping.numel()))):
++        assert int(slot_mapping.max()) < int(kv_cache.shape[0] * block_size), (
++            f"slot_mapping 越界：max={int(slot_mapping.max())} ≥ {int(kv_cache.shape[0] * block_size)}"
++        )
+     """Shared triton launcher for the fused compress+norm+RoPE+insert path.
+ 
+     Picks one of the three kernels in this module based on ``head_dim`` and
+@@ -106,6 +134,16 @@
+         )
+         return
+ 
++    # ⛔ [xtu 2026-11-01 第11轮 N7] 这里原先写 `alloc-audit: masked-in-kernel`，声称
++    #    "对块表的访问自带 mask" —— **不实**：内核 `mask_pos = pos >= 0` 只排除负值，
++    #    `req_idx`（行）与 `pos // block_size`（列）**都没有上界**；
++    #    而 `block_numbers` 直接参与 `state_cache_ptr + block_numbers_i64 * stride0` 的裸寻址。
++    #    ⇒ 改为真实的取值上界校验（gate 内，避开 capture 期 .max() 非法）。
++    if not _bound_check_skip(("fcc_bt", int(block_table.shape[0]), int(block_table.shape[-1]))):
++        assert int(block_table.max()) < int(state_cache.shape[0]), (
++            f"block_numbers 越界：max={int(block_table.max())} ≥ state_cache.shape[0]"
++            f"={int(state_cache.shape[0])}（内核按 block_numbers 直接算裸地址）"
++        )
+     kernel[(num_actual,)](
+         # state cache
+         state_cache,
+@@ -150,6 +188,8 @@
+ # DeepseekV4 Attention path (head=512, nope=448 FP8 + rope=64 bf16)
+ # =============================================================================
+ @triton.jit
++
++
+ def _fused_kv_compress_norm_rope_insert_sparse_attn(
+     # ── state cache (compressor internal state) ──
+     state_cache_ptr,
+@@ -569,6 +609,22 @@
+     num_actual: int,
+     compress_scratch: torch.Tensor,
+ ) -> None:
++    # ⛔ [xtu 2026-11-01 用户收窄目标] '可疑地址'类：内核把 `kv_slot_mapping` 当裸地址用，
++    #    此前无上界断言。容量推导：内核按 `slot // block_size` 取块 ⇒ 合法上界 = 块数×块大小。
++    if not _bound_check_skip(("addr__launch_two_stage_", int(kv_slot_mapping.numel()))):
++        assert int(kv_slot_mapping.max()) < int(kv_cache.shape[0] * block_size), (
++            f"kv_slot_mapping 越界：max={int(kv_slot_mapping.max())} ≥ {int(kv_cache.shape[0] * block_size)}"
++        )
++    # ⛔ [xtu 2026-11-01 第12轮] 内核按 block_table/slot_mapping 裸寻址；此前因内核名不含
++    #    "kernel" 而整段逃过 C4。补真正的取值上界（gate 内，避开 capture 期 .max()）。
++    if not _bound_check_skip(("2stage_bt", int(block_table.shape[-1]))):
++        assert int(block_table.max()) < int(kv_cache.shape[0]), (
++            f"block id 越界：max={int(block_table.max())} ≥ kv_cache.shape[0]={int(kv_cache.shape[0])}"
++        )
++    if not _bound_check_skip(("2stage_slot", int(slot_mapping.numel()))):
++        assert int(slot_mapping.max()) < int(kv_cache.shape[0]) * int(block_size), (
++            f"slot 越界：max={int(slot_mapping.max())} ≥ {int(kv_cache.shape[0])}*{int(block_size)}"
++        )
+     num_splits = _pick_compress_num_splits(num_actual, compress_ratio, head_dim)
+     head_tile = head_dim // num_splits
+     scratch = compress_scratch[:num_actual]
+--- a/vllm/models/deepseek_v4/common/ops/fused_indexer_q.py	2026-11-06 14:37:21.540952598 +0800
++++ b/vllm/models/deepseek_v4/common/ops/fused_indexer_q.py	2026-11-01 20:00:26.732752455 +0800
+@@ -176,20 +176,31 @@
+             + tok_idx * index_q_fp8_stride0
+             + head_idx * index_q_fp8_stride1
+         )
++        # ⛔ [xtu 2026-11-01 第三方审计] `USE_FNUZ: tl.constexpr` 原先**声明并传参但
++        #    内核体从未读取**，182/187/191 行无条件用 OCP e4m3fn 编码
++        #    （`_f32_to_e4m3_uint8`，bias 7、max 448）；而输出张量在 gfx942 上是
++        #    `float8_e4m3fnuz`（bias 8、max 240-ish）⇒ ROCm 上 indexer logits
++        #    **静默错数**。这里按 USE_FNUZ 分流，写法照抄 cache_utils.py:140-147。
+         if INDEX_Q_NOPE_DIM > 0:
+-            tl.store(
+-                fp8_base_ptr + nope_offset,
+-                _f32_to_e4m3_uint8(tl.div_rn(x_nope, index_q_scale)),
++            _q_nope_u8 = (
++                tl.div_rn(x_nope, index_q_scale).to(tl.float8e4b8).to(tl.uint8, bitcast=True)
++                if USE_FNUZ
++                else _f32_to_e4m3_uint8(tl.div_rn(x_nope, index_q_scale))
+             )
++            tl.store(fp8_base_ptr + nope_offset, _q_nope_u8)
+         fp8_rot_base = fp8_base_ptr + INDEX_Q_NOPE_DIM
+-        tl.store(
+-            fp8_rot_base + half_offset * 2,
+-            _f32_to_e4m3_uint8(tl.div_rn(r_even, index_q_scale)),
+-        )
+-        tl.store(
+-            fp8_rot_base + half_offset * 2 + 1,
+-            _f32_to_e4m3_uint8(tl.div_rn(r_odd, index_q_scale)),
++        _rot_even_u8 = (
++            tl.div_rn(r_even, index_q_scale).to(tl.float8e4b8).to(tl.uint8, bitcast=True)
++            if USE_FNUZ
++            else _f32_to_e4m3_uint8(tl.div_rn(r_even, index_q_scale))
++        )
++        _rot_odd_u8 = (
++            tl.div_rn(r_odd, index_q_scale).to(tl.float8e4b8).to(tl.uint8, bitcast=True)
++            if USE_FNUZ
++            else _f32_to_e4m3_uint8(tl.div_rn(r_odd, index_q_scale))
+         )
++        tl.store(fp8_rot_base + half_offset * 2, _rot_even_u8)
++        tl.store(fp8_rot_base + half_offset * 2 + 1, _rot_odd_u8)
+ 
+         # FP8 weight-fold contract:
+         #   index_weights_out = index_weights * q_scale * softmax_scale * head_scale
+@@ -618,7 +629,7 @@
+             dtype=torch.uint8,
+             device=index_q.device,
+         )
+-        if has_cutedsl() and not is_ampere_or_ada():
++        if current_platform.is_cuda() and has_cutedsl() and not is_ampere_or_ada():
+             # lazily import, otherwise some tests fail due to CUDA driver init failure.
+             from vllm.models.deepseek_v4.nvidia.ops.fused_indexer_q_cutedsl import (
+                 _INDEXER_Q_MXFP4_KERNEL,
+@@ -676,7 +687,7 @@
+     use_fnuz = fp8_dtype == torch.float8_e4m3fnuz
+     fp8_max = 224.0 if use_fnuz else 448.0
+     index_q_fp8 = torch.empty_like(index_q, dtype=fp8_dtype)
+-    if has_cutedsl() and not is_ampere_or_ada():
++    if current_platform.is_cuda() and has_cutedsl() and not is_ampere_or_ada():
+         # lazily import, otherwise some tests fail due to CUDA driver init failure.
+         from vllm.models.deepseek_v4.nvidia.ops.fused_indexer_q_cutedsl import (
+             _INDEXER_Q_FP8_KERNEL,
+--- a/vllm/models/deepseek_v4/nvidia/ops/fp8_einsum.py	2026-11-06 14:37:21.540952598 +0800
++++ b/vllm/models/deepseek_v4/nvidia/ops/fp8_einsum.py	2026-11-01 20:00:31.160651855 +0800
+@@ -14,30 +14,48 @@
+ from vllm.utils.deep_gemm import fp8_einsum
+ 
+ 
+-@triton.jit
++# ⛔ [xtu 2026-11-01] 长度类参数不参与 Triton 标量特化：`num_tokens` 及由其派生的
++#    三个 stride（a_stride_group / a_scale_stride_group / a_scale_stride_hidden）
++#    随请求变化；即便已从 constexpr 降级，Triton 仍会按 "==1 / 能被16整除 / 其它"
++#    给它们分类，产生有界但多余的变体（该内核历史累计 513 份）。
++@triton.jit(do_not_specialize=[
++    "num_tokens",
++    "a_stride_group",
++    "a_scale_stride_group",
++    "a_scale_stride_hidden",
++])
+ def _deepseek_v4_sm12x_fp8_einsum_kernel(
+     a_ptr,
+     a_scale_ptr,
+     b_ptr,
+     b_scale_ptr,
+     out_ptr,
+-    num_tokens: tl.constexpr,
++    # ⛔ [xtu] num_tokens 在内核里只用于掩码（3 处 `token_offsets < num_tokens`），
++    #    grid 由宿主侧 `cdiv(num_tokens, block_tokens)` 决定 ⇒ 不需要 constexpr。
++    #    原实现 ⇒ 每个不同 chunk 长度编一份 cubin（每层每步都会遇到），
++    #    这些模块常驻 GPU 代码段、不归 torch 分配器 ⇒ 显存随形状单调上涨。
++    num_tokens,
+     num_groups: tl.constexpr,
+     out_rank: tl.constexpr,
+     hidden_size: tl.constexpr,
+-    a_stride_token: tl.constexpr,
+-    a_stride_group: tl.constexpr,
++    a_stride_token,  # ⛔ 第6轮B1：由 .stride(0)/.shape[0] 派生 ⇒ 降级为运行时标量
++    # ⛔ [xtu 2026-11-01 第三方审计] 这三个 stride 由 num_tokens 派生
++    #    （`a.stride(1)=num_tokens*d`、`a_scale.stride(1)=scale_inner*tma_aligned_T`、
++    #    `a_scale.stride(2)=tma_aligned_T`，而 `a` 是 `(n_groups, num_tokens, d)` 的
++    #    转置视图）⇒ 只降级 `num_tokens` **无效**，编译键仍按 token 数增长
++    #    （实测本内核 513 份变体）。内核里它们只用于索引算术，降级无收益损失。
++    a_stride_group,
+     a_stride_hidden: tl.constexpr,
+-    a_scale_stride_token: tl.constexpr,
+-    a_scale_stride_group: tl.constexpr,
+-    a_scale_stride_hidden: tl.constexpr,
+-    b_stride_group: tl.constexpr,
++    a_scale_stride_token,  # ⛔ 第6轮B1：由 .stride(0)/.shape[0] 派生 ⇒ 降级为运行时标量
++    a_scale_stride_group,
++    a_scale_stride_hidden,
++    b_stride_group,  # ⛔ 第6轮B1：由 .stride(0)/.shape[0] 派生 ⇒ 降级为运行时标量
+     b_stride_out: tl.constexpr,
+     b_stride_hidden: tl.constexpr,
+-    b_scale_stride_group: tl.constexpr,
++    b_scale_stride_group,  # ⛔ 第6轮B1：由 .stride(0)/.shape[0] 派生 ⇒ 降级为运行时标量
+     b_scale_stride_out: tl.constexpr,
+     b_scale_stride_hidden: tl.constexpr,
+-    out_stride_token: tl.constexpr,
++    out_stride_token,  # ⛔ 第6轮B1：降级为运行时标量（每 token/batch 变化）
+     out_stride_group: tl.constexpr,
+     out_stride_rank: tl.constexpr,
+     BLOCK_TOKENS: tl.constexpr,
+--- a/vllm/models/deepseek_v4/nvidia/ops/sm12x_deep_gemm_fallbacks.py	2026-11-06 14:37:21.540952598 +0800
++++ b/vllm/models/deepseek_v4/nvidia/ops/sm12x_deep_gemm_fallbacks.py	2026-11-01 20:00:54.108132033 +0800
+@@ -2,6 +2,8 @@
+ # SPDX-FileCopyrightText: Copyright contributors to the vLLM project
+ """SM12x fallback implementations for DeepGEMM-only interfaces."""
+ 
++import os
++
+ import torch
+ 
+ from vllm.logger import init_logger
+@@ -76,9 +78,33 @@
+ 
+     seq_len, num_heads, _ = q_values.shape
+     seq_len_kv = k_f32.shape[0]
++    # ⭐【2026-10-26 · XTU】`logits` 由 fp32 改 **bf16**（默认），把这块"随上下文增长的稠密矩阵"砍半。
++    #   依据：241k 上下文 / MBT=8192 实测 8188×16384×4 B = **512 MiB**，是本机"预算外 ~7 GiB"的主源
++    #   （dev-docs/INCIDENT_2026-10-26_XID31.md §28）。⚠️ 只改**输出缓冲**类型：
++    #   `k_f32` 与 `scores` 仍在 fp32 上算 ⇒ 量化解码精度不降，只影响 logits 落盘精度。
++    #   ⚠️ 一键回退（无需改代码）：`XIAOTU_MQA_LOGITS_FP32=1` ⇒ 回到原 fp32 行为。
++    # ⚠️⚠️【实测结论 2026-10-26】bf16 **在本接口上不能直接开**：
++    #   下游按 float32 取指针（`const_data_ptr<float>`），bf16 会让引擎启动后立刻
++    #   `RuntimeError: Worker failed with error 'const_data_ptr<float>...'` 并 EngineDead ✗
++    #   ⇒ 默认**必须** fp32；bf16 仅作实验开关（`XIAOTU_MQA_LOGITS_BF16=1`），
++    #   且只有在把 candidate-block / top-k 那条链全部改成接受 bf16 之后才有意义。
++    _logits_dtype = (
++        torch.bfloat16
++        if os.environ.get("XIAOTU_MQA_LOGITS_BF16", "0") == "1"
++        else torch.float32
++    )
+     logits = torch.zeros(
+-        (seq_len, seq_len_kv), device=q_values.device, dtype=torch.float32
++        (seq_len, seq_len_kv), device=q_values.device, dtype=_logits_dtype
+     )
++    if not globals().get("_XTU_LOGITS_DTYPE_LOGGED"):
++        globals()["_XTU_LOGITS_DTYPE_LOGGED"] = True
++        print(
++            f"[xtu-mqa-logits] logits dtype={_logits_dtype} "
++            f"shape=({seq_len},{seq_len_kv}) "
++            f"bytes={seq_len * seq_len_kv * _logits_dtype.itemsize / 2**20:.1f} MiB "
++            f"(fp32 会是 {seq_len * seq_len_kv * 4 / 2**20:.1f} MiB)",
++            flush=True,
++        )
+     head_chunk_size = _fp8_mqa_logits_head_chunk_size(seq_len, seq_len_kv, num_heads)
+ 
+     for head_start in range(0, num_heads, head_chunk_size):
+@@ -425,6 +451,30 @@
+     return True
+ 
+ 
++# ⭐【2026-10-26 · XTU 诊断】`fp8_mqa_logits` 到底走 Triton 还是 torch 回退？
++#   背景：A100(SM80) 上 torch 回退会把 [seq_len × seq_len_kv] 的 fp32 稠密 logits 整块物化
++#   （实测 8188×16384×4B = **512 MiB**），且 profile 期测不到 ⇒ 预算外显存的主要来源。
++#   本诊断只打印前几次、每分支各 3 条，用来定位**判据里哪一项不满足**。加完即锁定取值再决定改法。
++_XTU_MQA_SEEN = {"triton": 0, "torch": 0}
++
++
++def _xtu_mqa_dispatch_diag(taken, clean_logits, q, kv):
++    _XTU_MQA_SEEN[taken] += 1
++    n = _XTU_MQA_SEEN[taken]
++    if n > 3:
++        return
++    q_values, q_scale = q
++    try:
++        info = (f"q.shape={tuple(q_values.shape)} q.dtype={q_values.dtype} "
++                f"q.dim={q_values.dim()} "
++                f"q_scale={'None' if q_scale is None else tuple(q_scale.shape)} "
++                f"kv0.dim={kv[0].dim()} kv0.shape={tuple(kv[0].shape)} "
++                f"clean_logits={clean_logits}")
++    except Exception as exc:  # noqa: BLE001
++        info = f"<diag failed: {exc}>"
++    print(f"[xtu-mqa-logits] #{n} path={taken.upper()} {info}", flush=True)
++
++
+ def _fp8_mqa_logits_sm12x(
+     q: tuple[torch.Tensor, torch.Tensor | None],
+     kv: tuple[torch.Tensor, torch.Tensor],
+@@ -434,12 +484,23 @@
+     clean_logits: bool,
+ ) -> torch.Tensor:
+     q_values, q_scale = q
+-    if clean_logits and q_scale is None and q_values.dim() == 3 and kv[0].dim() == 2:
++    # ⭐【2026-10-26 · XTU】放开 `clean_logits=False`：原判据要求 clean_logits=True，
++    #   而两处调用点都传 False ⇒ 永远落到下面的 torch 参考实现（fp32 matmul，不用 tensor core，
++    #   还额外物化 seq_len×seq_len_kv 的 512 MiB 浮点缓冲，是本机"预算外 ~7 GiB"的主源，见 §28）。
++    #   现在 Triton kernel 支持 `clean` 编译期开关，两种语义都走 tl.dot(tf32) ⇒ 走 tensor core。
++    #   回退开关：`XIAOTU_MQA_LOGITS_TRITON=0` ⇒ 恢复"clean=False 时用 torch 参考实现"的老行为。
++    _triton_shape_ok = q_scale is None and q_values.dim() == 3 and kv[0].dim() == 2
++    _triton_enabled = os.environ.get("XIAOTU_MQA_LOGITS_TRITON", "1") != "0"
++    if _triton_shape_ok and _triton_enabled:
+         from vllm.models.deepseek_v4.nvidia.ops.sm12x_mqa import (
+             fp8_mqa_logits_triton,
+         )
+ 
+-        return fp8_mqa_logits_triton(q_values, kv, weights, cu_seqlen_ks, cu_seqlen_ke)
++        _xtu_mqa_dispatch_diag("triton", clean_logits, q, kv)
++        return fp8_mqa_logits_triton(
++            q_values, kv, weights, cu_seqlen_ks, cu_seqlen_ke, clean=clean_logits
++        )
++    _xtu_mqa_dispatch_diag("torch", clean_logits, q, kv)
+     return _fp8_mqa_logits_torch(
+         q, kv, weights, cu_seqlen_ks, cu_seqlen_ke, clean_logits
+     )
+--- a/vllm/models/deepseek_v4/nvidia/ops/sm12x_mqa.py	2026-11-06 14:37:21.540952598 +0800
++++ b/vllm/models/deepseek_v4/nvidia/ops/sm12x_mqa.py	2026-11-01 20:48:12.451335166 +0800
+@@ -10,6 +10,30 @@
+ from vllm.triton_utils import tl, triton
+ 
+ 
++
++# ⛔ [xtu 2026-11-01 第12轮] 本文件需要 capture 安全的 gate 才能加值域断言
++#    （`_bt_bound_skip` 只定义在 sparse_mla_kernels.py，**不能**直接调用 —— 曾因此 NameError）。
++_MQA_BOUND_SEEN: set = set()
++_MQA_BOUND_CALLS: dict = {}
++
++
++def _bt_bound_skip(sig) -> bool:
++    """capture 中或本轮不需校验 ⇒ True（capture 期 `.max()` 属非法操作）。"""
++    try:
++        import torch as _t
++        if _t.cuda.is_current_stream_capturing():
++            return True
++    except Exception:  # noqa: BLE001
++        pass
++    if sig not in _MQA_BOUND_SEEN:
++        if len(_MQA_BOUND_SEEN) < 16:
++            _MQA_BOUND_SEEN.add(sig)
++            _MQA_BOUND_CALLS[sig] = 1
++            return False
++    _c = _MQA_BOUND_CALLS.get(sig, 0) + 1
++    _MQA_BOUND_CALLS[sig] = _c
++    return (_c % 256) != 0
++
+ def _view_packed_fp8_paged_mqa_kv_cache(
+     kv_cache: torch.Tensor,
+     head_dim: int,
+@@ -53,7 +77,10 @@
+     return kv_values, kv_scale[..., :scale_elems]
+ 
+ 
+-@triton.jit
++# ⛔ [xtu 2026-11-01] 加 do_not_specialize：Triton 默认会把整数标量按
++#    "==1 / 能被16整除 / 其它" 三档特化，即使已从 constexpr 降级，仍会产生少量
++#    变体（实测 30 种长度 → 5 份）。把长度类参数排除特化后应收敛到 1 份。
++@triton.jit(do_not_specialize=["num_q", "seq_len_kv", "stride_lm"])
+ def _fp8_mqa_logits_kernel(
+     q_ptr,
+     k_ptr,
+@@ -62,22 +89,24 @@
+     cu_seqlen_ks_ptr,
+     cu_seqlen_ke_ptr,
+     logits_ptr,
+-    num_q: tl.constexpr,
+-    seq_len_kv: tl.constexpr,
++    num_q,
++    seq_len_kv,
+     num_heads: tl.constexpr,
+     head_dim: tl.constexpr,
+-    stride_qm: tl.constexpr,
++    stride_qm,  # ⛔ 第8轮：q.stride(0) 随 token 行数变（连续时恰好等于 num_heads*head_dim）
+     stride_qh: tl.constexpr,
+     stride_qd: tl.constexpr,
+-    stride_kn: tl.constexpr,
++    stride_kn,  # ⛔ 第6轮B1：由 .stride(0)/.shape[0] 派生 ⇒ 降级为运行时标量
+     stride_kd: tl.constexpr,
+-    stride_wm: tl.constexpr,
++    stride_wm,  # ⛔ 第6轮B1：由 .stride(0)/.shape[0] 派生 ⇒ 降级为运行时标量
+     stride_wh: tl.constexpr,
+-    stride_lm: tl.constexpr,
++    stride_lm,
+     stride_ln: tl.constexpr,
+     BLOCK_M: tl.constexpr,
+     BLOCK_N: tl.constexpr,
+     BLOCK_D: tl.constexpr,
++    clean: tl.constexpr = True,
++    dot_bf16: tl.constexpr = True,
+ ):
+     pid_m = tl.program_id(0)
+     pid_n = tl.program_id(1)
+@@ -116,7 +145,15 @@
+                     other=0,
+                 )
+             )
+-            scores += tl.dot(q, tl.trans(k), input_precision="tf32")
++            # ⭐【2026-10-26 · XTU】A100(SM80) **没有 fp8 tensor core**（fp8 MMA 是 Hopper SM90 起），
++            #   所以"fp8 精度"只能落成 **fp8 存储 + 宽格式 tensor core 计算**（Marlin 对权重也是这么做的：
++            #   fp8 → 反量化 → bf16 GEMM）。这里选 **bf16** 而不是 tf32，理由是**零精度损失下的最快**：
++            #   e4m3 只有 3 位尾数，bf16 有 7 位 ⇒ **每个 fp8 值在 bf16 中精确可表示**（反量化无损）；
++            #   累加在 `scores` 里是 fp32；bf16 TC 峰值 312 TFLOPS vs tf32 156 ⇒ 快一倍。
++            if dot_bf16:
++                scores += tl.dot(q.to(tl.bfloat16), tl.trans(k.to(tl.bfloat16)))
++            else:
++                scores += tl.dot(q, tl.trans(k), input_precision="tf32")
+         scale = tl.load(scale_ptr + offs_n, mask=valid_n, other=0.0)
+         weighted = tl.maximum(scores * scale[None, :], 0.0)
+         weight = tl.load(
+@@ -127,7 +164,12 @@
+         logits += weighted * weight[:, None]
+ 
+     store_mask = valid_m[:, None] & valid_n[None, :]
+-    logits = tl.where(seq_mask & store_mask, logits, float("-inf"))
++    # ⭐【2026-10-26 · XTU】原来这里**无条件**套 seq_mask，于是本 kernel 只能服务
++    #   `clean_logits=True`；调用方两处都传 False ⇒ 被 dispatcher 挡到 torch 参考实现
++    #   （纯 fp32 matmul，**完全没用上 tensor core**，还额外物化 512 MiB 缓存）。
++    #   加 `clean` 编译期开关后，clean=False 走同一 kernel、只跳过掩码 ⇒ 走 tl.dot(tf32)。
++    if clean:
++        logits = tl.where(seq_mask & store_mask, logits, float("-inf"))
+     tl.store(
+         logits_ptr + offs_m[:, None] * stride_lm + offs_n[None, :] * stride_ln,
+         logits,
+@@ -141,6 +183,8 @@
+     weights: torch.Tensor,
+     cu_seqlen_ks: torch.Tensor,
+     cu_seqlen_ke: torch.Tensor,
++    clean: bool = True,
++    dot_bf16: bool = True,
+ ) -> torch.Tensor:
+     k_fp8, scale = kv
+     num_q, num_heads, head_dim = q.shape
+@@ -183,6 +227,8 @@
+         BLOCK_M=block_m,
+         BLOCK_N=128,
+         BLOCK_D=block_d,
++        clean=clean,
++        dot_bf16=dot_bf16,
+         num_warps=4,
+     )
+     return logits
+@@ -198,7 +244,10 @@
+     return 64
+ 
+ 
+-@triton.jit
++# ⛔ [xtu 2026-11-01] 加 do_not_specialize：Triton 默认会把整数标量按
++#    "==1 / 能被16整除 / 其它" 三档特化，即使已从 constexpr 降级，仍会产生少量
++#    变体（实测 30 种长度 → 5 份）。把长度类参数排除特化后应收敛到 1 份。
++@triton.jit(do_not_specialize=["num_rows", "logits_width", "next_n", "stride_qb", "stride_clb", "stride_lm", "token_start"])
+ def _fp8_paged_mqa_logits_kernel(
+     q_ptr,
+     kv_ptr,
+@@ -208,28 +257,37 @@
+     block_tables_ptr,
+     logits_ptr,
+     token_start,
+-    num_rows: tl.constexpr,
+-    logits_width: tl.constexpr,
+-    next_n: tl.constexpr,
++    num_rows,
++    # ⛔ [xtu 2026-11-01 第三方审计] `logits_width` 只用于掩码 `valid_n = offs_local_n < logits_width`，
++    #    取值是请求的 token_count（逐请求变化）⇒ constexpr 会让每个长度各编一份。
++    logits_width,
++    # ⛔ [xtu 2026-11-01 第三方审计] `next_n` = 每请求的 q token 数（q.size(1)），内核里只用于 `offs_m // next_n` ⇒ 只用于索引算术，降级。
++    # ⛔ [xtu 2026-11-01 第三方审计] `next_n`(=q.size(1)，每请求的 q token 数) 及其派生的
++    #    `stride_qb`/`stride_clb`，以及每调用新建缓冲的 `stride_outs`/`stride_sqs`，
++    #    都只用于索引算术 ⇒ 降级为运行时标量，否则"每个 token 数一份 cubin"
++    #    （实测 _fp8_paged_mqa_logits_rowwise_kernel 567 份变体即由此累积）。
++    next_n,
+     num_heads: tl.constexpr,
+     head_dim: tl.constexpr,
+     block_size: tl.constexpr,
+-    stride_qb: tl.constexpr,
++    # ⛔ [xtu 2026-11-01 第三方审计] `stride_qb` 携带 next_n ⇒ 只用于索引算术，降级。
++    stride_qb,
+     stride_qn: tl.constexpr,
+     stride_qh: tl.constexpr,
+     stride_qd: tl.constexpr,
+-    stride_kvb: tl.constexpr,
++    stride_kvb,  # ⛔ 第10轮：无 .stride(0) 证据 ⇒ 降级
+     stride_kvs: tl.constexpr,
+     stride_kvd: tl.constexpr,
+-    stride_sb: tl.constexpr,
++    stride_sb,  # ⛔ 第10轮：无 .stride(0) 证据 ⇒ 降级为运行时标量
+     stride_ss: tl.constexpr,
+-    stride_wm: tl.constexpr,
++    stride_wm,  # ⛔ 第6轮B1：由 .stride(0)/.shape[0] 派生 ⇒ 降级为运行时标量
+     stride_wh: tl.constexpr,
+-    stride_clb: tl.constexpr,
++    # ⛔ [xtu 2026-11-01 第三方审计] `stride_clb` 携带 next_n ⇒ 只用于索引算术，降级。
++    stride_clb,
+     stride_cln: tl.constexpr,
+-    stride_btb: tl.constexpr,
++    stride_btb,  # ⛔ 第6轮B1：降级为运行时标量（每 token/batch 变化）
+     stride_btk: tl.constexpr,
+-    stride_lm: tl.constexpr,
++    stride_lm,
+     stride_ln: tl.constexpr,
+     BLOCK_M: tl.constexpr,
+     BLOCK_N: tl.constexpr,
+@@ -312,7 +370,10 @@
+     )
+ 
+ 
+-@triton.jit
++# ⛔ [xtu 2026-11-01] 加 do_not_specialize：Triton 默认会把整数标量按
++#    "==1 / 能被16整除 / 其它" 三档特化，即使已从 constexpr 降级，仍会产生少量
++#    变体（实测 30 种长度 → 5 份）。把长度类参数排除特化后应收敛到 1 份。
++@triton.jit(do_not_specialize=["num_rows", "logits_width", "next_n", "stride_qb", "stride_clb", "stride_lm", "token_start"])
+ def _fp8_paged_mqa_logits_rowwise_kernel(
+     q_ptr,
+     kv_ptr,
+@@ -322,28 +383,30 @@
+     block_tables_ptr,
+     logits_ptr,
+     token_start,
+-    num_rows: tl.constexpr,
+-    logits_width: tl.constexpr,
+-    next_n: tl.constexpr,
++    num_rows,
++    # ⛔ [xtu 2026-11-01 第三方审计] `logits_width` 只用于掩码 `valid_n = offs_local_n < logits_width`，
++    #    取值是请求的 token_count（逐请求变化）⇒ constexpr 会让每个长度各编一份。
++    logits_width,
++    next_n,
+     num_heads: tl.constexpr,
+     head_dim: tl.constexpr,
+     block_size: tl.constexpr,
+-    stride_qb: tl.constexpr,
++    stride_qb,
+     stride_qn: tl.constexpr,
+     stride_qh: tl.constexpr,
+     stride_qd: tl.constexpr,
+-    stride_kvb: tl.constexpr,
++    stride_kvb,  # ⛔ 第10轮：无 .stride(0) 证据 ⇒ 降级
+     stride_kvs: tl.constexpr,
+     stride_kvd: tl.constexpr,
+-    stride_sb: tl.constexpr,
++    stride_sb,  # ⛔ 第10轮：无 .stride(0) 证据 ⇒ 降级为运行时标量
+     stride_ss: tl.constexpr,
+-    stride_wm: tl.constexpr,
++    stride_wm,  # ⛔ 第6轮B1：由 .stride(0)/.shape[0] 派生 ⇒ 降级为运行时标量
+     stride_wh: tl.constexpr,
+-    stride_clb: tl.constexpr,
++    stride_clb,
+     stride_cln: tl.constexpr,
+-    stride_btb: tl.constexpr,
++    stride_btb,  # ⛔ 第6轮B1：降级为运行时标量（每 token/batch 变化）
+     stride_btk: tl.constexpr,
+-    stride_lm: tl.constexpr,
++    stride_lm,
+     stride_ln: tl.constexpr,
+     BLOCK_N: tl.constexpr,
+     BLOCK_D: tl.constexpr,
+@@ -454,6 +517,12 @@
+     token_start: int = 0,
+     token_count: int | None = None,
+ ) -> torch.Tensor:
++    # ⛔ [xtu 2026-11-01 第12轮] 内核按块表值裸寻址；下界断言（shape[0] >= batch_size）不够，
++    #    必须有**取值上界**。gate 内做，避开 capture 期 .max() 非法。
++    if not _bt_bound_skip(("mqa_bt", int(block_tables.shape[-1]))):
++        assert int(block_tables.max()) < int(kv_cache.shape[0]), (
++            f"block id 越界：max={int(block_tables.max())} ≥ kv_cache.shape[0]={int(kv_cache.shape[0])}"
++        )
+     """Rowwise paged-MQA logits wrapper.
+ 
+     Pre-condition: ``head_dim % 64 == 0`` and ``num_heads % 4 == 0`` so the
+@@ -464,6 +533,18 @@
+     misaligned shapes.
+     """
+     batch_size, next_n, num_heads, head_dim = q.size()
++    # ⛔ [xtu 2026-11-01 第6轮审计 C4] 内核按块表裸地址取页（无 mask）⇒ 宿主必须校验
++    #    块表二维连续、行数覆盖 batch、context_lens 不超出块表可覆盖范围。
++    #    ⚠️ 只用**主机侧**廉价检查（不触发设备规约）⇒ capture 期安全、无 D2H 同步。
++    assert block_tables.dim() == 2 and block_tables.stride(1) == 1, (
++        f"block_tables 必须是行内连续的二维块表：dim={block_tables.dim()}"
++    )
++    assert block_tables.shape[0] >= batch_size, (
++        f"block_tables 行数 {block_tables.shape[0]} < batch_size {batch_size}"
++    )
++    if block_tables.shape[1] <= 0:
++        raise AssertionError("block_tables 列数为 0")
++
+     kv_values, kv_scale = _view_packed_fp8_paged_mqa_kv_cache(kv_cache, head_dim)
+     _, block_size, _, _ = kv_values.size()
+     # Ampere lacks the fp8e4nv type; the kernel decodes e4m3 from uint8.
+@@ -538,7 +619,25 @@
+     token_start: int = 0,
+     token_count: int | None = None,
+ ) -> torch.Tensor:
++    # ⛔ [xtu 2026-11-01 第12轮] 内核按块表值裸寻址；下界断言（shape[0] >= batch_size）不够，
++    #    必须有**取值上界**。gate 内做，避开 capture 期 .max() 非法。
++    if not _bt_bound_skip(("mqa_bt", int(block_tables.shape[-1]))):
++        assert int(block_tables.max()) < int(kv_cache.shape[0]), (
++            f"block id 越界：max={int(block_tables.max())} ≥ kv_cache.shape[0]={int(kv_cache.shape[0])}"
++        )
+     batch_size, next_n, num_heads, head_dim = q.size()
++    # ⛔ [xtu 2026-11-01 第6轮审计 C4] 内核按块表裸地址取页（无 mask）⇒ 宿主必须校验
++    #    块表二维连续、行数覆盖 batch、context_lens 不超出块表可覆盖范围。
++    #    ⚠️ 只用**主机侧**廉价检查（不触发设备规约）⇒ capture 期安全、无 D2H 同步。
++    assert block_tables.dim() == 2 and block_tables.stride(1) == 1, (
++        f"block_tables 必须是行内连续的二维块表：dim={block_tables.dim()}"
++    )
++    assert block_tables.shape[0] >= batch_size, (
++        f"block_tables 行数 {block_tables.shape[0]} < batch_size {batch_size}"
++    )
++    if block_tables.shape[1] <= 0:
++        raise AssertionError("block_tables 列数为 0")
++
+     # Aligned head shapes (DSv4-Flash and any future MQA model with
+     # ``head_dim % 64 == 0`` and ``num_heads % 4 == 0``) get the rowwise
+     # kernel, which keeps long-context decode (>100K tokens) on a per-row
+@@ -642,14 +741,16 @@
+     M,
+     K: tl.constexpr,
+     N: tl.constexpr,
+-    stride_xm: tl.constexpr,
++    stride_xm,  # ⛔ 第6轮B1：由 .stride(0)/.shape[0] 派生 ⇒ 降级为运行时标量
+     stride_xk: tl.constexpr,
+-    stride_fnn: tl.constexpr,
++    stride_fnn,  # ⛔ 第6轮B1：由 .stride(0)/.shape[0] 派生 ⇒ 降级为运行时标量
+     stride_fnk: tl.constexpr,
+-    stride_outs: tl.constexpr,
++    # ⛔ [xtu 2026-11-01 第三方审计] `stride_outs` = n*hc*(hc+2)（每调用新建的 mix 缓冲） ⇒ 只用于索引算术，降级。
++    stride_outs,
+     stride_outm: tl.constexpr,
+     stride_outn: tl.constexpr,
+-    stride_sqs: tl.constexpr,
++    # ⛔ [xtu 2026-11-01 第三方审计] `stride_sqs` = n（每调用新建的 sqr 缓冲） ⇒ 只用于索引算术，降级。
++    stride_sqs,
+     stride_sqm: tl.constexpr,
+     NUM_SPLIT: tl.constexpr,
+     BLOCK_M: tl.constexpr,
+--- a/vllm/models/deepseek_v41/attention.py	2026-11-06 14:37:18.768875267 +0800
++++ b/vllm/models/deepseek_v41/attention.py	2026-11-01 20:00:10.353125438 +0800
+@@ -662,6 +662,78 @@
+         hidden_states: torch.Tensor,
+         llama_4_scaling: torch.Tensor | None = None,
+     ) -> torch.Tensor:
++        """Run the layer, transferring KV to and from an external connector.
++
++        Equivalent to the ``maybe_transfer_kv_layer`` decorator that the
++        standard attention layers use; the unwrapped body is ``_forward_impl``.
++        Attention metadata is keyed per KV cache group (for example
++        ``<layer>.attn.swa_cache``) rather than per layer, so any one of this
++        layer's group keys is used to reach the context while the connector is
++        called with that same key. Without a transfer group or connector
++        metadata this is a no-op and costs nothing.
++        """
++        from vllm.distributed.kv_transfer import (
++            get_kv_transfer_group,
++            has_kv_transfer_group,
++            is_v1_kv_transfer_group,
++        )
++        from vllm.forward_context import get_forward_context
++        from vllm.model_executor.layers.attention.attention import (
++            get_attention_context,
++        )
++
++        args = (positions, hidden_states, llama_4_scaling)
++        if not (has_kv_transfer_group() and is_v1_kv_transfer_group()):
++            return self._forward_impl(*args)
++        raw = getattr(self, "prefix", None) or getattr(self, "layer_name", None)
++        if not raw:
++            return self._forward_impl(*args)
++        attn_metadata = get_forward_context().attn_metadata
++        # ⛔ [xtu 2026-11-01 内核资源审计 #4] 旧实现用 `startswith(raw + ".")` 取
++        #    **第一个**匹配键 ⇒ ① 永远排除主 KV 键 `raw` 本身（MLA 主压缩缓存从不
++        #    wait/save）；② 命中的是 `.swa_cache` / `.indexer.k_cache` 中按 dict 插入序
++        #    的任意一个，换配置即改变传输对象。
++        #    改为取**全部**同名组（含 `raw` 自身），对每个组一致地 wait / save；
++        #    metadata 为 None 的组跳过。这样多缓存组要么全传、要么明确不传，不会静默漏传。
++        keys = []
++        if isinstance(attn_metadata, dict):
++            keys = [k for k in attn_metadata if k == raw or k.startswith(raw + ".")]
++        if not keys:
++            return self._forward_impl(*args)
++        connector = get_kv_transfer_group()
++        if not connector.has_connector_metadata():
++            return self._forward_impl(*args)
++        active = []
++        for k in keys:
++            try:
++                md, _, kv_cache, _ = get_attention_context(k)
++            except (KeyError, AttributeError) as exc:
++                # ⛔ [xtu 2026-11-01 第三方审计] 原为 `except Exception: continue`，
++                #    会把任何异常都当成"非 KV 组"静默跳过 ⇒ 组名变更/注册缺失时
++                #    **静默漏传**该缓存组（disagg 下注意力读到未传输的 KV，静默错数）。
++                #    只吞预期的 KeyError/AttributeError，并一定告警；其它异常上抛。
++                from vllm.logger import init_logger as _init_logger
++                _init_logger(__name__).warning_once(
++                    "kv-transfer: 跳过缓存组 %s（%s: %s）", k,
++                    type(exc).__name__, exc,
++                )
++                continue
++            if md is not None:
++                active.append((k, md, kv_cache))
++        if not active:
++            return self._forward_impl(*args)
++        for k, _md, _kvc in active:
++            connector.wait_for_layer_load(k)
++        out = self._forward_impl(*args)
++        for k, md, kvc in active:
++            connector.save_kv_layer(k, kvc, md)
++        return out
++    def _forward_impl(
++        self,
++        positions: torch.Tensor,
++        hidden_states: torch.Tensor,
++        llama_4_scaling: torch.Tensor | None = None,
++    ) -> torch.Tensor:
+         # The eager attention region writes into a caller-owned buffer
+         # (breakable_cudagraph needs in-place outputs); its shape and how it is
+         # projected afterwards follow the interface contract above.
+--- a/vllm/models/deepseek_v41/common/ops/cache_utils.py	2026-11-06 14:37:21.568953379 +0800
++++ b/vllm/models/deepseek_v41/common/ops/cache_utils.py	2026-11-04 22:19:50.185713884 +0800
+@@ -75,7 +75,7 @@
+     quant_block: tl.constexpr,  # 64 (quantization block size)
+     cache_block_size: tl.constexpr,  # 64 (paged cache block size)
+     token_data_size: tl.constexpr,  # 576 bytes per token data
+-    block_stride: tl.constexpr,  # total bytes per block (padded)
++    block_stride,  # ⛔ 第11轮N2：由 k_cache.stride(0) 中转而来 ⇒ 降级为运行时标量  # total bytes per block (padded)
+     fp8_max: tl.constexpr,
+     n_quant_blocks: tl.constexpr,  # 8 (7 real + 1 padding)
+     use_fnuz: tl.constexpr = False,
+@@ -194,7 +194,7 @@
+     scale_dim: tl.constexpr,  # 16
+     quant_block: tl.constexpr,  # 32 dims per UE8M0 scale
+     cache_block_size: tl.constexpr,  # paged cache block size, in tokens
+-    block_stride: tl.constexpr,  # total bytes per block (padded)
++    block_stride,  # ⛔ 第11轮N2：由 k_cache.stride(0) 中转而来 ⇒ 降级为运行时标量  # total bytes per block (padded)
+     fp8_max: tl.constexpr,
+     use_fnuz: tl.constexpr = False,
+ ):
+@@ -254,6 +254,12 @@
+     use_fnuz: bool = False,
+     bytes_per_token: int = V4_BYTES_PER_TOKEN,
+ ):
++    # ⛔ [xtu 2026-11-01 用户收窄目标] '可疑地址'类：内核把 `slot_mapping` 当裸地址用，
++    #    此前无上界断言。容量推导：内核按 `slot // block_size` 取块 ⇒ 合法上界 = 块数×块大小。
++    if not _bound_check_skip(("addr_quantize_and_inser", int(slot_mapping.numel()))):
++        assert int(slot_mapping.max()) < int(k_cache.shape[0] * block_size), (
++            f"slot_mapping 越界：max={int(slot_mapping.max())} ≥ {int(k_cache.shape[0] * block_size)}"
++        )
+     """Quantize K tensor and insert into paged K cache.
+ 
+     ``bytes_per_token`` picks the record (see the module header): the V4 one,
+@@ -263,6 +269,20 @@
+     platforms whose FP8 format is FNUZ. ``use_fnuz=False`` selects OCP E4M3,
+     which is used by OCP-encoded caches even on gfx942.
+     """
++    # ⛔ [xtu 2026-11-01 第三方审计] 528 记录 = V4.1 all-dims MXFP8，其内核用
++    #    `tl.float8e4nv`（本文件 238/493/564 行）。调度层只会在 SM100 选它，但**这个
++    #    导出 API 本身没有任何 fp8 能力检查** ⇒ 直接调用会在 SM80/SM86 上编译期崩溃，
++    #    且报错位置离根因很远。这里显式 fail-fast（与
++    #    fused_compress_quant_cache.py:272-282 同一处理）。
++    if (
++        bytes_per_token == V41_BYTES_PER_TOKEN
++        and current_platform.is_cuda()
++        and not current_platform.has_device_capability(89)
++    ):
++        raise RuntimeError(
++            "V4.1 MXFP8 KV 记录（bytes_per_token=528）需要 Triton fp8e4nv（CUDA SM89+）；"
++            "SM80/SM86 不支持，请改用 V4 记录或 fp8_ds_mla 布局"
++        )
+     assert k.dim() == 2 and k.shape[1] == 512, (
+         f"K must be [num_tokens, 512], got {k.shape}"
+     )
+@@ -327,7 +347,10 @@
+     )
+ 
+ 
+-@triton.jit
++# ⛔ [xtu 2026-11-01] `max_blocks_per_seq` = block_table.shape[-1]（随上下文变化）已从
++#    constexpr 降级；这里再排除它的标量特化，避免按 "==1 / 16 倍数 / 其它" 产生残余变体
++#    （该内核历史累计 190 份）。
++@triton.jit(do_not_specialize=["max_blocks_per_seq", "offset"])
+ def _dequantize_and_gather_k_kernel(
+     out_ptr,
+     out_stride0,
+@@ -338,14 +361,19 @@
+     offset,
+     gather_lens_ptr,
+     # Constants
+-    max_blocks_per_seq: tl.constexpr,
++        # ⛔ [xtu 2026-11-01 第三方审计] 实测 Triton 缓存里本内核有 **190 份变体**：
++    #    `max_blocks_per_seq` 被当 constexpr，取值 `block_table.shape[-1]`（随上下文
++    #    长度变化），而内核里它**只用于算 stride**
++    #    （`block_table_ptr + batch_idx * max_blocks_per_seq`），不是循环上界
++    #    ⇒ 特化零收益，纯属按上下文长度累积 cubin。降级为运行时标量。
++    max_blocks_per_seq,
+     fp8_dim: tl.constexpr,  # 448
+     bf16_dim: tl.constexpr,  # 64
+     scale_dim: tl.constexpr,  # 8
+     quant_block: tl.constexpr,  # 64 (quantization block size)
+     cache_block_size: tl.constexpr,  # 64 or 128 (paged cache block size)
+     token_data_size: tl.constexpr,  # 576 bytes per token data
+-    block_stride: tl.constexpr,  # total bytes per block (padded) int32
++    block_stride,  # ⛔ 第6轮B1：由 .stride(0)/.shape[0] 派生 ⇒ 降级为运行时标量  # total bytes per block (padded) int32
+     output_dim: tl.constexpr,  # 512
+     fp8_max: tl.constexpr,
+     n_quant_blocks: tl.constexpr,  # 7 real blocks
+@@ -439,7 +467,10 @@
+             tl.store(output_row_ptr + bf16_output_offset + chunk_offsets, bf16_vals)
+ 
+ 
+-@triton.jit
++# ⛔ [xtu 2026-11-01] `max_blocks_per_seq` = block_table.shape[-1]（随上下文变化）已从
++#    constexpr 降级；这里再排除它的标量特化，避免按 "==1 / 16 倍数 / 其它" 产生残余变体
++#    （该内核历史累计 190 份）。
++@triton.jit(do_not_specialize=["max_blocks_per_seq", "offset"])
+ def _dequantize_and_gather_k_mxfp8_kernel(
+     out_ptr,
+     out_stride0,
+@@ -449,12 +480,17 @@
+     block_table_ptr,
+     offset,
+     gather_lens_ptr,
+-    max_blocks_per_seq: tl.constexpr,
++        # ⛔ [xtu 2026-11-01 第三方审计] 实测 Triton 缓存里本内核有 **190 份变体**：
++    #    `max_blocks_per_seq` 被当 constexpr，取值 `block_table.shape[-1]`（随上下文
++    #    长度变化），而内核里它**只用于算 stride**
++    #    （`block_table_ptr + batch_idx * max_blocks_per_seq`），不是循环上界
++    #    ⇒ 特化零收益，纯属按上下文长度累积 cubin。降级为运行时标量。
++    max_blocks_per_seq,
+     head_dim: tl.constexpr,  # 512
+     scale_dim: tl.constexpr,  # 16
+     quant_block: tl.constexpr,  # 32
+     cache_block_size: tl.constexpr,
+-    block_stride: tl.constexpr,
++    block_stride,  # ⛔ 第6轮B1：由 .stride(0)/.shape[0] 派生 ⇒ 降级为运行时标量
+     use_fnuz: tl.constexpr = False,
+ ):
+     """Gather V4.1 MXFP8 rows into a bf16 workspace, dequantizing in place."""
+@@ -502,7 +538,10 @@
+         tl.store(output_row_ptr + d, dequant.to(tl.bfloat16))
+ 
+ 
+-@triton.jit
++# ⛔ [xtu 2026-11-01] `max_blocks_per_seq` = block_table.shape[-1]（随上下文变化）已从
++#    constexpr 降级；这里再排除它的标量特化，避免按 "==1 / 16 倍数 / 其它" 产生残余变体
++#    （该内核历史累计 190 份）。
++@triton.jit(do_not_specialize=["max_blocks_per_seq", "offset"])
+ def _dequantize_and_gather_k_nvfp4_kernel(
+     out_ptr,
+     out_stride0,
+@@ -512,12 +551,17 @@
+     block_table_ptr,
+     offset,
+     gather_lens_ptr,
+-    max_blocks_per_seq: tl.constexpr,
++        # ⛔ [xtu 2026-11-01 第三方审计] 实测 Triton 缓存里本内核有 **190 份变体**：
++    #    `max_blocks_per_seq` 被当 constexpr，取值 `block_table.shape[-1]`（随上下文
++    #    长度变化），而内核里它**只用于算 stride**
++    #    （`block_table_ptr + batch_idx * max_blocks_per_seq`），不是循环上界
++    #    ⇒ 特化零收益，纯属按上下文长度累积 cubin。降级为运行时标量。
++    max_blocks_per_seq,
+     head_dim: tl.constexpr,  # 512
+     scale_dim: tl.constexpr,  # 32
+     quant_block: tl.constexpr,  # 16
+     cache_block_size: tl.constexpr,
+-    block_stride: tl.constexpr,
++    block_stride,  # ⛔ 第6轮B1：由 .stride(0)/.shape[0] 派生 ⇒ 降级为运行时标量
+ ):
+     """Gather and dequantize V4.1 NVFP4 rows into a bf16 workspace."""
+     batch_idx = tl.program_id(0)
+@@ -569,6 +613,55 @@
+         tl.store(output_row_ptr + d, dequant.to(tl.bfloat16))
+ 
+ 
++_BT_WIDTHS: set = set()
++_BT_WIDTHS_MAX = 8   # ⛔ 审计 C1：观测集合必须有界，超过即停止记录（不再增长）
++
++
++def _note_block_table_width(w: int) -> None:
++    """记录见到的 block_table 宽度；每个新宽度只打印一次（用于判定形状轴真假）。"""
++    if w in _BT_WIDTHS or len(_BT_WIDTHS) >= _BT_WIDTHS_MAX:
++        return
++    _BT_WIDTHS.add(w)
++    try:
++        print(f"[xtu-shape] block_table 宽度 {w}（第 {len(_BT_WIDTHS)} 个不同值）", flush=True)
++    except Exception:  # noqa: BLE001
++        pass
++
++
++_BOUND_CHECKED: set = set()
++_BOUND_RECHECK: dict = {}
++_BOUND_CHECKED_MAX = 16
++
++
++def _bound_check_skip(sig) -> bool:
++    """True = 跳过本轮校验（CUDA graph capture 中，或该形状签名已校验过）。
++
++    ⛔ [xtu 2026-11-01 第6轮审计 N4] capture 期 `.max()/.item()` 属非法操作，
++    且 decode 热路径每步做全设备规约代价不可接受 ⇒ 只在首见签名、非 capture 时校验一次。
++    """
++    try:
++        import torch as _t
++        if _t.cuda.is_current_stream_capturing():
++            return True
++    except Exception:  # noqa: BLE001
++        pass
++    if sig in _BOUND_CHECKED:
++        # ⛔ 第8轮审计 §4-3：只在首见签名校验一次 ⇒ decode 期 `seq_len` 单调增长而
++        #    `numel()` 不变，首调之后的越界**永远发现不了**。⇒ 每 256 次同类调用复检一次。
++        _c = _BOUND_RECHECK.get(sig, 0) + 1
++        _BOUND_RECHECK[sig] = _c
++        return (_c % 256) != 0
++    if len(_BOUND_CHECKED) < _BOUND_CHECKED_MAX:
++        _BOUND_CHECKED.add(sig)
++        _BOUND_RECHECK[sig] = 1
++        return False
++    # ⛔ 第9轮 §4-3 反向风险：集合满后旧逻辑对新签名恒返回 False ⇒ `.max()` 在**每个
++    #    decode step** 执行（设备同步）。改为：满集时同样走 256 次复检（最多多出少量签名）。
++    _c = _BOUND_RECHECK.get(sig, 0) + 1
++    _BOUND_RECHECK[sig] = _c
++    return (_c % 256) != 0
++
++
+ def dequantize_and_gather_k_cache_triton(
+     # [num_reqs, max_num_tokens, head_size]
+     out: torch.Tensor,
+@@ -586,6 +679,30 @@
+ ) -> None:
+     num_reqs = seq_lens.shape[0]
+     NUM_WORKERS = 128
++    # ⛔ [xtu 2026-11-01 第三方审计 C4] 内核按 `block_table.shape[-1]` 算行指针，且在
++    #    `out` / `k_cache` 上**无 mask** 读写 ⇒ 以下三条不变量必须显式校验，
++    #    否则越界访存（正是 Xid31 / FAULT_PDE 的形态）。
++    #    放在函数入口（每次调用都查，纯主机侧、无 GPU 同步、成本 O(1)）。
++    assert block_table.stride(0) == block_table.shape[-1], (
++        f"block_table 必须行内连续（内核按宽度算行指针）："
++        f"stride(0)={block_table.stride(0)} shape[-1]={block_table.shape[-1]}"
++    )
++    # ⛔ 第9轮 §4-3：旧版这里是**双层** _bound_check_skip，两个键共用同一计数器、
++    #    内层只在外层放行时才自增 ⇒ 实际周期 = 256×256 = 65,536（断言几乎永不重跑）。
++    #    去掉了内层 `("entry")` 门（其断言与外层语义重复），恢复 256 次复检。
++    if not _bound_check_skip(("gather", int(block_table.shape[-1]), int(block_size), int(seq_lens.numel()))):
++        assert int(seq_lens.max()) <= int(block_table.shape[-1]) * int(block_size), (
++            f"seq_len 超出块表范围：max={int(seq_lens.max())} > "
++            f"{int(block_table.shape[-1])}*{int(block_size)}"
++        )
++    if gather_lens is not None:
++        if not _bound_check_skip(("gl", int(out.shape[1]), int(offset), int(gather_lens.numel()))):
++            assert int(gather_lens.max()) <= int(out.shape[1]) - int(offset), (
++                f"gather_lens 超出 out 容量：max={int(gather_lens.max())} > "
++                f"out.shape[1]={int(out.shape[1])} - offset={int(offset)}（内核此处无 mask 写）"
++            )
++    # 观测：block_table 宽度是否真的随请求变化（有限次记录，避免无界增长）
++    _note_block_table_width(int(block_table.shape[-1]))
+     if k_cache.shape[-1] == V41_NVFP4_BYTES_PER_TOKEN:
+         # Keep short gathers unchanged; cap total workers for multi-request chunks.
+         num_workers = min(
+@@ -600,6 +717,11 @@
+             block_table,
+             offset,
+             gather_lens,
++            # ⛔ [xtu 2026-11-01] 观测：`block_table.shape[-1]` 到底是**配置常量**还是
++            #    **逐请求变化**——静态读代码无法定论（docstring 写的是 max_blocks_per_seq）。
++            #    这里在首次遇到新宽度时打一行，用来判定它是不是一个真实的形状轴。
++            #    判据：整个运行期只出现 1–2 个不同值 ⇒ 常量（190 份变体来自历史配置差异）；
++            #          出现很多值 ⇒ 逐请求轴，需继续桶化。
+             max_blocks_per_seq=block_table.shape[-1],
+             head_dim=512,
+             scale_dim=V41_NVFP4_NUM_SCALES,
+@@ -636,6 +758,15 @@
+     FP8_MAX = 448.0
+     TOKEN_DATA_SIZE = TOKEN_FP8_DIM + TOKEN_BF16_DIM * 2
+ 
++    # ⛔ [xtu 2026-11-01 第三方审计 C4] 上面两支已按记录宽度分派，这里是**默认分支**
++    #    （V4 的 584 字节记录）。此前没有断言 ⇒ 任何未预期的宽度都会掉进来被按 584
++    #    解析（静默错读）。显式钉死契约。
++    assert k_cache.shape[-1] == V4_BYTES_PER_TOKEN, (
++        f"未支持的 K cache 记录宽度 {k_cache.shape[-1]}："
++        f"应为 {V41_NVFP4_BYTES_PER_TOKEN}(NVFP4) / {V41_BYTES_PER_TOKEN}(MXFP8) / "
++        f"{V4_BYTES_PER_TOKEN}(V4 plain)"
++    )
++
+     _dequantize_and_gather_k_kernel[(num_reqs, NUM_WORKERS)](
+         out,
+         out.stride(0),
+@@ -686,8 +817,38 @@
+     ``current_platform.is_fp8_fnuz()`` for ``swa_k_cache`` (C++ encoder
+     writes FNUZ on gfx942 and OCP on gfx950).
+     """
++    # ⛔ [xtu 2026-11-01 第5轮审计 #11] 原断言只装在 Triton 叶子函数里，
++    #    而本入口在 `is_cuda() and has_cutedsl() and not is_ampere_or_ada()` 时走 CuteDSL
++    #    并提前 return ⇒ 那些断言在 H100/B200 上**一条都不执行**。
++    #    这里把与实现无关的三条不变量提到**公共入口**，两种后端都覆盖。
++    assert block_table.dim() == 2 and block_table.stride(1) == 1, (
++        f"block_table 必须是行内连续的二维块表：dim={block_table.dim()}"
++    )
++    assert block_table.stride(0) == block_table.shape[-1], (
++        f"block_table 行跨距必须等于宽度：stride(0)={block_table.stride(0)} "
++        f"shape[-1]={block_table.shape[-1]}"
++    )
++    # ⛔ [xtu 2026-11-01 第6轮审计 #11 残留] 第三条（唯一约束 out 写入上界的）此前**没上提**，
++    #    CuteDSL 分支仍会绕过它。这里补齐。
++    if gather_lens is not None and not _bound_check_skip(
++            ("entry_gl", int(out.shape[1]), int(offset), int(gather_lens.numel()))):
++        assert int(gather_lens.max()) <= int(out.shape[1]) - int(offset), (
++            f"gather_lens 超出 out 容量：max={int(gather_lens.max())} > "
++            f"out.shape[1]={int(out.shape[1])} - offset={int(offset)}（内核此处无 mask 写）"
++        )
++    if seq_lens is not None and not _bound_check_skip(
++            ("entry_sl", int(block_table.shape[-1]), int(block_size), int(seq_lens.numel()))):
++        assert int(seq_lens.max()) <= int(block_table.shape[-1]) * int(block_size), (
++            f"seq_len 超出块表范围：max={int(seq_lens.max())} > "
++            f"{int(block_table.shape[-1])}*{int(block_size)}"
++        )
++
+     if (
+-        has_cutedsl()
++        # ⛔ [xtu 2026-11-01 第三方审计] 必须补 `is_cuda()`：`has_cutedsl()` 在非 CUDA
++        #    平台只要 `import cutlass` 成功就为 True，而 `is_ampere_or_ada()` 在非 CUDA
++        #    恒为 False ⇒ 这个组合在 ROCm/XPU/MUSA 上是 **True**，会进 NVIDIA-only 模块。
++        current_platform.is_cuda()
++        and has_cutedsl()
+         and not is_ampere_or_ada()
+         and k_cache.shape[-1] != V41_NVFP4_BYTES_PER_TOKEN
+     ):
+@@ -737,6 +898,36 @@
+     3. Masking padding tokens to length 0
+     """
+     num_tokens = topk_indices.shape[0]
++    # ⛔ [xtu 2026-11-01 机械门禁 C4] 内核按 `req_idx * block_table_stride + block_idx`
++    #    直接算裸地址（无 mask 读块表）⇒ 必须校验块表跨距与行数。
++    assert block_table.stride(1) == 1, (
++        f"block_table 必须行内连续：stride(1)={block_table.stride(1)}"
++    )
++    assert block_table.stride(0) == block_table.shape[1] * block_table.stride(1), (
++        f"block_table 行跨距必须等于 列数×元素跨距："
++        f"stride(0)={block_table.stride(0)} shape[1]={block_table.shape[1]}"
++    )
++    # ⛔ [xtu 2026-11-01 第5轮审计 #12] 以上只查了**跨距**，没查**上界**；而内核
++    #    `block_indices = local_idx // block_size` 与 `req_idx` 都是无 mask 读块表。
++    #   ⚠️ 上一版写成 `... if 'block_size' in dir() else 1` —— 那是**错的**：
++    #      `block_size` 是本函数的形参（一定存在），该写法只会让读者困惑，
++    #      而且一旦真取到 1 会把上界缩成 `shape[1]`，反而漏放行。
++    _blk = max(1, int(block_size))
++    if topk_indices.numel() > 0:
++        _cap = int(block_table.shape[1]) * _blk
++        if not _bound_check_skip(("topk", _cap, int(topk_indices.numel()))):
++            assert int(topk_indices.max()) < _cap, (
++                f"topk_indices 越界：max={int(topk_indices.max())} ≥ "
++                f"shape[1]({int(block_table.shape[1])}) * block_size({_blk}) = {_cap}"
++                f"（内核按 local_idx//block_size 无 mask 读块表）"
++            )
++    # ⛔ [xtu 2026-11-04 撤回] 这里曾断言 `token_to_req_indices.max() < block_table.shape[0]`，
++    #    **不成立**：调用点传的是 `attn_metadata.block_table[:num_decodes]`（按 decode 数切片），
++    #    而 `token_to_req_indices` 用的是**全局请求号**。混合 prefill+decode 时
++    #    `num_decodes=1` 但 token 覆盖 2 个请求 ⇒ max=1 ≥ 1 假报，
++    #    真机上把生产服务直接 assert 死（2026-11-04 14:17，加第二路并发即崩）。
++    #    ⇒ 撤回。本函数可断言的是**结构性**契约（行内连续、行跨距一致），
++    #      取值上界取决于调用方切片语义，无法在此处断言。
+     global_topk_indices = torch.empty_like(topk_indices)
+     topk_lens = torch.empty(num_tokens, dtype=torch.int32, device=topk_indices.device)
+     _compute_global_topk_indices_and_lens_kernel[(num_tokens,)](
+@@ -759,14 +950,17 @@
+ @triton.jit
+ def _compute_global_topk_indices_and_lens_kernel(
+     global_topk_indices_ptr,
+-    global_topk_indices_stride: tl.constexpr,
++    global_topk_indices_stride,  # ⛔ 第6轮B1：每 token 变化 ⇒ 降级为运行时标量
+     topk_lens_ptr,
+     topk_indices_ptr,
+-    topk_indices_stride: tl.constexpr,
++    topk_indices_stride,  # ⛔ 第6轮B1：降级为运行时标量（每 token/batch 变化）
+     topk: tl.constexpr,
+     token_to_req_indices_ptr,
+     block_table_ptr,
+-    block_table_stride: tl.constexpr,
++    # ⛔ [xtu 2026-11-01] 跨距 ≠ 常量：它等于 `block_table.stride(0)`，随块表宽度变化。
++    #    作为 constexpr 会让每个宽度各编一份 cubin（同类问题已在 gather/mqa 上修过）。
++    #    降级为运行时标量；调用点已按位置传 `block_table.stride(0)`，无需改调用。
++    block_table_stride,
+     block_size: tl.constexpr,
+     is_valid_token_ptr,
+     TRITON_BLOCK_SIZE: tl.constexpr,
+--- a/vllm/models/deepseek_v41/common/ops/fused_compress_quant_cache.py	2026-11-06 14:37:21.568953379 +0800
++++ b/vllm/models/deepseek_v41/common/ops/fused_compress_quant_cache.py	2026-11-01 21:58:48.922634395 +0800
+@@ -19,9 +19,38 @@
+ # The ring and raw rows a ratio-2 request program pools are not adjacent, so
+ # reading them as one tile means joining two pointers. ROCm's Triton fails to
+ # legalize `tt.join` on pointers, so there the two rows are loaded separately.
+-_JOIN_ROW_PTRS = not current_platform.is_rocm()
++# ⛔ [xtu 2026-11-01 内核资源审计] 极性写反了：`not is_rocm()` 等于把「指针 join」
++#    当成除 ROCm 外**所有**后端（含 XPU / MUSA 等非 NVIDIA Triton）的默认分支，
++#    而那些后端同样可能 legalize 失败 ⇒ 默认落到未验证分支。改为**只对 CUDA 开启**，
++#    其余后端走已验证的「两次独立 load」安全分支（无额外成本证明需求，见 161-181 行）。
++_JOIN_ROW_PTRS = current_platform.is_cuda()
+ 
+ 
++
++# ⛔ [xtu 2026-11-01] 本文件需要 capture 安全的 gate 才能加值域断言。
++#    ⚠️ 这是**第 3 次**因为"用了但没定义"导致 NameError（第 35、46、57 轮），
++#    已加全树检查（scripts/check_helpers_defined.py）防第 4 次。
++_FCC_BND_SEEN: set = set()
++_FCC_BND_CALLS: dict = {}
++
++
++def _bound_check_skip(sig) -> bool:
++    """capture 中或本轮不需校验 ⇒ True（capture 期 `.max()` 属非法操作）。"""
++    try:
++        import torch as _t
++        if _t.cuda.is_current_stream_capturing():
++            return True
++    except Exception:  # noqa: BLE001
++        pass
++    if sig not in _FCC_BND_SEEN:
++        if len(_FCC_BND_SEEN) < 16:
++            _FCC_BND_SEEN.add(sig)
++            _FCC_BND_CALLS[sig] = 1
++            return False
++    _c = _FCC_BND_CALLS.get(sig, 0) + 1
++    _FCC_BND_CALLS[sig] = _c
++    return (_c % 256) != 0
++
+ def fused_save_compress_norm(
+     kv_score: torch.Tensor,
+     positions: torch.Tensor,
+@@ -70,7 +99,14 @@
+     assert latent_out.is_contiguous() and latent_out.dtype == torch.bfloat16
+     assert positions.is_contiguous() and slot_mapping.is_contiguous()
+     # Rows stay 64-byte aligned, as the kernel's tl.multiple_of hint promises.
+-    assert kv_score.stride(0) % 16 == 0
++    # ⛔ [xtu 2026-11-01 审计] 该 stride 会作为 constexpr `RAW_STRIDE` 传进内核
++    #    （108 行），只约束「16 对齐」意味着**任意 16 对齐跨距都会各编一份 cubin**。
++    #    今天唯一调用方（compressor.py:279）的输出恒为连续张量，这里把契约收紧成定值，
++    #    从源头消灭这个特化轴；若将来确有带 padding 的视图，会在此显式失败而不是悄悄多编。
++    assert kv_score.stride(0) == 512 * compress_ratio, (
++        f"RAW_STRIDE 必须是常量 512*compress_ratio，实际 {kv_score.stride(0)}"
++        f"（compress_ratio={compress_ratio}）—— 否则每个新跨距都会新增一份 cubin"
++    )
+     if compress_ratio == 2:
+         assert state_cache is not None and query_start_loc is not None
+         assert token_to_req_indices is not None
+@@ -233,6 +269,12 @@
+     compress_ratio: int,
+     fp8_scale: torch.Tensor | None = None,
+ ) -> None:
++    # ⛔ [xtu 2026-11-01 用户收窄目标] '可疑地址'类：内核把 `slot_mapping` 当裸地址用，
++    #    此前无上界断言。容量推导：内核按 `slot // block_size` 取块 ⇒ 合法上界 = 块数×块大小。
++    if not _bound_check_skip(("addr_rope_quant_insert", int(slot_mapping.numel()))):
++        assert int(slot_mapping.max()) < int(kv_cache.shape[0] * kv_cache.shape[1]), (
++            f"slot_mapping 越界：max={int(slot_mapping.max())} ≥ {int(kv_cache.shape[0] * kv_cache.shape[1])}"
++        )
+     """Apply GPT-J RoPE and publish a latent to the compressed KV cache.
+ 
+     The BF16 latent supplies both NoPE quantization and RoPE input. It is read
+@@ -255,6 +297,20 @@
+         return
+     launch_kwargs = {"launch_pdl": False} if current_platform.is_cuda() else {}
+     if kv_cache.dtype == torch.uint8:
++        # ⛔ [xtu 2026-11-01 内核资源审计] 记录宽度 528 = MXFP8 变体，其内核用
++        #    `tl.clamp(...).to(tl.float8e4nv)` 直写 fp8（417/466/521 行）——
++        #    SM80/SM86 的 Triton 没有 fp8e4nv ⇒ 编译期崩溃。该变体本应只在 SM100
++        #    被配置选中，但**此前没有任何门控保证这一点**。这里显式 fail-fast，
++        #    避免有人在 SM80 上配出 mxfp8 后拿到离根因很远的编译错误。
++        if (
++            kv_cache.shape[-1] == 528
++            and current_platform.is_cuda()
++            and not current_platform.has_device_capability(89)
++        ):
++            raise RuntimeError(
++                "MXFP8 KV 记录宽度 528 需要 Triton fp8e4nv（CUDA SM89+）；"
++                "当前 CUDA 设备不支持。请在 SM80/SM86 上使用 fp8_ds_mla/uint8 布局。"
++            )
+         kernel = {
+             584: _rope_quant_insert_kernel,
+             528: _rope_quant_insert_mxfp8_kernel,
+@@ -475,7 +531,7 @@
+     cache,
+     cache_slots,
+     fp8_scale,
+-    COS_STRIDE: tl.constexpr,
++    COS_STRIDE,  # ⛔ 第6轮B1：由 .stride(0)/.shape[0] 派生 ⇒ 降级为运行时标量
+     CACHE_STRIDE: tl.constexpr,
+     ROW_STRIDE: tl.constexpr,
+     CACHE_BLOCK: tl.constexpr,
+@@ -507,6 +563,9 @@
+     )
+     if STORE_FP8:
+         scaled = row.to(tl.float32) * (1.0 / tl.load(fp8_scale))
+-        tl.store(dst + d, tl.clamp(scaled, -448.0, 448.0).to(tl.float8e4nv))
++        # ⛔ [xtu 2026-11-01 第三方审计] 原实现无条件 `.to(tl.float8e4nv)`：
++        #    SM80/SM86 的 Triton 没有该类型 ⇒ plain-fp8 KV 行在 A100 上直接编译失败。
++        #    同文件 364 行（584 变体）早已改用手写 e4m3 字节编码，这里漏改。
++        tl.store(dst + d, _f32_to_e4m3_uint8(tl.clamp(scaled, -448.0, 448.0)))
+     else:
+         tl.store(dst + d, row)
+--- a/vllm/models/deepseek_v41/common/ops/indexer_k_store.py	2026-11-06 14:37:21.568953379 +0800
++++ b/vllm/models/deepseek_v41/common/ops/indexer_k_store.py	2026-11-01 21:23:23.025518256 +0800
+@@ -29,6 +29,29 @@
+ _HEAD_TILE_SIZE = 16
+ 
+ 
++
++# ⛔ [xtu 2026-11-01] 本文件需要 capture 安全的 gate 才能加值域断言
++_BND_ADDR_SEEN: set = set()
++_BND_ADDR_CALLS: dict = {}
++
++
++def _bound_check_skip(sig) -> bool:
++    """capture 中或本轮不需校验 ⇒ True（capture 期 `.max()` 属非法操作）。"""
++    try:
++        import torch as _t
++        if _t.cuda.is_current_stream_capturing():
++            return True
++    except Exception:  # noqa: BLE001
++        pass
++    if sig not in _BND_ADDR_SEEN:
++        if len(_BND_ADDR_SEEN) < 16:
++            _BND_ADDR_SEEN.add(sig)
++            _BND_ADDR_CALLS[sig] = 1
++            return False
++    _c = _BND_ADDR_CALLS.get(sig, 0) + 1
++    _BND_ADDR_CALLS[sig] = _c
++    return (_c % 256) != 0
++
+ def indexer_k_norm_rope_store(
+     k_pre: torch.Tensor,
+     positions: torch.Tensor,
+@@ -40,6 +63,11 @@
+     compress_ratio: int,
+     use_fp4_cache: bool,
+ ) -> None:
++    # ⛔ [xtu 2026-11-01 用户收窄目标] '可疑地址'类：补上界断言。
++    if not _bound_check_skip(("addr_idxk", int(kv_slot_mapping.numel()))):
++        assert int(kv_slot_mapping.max()) < int(k_cache.shape[0] * k_cache.shape[1]), (
++            f"kv_slot_mapping 越界：max={int(kv_slot_mapping.max())} ≥ {int(k_cache.shape[0] * k_cache.shape[1])}"
++        )
+     """k_norm → RoPE → quant → paged store for indexer keys.
+ 
+     Args:
+--- a/vllm/models/deepseek_v41/nvidia/dspark.py	2026-11-06 14:37:18.772875379 +0800
++++ b/vllm/models/deepseek_v41/nvidia/dspark.py	2026-11-03 01:14:01.734097007 +0800
+@@ -121,17 +121,23 @@
+         run_gemm_rs = maybe_init_gemm_rs(
+             current_vllm_config, self.use_sequence_parallel
+         )
+-        self.layers = nn.ModuleList(
+-            [
+-                DeepseekV4DecoderLayer(
+-                    current_vllm_config,
+-                    prefix=maybe_prefix(prefix, f"layers.{self.num_hidden_layers + i}"),
+-                    topk_indices_buffer=self.topk_indices_buffer,
+-                    run_gemm_rs=run_gemm_rs,
+-                )
+-                for i in range(self.num_dspark_layers)
+-            ]
+-        )
++        if __import__("os").environ.get("XIAOTU_DSPARK_REMOTE", "") not in ("", "0", "false", "False"):
++            # Remote draft: do not construct the three DSpark decoder layers at all.
++            # Their KV/attention and weights live in the GPU0 server process.
++            self.layers = nn.ModuleList([])
++            print("[xtu-remote-model] skipped DSpark decoder layers", flush=True)
++        else:
++            self.layers = nn.ModuleList(
++                [
++                    DeepseekV4DecoderLayer(
++                        current_vllm_config,
++                        prefix=maybe_prefix(prefix, f"layers.{self.num_hidden_layers + i}"),
++                        topk_indices_buffer=self.topk_indices_buffer,
++                        run_gemm_rs=run_gemm_rs,
++                    )
++                    for i in range(self.num_dspark_layers)
++                ]
++            )
+ 
+         # Heads: final norm, and the Markov + confidence heads.
+         # Loaded from the "final" MTP layer weights (mtp.*) in the target
+@@ -373,7 +379,7 @@
+         are skipped here. ``embed_tokens``/``lm_head`` are aliased from the target.
+         """
+         first_layer = self.model.layers[0]
+-        use_native_mega_moe = first_layer.ffn.use_native_mega_moe
++        use_native_mega_moe = getattr(first_layer.ffn, "use_native_mega_moe", False)
+         # Draft MoE layers use the dspark_* expert counts, not the
+         # backbone's (see DeepseekV4MoE and the reference
+         # ModelArgs.get_moe_config).
+--- a/vllm/models/glm5next/nvidia/ops/kpool_compress.py	2026-11-06 14:37:21.640955387 +0800
++++ b/vllm/models/glm5next/nvidia/ops/kpool_compress.py	2026-11-01 21:08:12.758374513 +0800
+@@ -164,7 +164,7 @@
+     slot_score_stride_1,
+     ape_stride_0,
+     PAGE_SIZE: tl.constexpr,
+-    BUF_NUMEL_PER_PAGE: tl.constexpr,
++    BUF_NUMEL_PER_PAGE,  # ⛔ 第6轮B1/第13轮：由 buf.stride(0) 中转而来 ⇒ 降级为运行时标量
+     POOL_SIZE: tl.constexpr,
+     HEAD_DIM: tl.constexpr,
+     S_OFFSET_NBYTES_IN_PAGE: tl.constexpr,
+@@ -491,7 +491,7 @@
+     positions_ptr,  # [B, NEXT_N] int32
+     NEXT_N,  # runtime token count per request (no .item() needed)
+     PAGE_SIZE: tl.constexpr,
+-    BUF_NUMEL_PER_PAGE: tl.constexpr,
++    BUF_NUMEL_PER_PAGE,  # ⛔ 第6轮B1：由 .stride(0)/.shape[0] 派生 ⇒ 降级为运行时标量
+     POOL_SIZE: tl.constexpr,
+     RING: tl.constexpr,
+     TAIL_BLOCK_ELEMS: tl.constexpr,
+@@ -818,9 +818,10 @@
+ 
+     rows, n_cols = topk_result.shape
+     out_cols = n_cols + tail_pool
+-    out = torch.empty(
+-        (rows, out_cols), dtype=topk_result.dtype, device=topk_result.device
+-    )
++    # ⛔ [xtu 2026-11-01 内核资源审计] 这里原有一处 `torch.empty((rows, out_cols))`，
++    #    但 `out` 随后被下面的两个 `torch.where` **整体重新赋值**（见函数末尾），
++    #    初值从未被读取 ⇒ 纯死分配，每次调用白分配 rows*(n_cols+tail_pool)*4B。
++    #    删除分配，`out` 直接由第一个 where 产生。
+ 
+     # tail tokens: [pool_len*pool_size, seq_len) for each row.
+     pool_len = pool_lens.to(torch.int32)
+--- a/vllm/v1/attention/backends/mla/flashmla_sparse_sm8x.py	2026-11-06 14:37:21.704957172 +0800
++++ b/vllm/v1/attention/backends/mla/flashmla_sparse_sm8x.py	2026-11-01 20:00:49.776229970 +0800
+@@ -179,7 +179,12 @@
+             chunk_workspace[:rows],
+             dst_rows,
+             kv_c_and_k_pe_cache.shape[1],
+-            kv_c_and_k_pe_cache.stride(0),
++            # ⛔ [xtu 2026-11-01 第三方审计 F4·CRITICAL] 原为 `stride(0)`（**页跨距** =
++            #    block_size × 行字节），而 `gather_dequant_fp8ds_nope` 把它当**行跨距**用
++            #    （`block_idx*block_size*entry_stride + pos*entry_stride`）⇒ 除 block0/pos0
++            #    以外每行的取数地址都错到 page 倍数之外（静默错数 + IMA 风险）。
++            #    正确值是 `stride(1)`（同文件另一处调用传的就是它）。
++            kv_c_and_k_pe_cache.stride(1),
+         )
+ 
+     def _convert_logical_to_physical_topk(
+@@ -232,12 +237,12 @@
+         output = q.new_empty((num_tokens, q.shape[1], head_dim), dtype=q.dtype)
+         _ = out
+         if topk_length is None:
+-            topk_length = torch.full(
+-                (num_tokens,),
+-                topk_indices.shape[-1],
+-                dtype=torch.int32,
+-                device=q.device,
+-            )
++            # ⛔ [xtu 2026-11-01 第三方审计 · 正确性缺陷] 原实现把 `topk_length` 取成
++            #    **满 top-k 宽度**，而 `:146-149` 把无效槽置为 -1（`dst_rows = where(idx>=0, .., -1)`）。
++            #    稀疏 MLA 内核随后 `row_safe = where(k_mask, maximum(row,0), 0)`，只按
++            #    `k_mask` 屏蔽 —— 于是每个 `-1` 填充槽都会被当作 gather 表**第 0 行**
++            #    参与 softmax（静默错数）。正确做法：按"有效槽数"给长度。
++            topk_length = (topk_indices >= 0).sum(dim=-1).to(torch.int32)
+         # GLM-5.3 / V3.2 MLA carries no attention sink (``has_sink=False``, as on
+         # the sm120 flashinfer path). The sink-aware kernel folds the sink in as a
+         # pseudo-key with logit ``attn_sink`` and zero value, so "no sink" must be
+--- a/vllm/v1/attention/backends/mla/indexer.py	2026-11-06 14:37:21.540952598 +0800
++++ b/vllm/v1/attention/backends/mla/indexer.py	2026-11-01 21:28:26.632750906 +0800
+@@ -55,6 +55,30 @@
+ DSA_INDEXER_KV_DTYPES = ("fp8", "mxfp4")
+ 
+ 
++
++# ⛔ [xtu 2026-11-01 第12轮] 本文件需要 capture 安全的 gate 才能加值域断言
++#    （`_bt_bound_skip` 只定义在 sparse_mla_kernels.py，**不能**直接调用 —— 曾因此 NameError）。
++_MQA_BOUND_SEEN: set = set()
++_MQA_BOUND_CALLS: dict = {}
++
++
++def _bt_bound_skip(sig) -> bool:
++    """capture 中或本轮不需校验 ⇒ True（capture 期 `.max()` 属非法操作）。"""
++    try:
++        import torch as _t
++        if _t.cuda.is_current_stream_capturing():
++            return True
++    except Exception:  # noqa: BLE001
++        pass
++    if sig not in _MQA_BOUND_SEEN:
++        if len(_MQA_BOUND_SEEN) < 16:
++            _MQA_BOUND_SEEN.add(sig)
++            _MQA_BOUND_CALLS[sig] = 1
++            return False
++    _c = _MQA_BOUND_CALLS.get(sig, 0) + 1
++    _MQA_BOUND_CALLS[sig] = _c
++    return (_c % 256) != 0
++
+ def dsa_indexer_uses_fp4(vllm_config: VllmConfig) -> bool:
+     """Whether the DeepSeek sparse indexer should use the MXFP4 K cache."""
+     kv_dtype = vllm_config.attention_config.resolve_indexer_kv_dtype("fp8")
+@@ -730,12 +754,30 @@
+     kpool: int,
+     out: torch.Tensor | None = None,
+ ) -> torch.Tensor:
++    if not _bt_bound_skip(("kpool_bt", int(block_table.shape[-1]))):
++        assert int(block_table.max()) < int(kpool.shape[0]), (
++            f"block id 越界：max={int(block_table.max())} ≥ kpool.shape[0]={int(kpool.shape[0])}"
++        )
++    # ⛔ [xtu 2026-11-01 第12轮] slot/块表取值上界（下界断言不算）。
++    if not _bt_bound_skip(("kpool_slot", int(slot_mapping.numel()))):
++        assert int(slot_mapping.max()) < int(kpool.shape[0]), (
++            f"slot 越界：max={int(slot_mapping.max())} ≥ kpool.shape[0]={int(kpool.shape[0])}"
++        )
+     """Map every token to its request's one circular tail block."""
+     if out is None:
+         out = torch.empty_like(slot_mapping)
+     else:
+         assert out.shape == slot_mapping.shape
+     if slot_mapping.is_cuda and slot_mapping.dim() == 1 and num_reqs > 0:
++        # ⛔ [xtu 2026-11-01 机械门禁 C4] 内核按 `pid * block_table_stride` 读块表（无 mask）
++        #    ⇒ 必须保证块表行数覆盖 num_reqs、且行内连续。
++        assert block_table.dim() == 2 and block_table.stride(1) == 1, (
++            f"block_table 必须是行内连续的二维表：dim={block_table.dim()} "
++            f"stride(1)={block_table.stride(1) if block_table.dim() == 2 else 'n/a'}"
++        )
++        assert block_table.shape[0] >= int(num_reqs), (
++            f"block_table 行数 {block_table.shape[0]} < num_reqs {num_reqs}（内核按 pid 取行）"
++        )
+         block = 256
+         num_tokens = slot_mapping.shape[0]
+         num_actual_tokens = min(num_actual_tokens, num_tokens)
+@@ -1526,6 +1568,10 @@
+                 global_seq_lens_for_decode = common_attn_metadata.seq_lens[:num_decodes]
+             seq_lens = common_attn_metadata.seq_lens[:num_decodes]
+             block_table = common_attn_metadata.block_table_tensor[:num_decodes, ...]
++            # ⛔ [xtu 2026-11-01 第11轮] 内核按 block_table 行索引裸寻址；行维上界来自上面的切片，此前无断言。
++            assert block_table.shape[0] >= num_decodes, (
++                f"block_table 行数 {block_table.shape[0]} < num_decodes {num_decodes}"
++            )
+ 
+             max_decode_len = int(decode_lens_cpu.max().item())
+             min_decode_len = int(decode_lens_cpu.min().item())
+@@ -1565,6 +1611,10 @@
+                     num_decodes,
+                     num_decode_tokens + triton.cdiv(capacity - num_decode_tokens, 256),
+                 )
++                assert block_table.shape[1] <= self.expanded_block_table_buffer.shape[1], (
++                    f"block_table 列数 {block_table.shape[1]} > 扩展缓冲列数 "
++                    f"{self.expanded_block_table_buffer.shape[1]}"
++                )
+                 _indexer_decode_metadata_kernel[(grid,)](
+                     query_start_loc,
+                     seq_lens,
+@@ -1595,7 +1645,7 @@
+                         :num_decode_tokens
+                     ]
+             else:
+-                seq_lens, block_table, decode_lens, batch_size, requires_padding = (
++                seq_lens, block_table, decode_lens, _, requires_padding = (
+                     self._prepare_decode_tensors(
+                         seq_lens=seq_lens,
+                         block_table=block_table,
+--- a/vllm/v1/attention/backends/mla/sparse_mla_kernels.py	2026-11-06 14:37:21.704957172 +0800
++++ b/vllm/v1/attention/backends/mla/sparse_mla_kernels.py	2026-11-04 15:33:43.518634407 +0800
+@@ -14,6 +14,28 @@
+ )
+ 
+ 
++_BT_BOUND_SEEN: set = set()
++_BT_BOUND_CALLS: dict = {}
++
++
++def _bt_bound_skip(sig) -> bool:
++    """capture 中或该签名本轮不需校验 ⇒ True（capture 期 `.max()` 属非法操作）。"""
++    try:
++        import torch as _t
++        if _t.cuda.is_current_stream_capturing():
++            return True
++    except Exception:  # noqa: BLE001
++        pass
++    if sig not in _BT_BOUND_SEEN:
++        if len(_BT_BOUND_SEEN) < 16:
++            _BT_BOUND_SEEN.add(sig)
++            _BT_BOUND_CALLS[sig] = 1
++            return False
++    _c = _BT_BOUND_CALLS.get(sig, 0) + 1
++    _BT_BOUND_CALLS[sig] = _c
++    return (_c % 256) != 0
++
++
+ def sparse_mla_decode_head_block_size(num_decode_tokens: int) -> int:
+     """Choose the SM12x sparse MLA head grouping for decode kernels.
+ 
+@@ -40,17 +62,17 @@
+     lse1_ptr,
+     sink_ptr,
+     output_ptr,
+-    stride_out0_t: tl.constexpr,
++    stride_out0_t,  # ⛔ 第6轮B1：每 token 变化 ⇒ 降级为运行时标量
+     stride_out0_h: tl.constexpr,
+     stride_out0_d: tl.constexpr,
+-    stride_lse0_t: tl.constexpr,
++    stride_lse0_t,  # ⛔ 第6轮B1：由 .stride(0)/.shape[0] 派生 ⇒ 降级为运行时标量
+     stride_lse0_h: tl.constexpr,
+-    stride_out1_t: tl.constexpr,
++    stride_out1_t,  # ⛔ 第6轮B1：每 token 变化 ⇒ 降级为运行时标量
+     stride_out1_h: tl.constexpr,
+     stride_out1_d: tl.constexpr,
+-    stride_lse1_t: tl.constexpr,
++    stride_lse1_t,  # ⛔ 第6轮B1：由 .stride(0)/.shape[0] 派生 ⇒ 降级为运行时标量
+     stride_lse1_h: tl.constexpr,
+-    stride_output_t: tl.constexpr,
++    stride_output_t,  # ⛔ 第6轮B1：每 token 变化 ⇒ 降级为运行时标量
+     stride_output_h: tl.constexpr,
+     stride_output_d: tl.constexpr,
+     num_heads: tl.constexpr,
+@@ -154,12 +176,12 @@
+     subset_lse_ptr,
+     sink_ptr,
+     output_ptr,
+-    stride_subset_t: tl.constexpr,
++    stride_subset_t,  # ⛔ 第6轮B1：每 token 变化 ⇒ 降级为运行时标量
+     stride_subset_h: tl.constexpr,
+     stride_subset_d: tl.constexpr,
+-    stride_lse_t: tl.constexpr,
++    stride_lse_t,  # ⛔ 第6轮B1：由 .stride(0)/.shape[0] 派生 ⇒ 降级为运行时标量
+     stride_lse_h: tl.constexpr,
+-    stride_output_t: tl.constexpr,
++    stride_output_t,  # ⛔ 第6轮B1：每 token 变化 ⇒ 降级为运行时标量
+     stride_output_h: tl.constexpr,
+     stride_output_d: tl.constexpr,
+     num_heads: tl.constexpr,
+@@ -244,10 +266,10 @@
+     slot_ids_ptr,
+     topk_lens_ptr,
+     swa_lens_ptr,
+-    stride_output_t: tl.constexpr,
++    stride_output_t,  # ⛔ 第6轮B1：每 token 变化 ⇒ 降级为运行时标量
+     stride_output_c: tl.constexpr,
+-    stride_slot_t: tl.constexpr,
+-    stride_slot_c: tl.constexpr,
++    stride_slot_t,  # ⛔ 第6轮 B1：降级为运行时标量（constexpr 时 do_not_specialize 无效）
++    stride_slot_c: tl.constexpr,  # 固定 head 维跨距（配置常量）
+     num_compressed_candidates: tl.constexpr,
+     num_candidates: tl.constexpr,
+     BLOCK_C: tl.constexpr,
+@@ -395,15 +417,15 @@
+     valid_tokens_ptr,
+     attn_sink_ptr,
+     output_ptr,
+-    stride_scores_t: tl.constexpr,
++    stride_scores_t,  # ⛔ 第6轮B1：由 .stride(0)/.shape[0] 派生 ⇒ 降级为运行时标量
+     stride_scores_h: tl.constexpr,
+     stride_scores_c: tl.constexpr,
+-    stride_kv_t: tl.constexpr,
+-    stride_kv_c: tl.constexpr,
+-    stride_kv_d: tl.constexpr,
+-    stride_valid_t: tl.constexpr,
++    stride_kv_t,  # ⛔ 第6轮 B1：降级为运行时标量（constexpr 时 do_not_specialize 无效）
++    stride_kv_c: tl.constexpr,  # 固定 head 维跨距（配置常量）
++    stride_kv_d: tl.constexpr,  # 固定 head 维跨距（配置常量）
++    stride_valid_t,  # ⛔ 第6轮B1：由 .stride(0)/.shape[0] 派生 ⇒ 降级为运行时标量
+     stride_valid_c: tl.constexpr,
+-    stride_out_t: tl.constexpr,
++    stride_out_t,  # ⛔ 第6轮B1：每 token 变化 ⇒ 降级为运行时标量
+     stride_out_h: tl.constexpr,
+     stride_out_d: tl.constexpr,
+     num_heads: tl.constexpr,
+@@ -477,15 +499,15 @@
+     valid_tokens_ptr,
+     attn_sink_ptr,
+     output_ptr,
+-    stride_scores_t: tl.constexpr,
++    stride_scores_t,  # ⛔ 第6轮B1：由 .stride(0)/.shape[0] 派生 ⇒ 降级为运行时标量
+     stride_scores_h: tl.constexpr,
+     stride_scores_c: tl.constexpr,
+-    stride_kv_t: tl.constexpr,
++    stride_kv_t,  # ⛔ 第6轮B1：降级为运行时标量（每 token/batch 变化）
+     stride_kv_c: tl.constexpr,
+-    stride_kv_d: tl.constexpr,
+-    stride_valid_t: tl.constexpr,
++    stride_kv_d: tl.constexpr,  # 固定 head 维跨距（配置常量）
++    stride_valid_t,  # ⛔ 第6轮B1：由 .stride(0)/.shape[0] 派生 ⇒ 降级为运行时标量
+     stride_valid_c: tl.constexpr,
+-    stride_out_t: tl.constexpr,
++    stride_out_t,  # ⛔ 第6轮B1：每 token 变化 ⇒ 降级为运行时标量
+     stride_out_h: tl.constexpr,
+     stride_out_d: tl.constexpr,
+     head_dim: tl.constexpr,
+@@ -566,15 +588,15 @@
+     valid_tokens_ptr,
+     attn_sink_ptr,
+     output_ptr,
+-    stride_scores_t: tl.constexpr,
++    stride_scores_t,  # ⛔ 第6轮B1：由 .stride(0)/.shape[0] 派生 ⇒ 降级为运行时标量
+     stride_scores_h: tl.constexpr,
+     stride_scores_c: tl.constexpr,
+-    stride_kv_t: tl.constexpr,
++    stride_kv_t,  # ⛔ 第6轮B1：降级为运行时标量（每 token/batch 变化）
+     stride_kv_c: tl.constexpr,
+-    stride_kv_d: tl.constexpr,
+-    stride_valid_t: tl.constexpr,
++    stride_kv_d: tl.constexpr,  # 固定 head 维跨距（配置常量）
++    stride_valid_t,  # ⛔ 第6轮B1：由 .stride(0)/.shape[0] 派生 ⇒ 降级为运行时标量
+     stride_valid_c: tl.constexpr,
+-    stride_out_t: tl.constexpr,
++    stride_out_t,  # ⛔ 第6轮B1：每 token 变化 ⇒ 降级为运行时标量
+     stride_out_h: tl.constexpr,
+     stride_out_d: tl.constexpr,
+     head_dim: tl.constexpr,
+@@ -782,19 +804,19 @@
+     max_score_ptr,
+     denom_ptr,
+     acc_ptr,
+-    stride_q_t: tl.constexpr,
+-    stride_q_h: tl.constexpr,
+-    stride_q_d: tl.constexpr,
+-    stride_kv_t: tl.constexpr,
++    stride_q_t,  # ⛔ 第6轮 B1：降级为运行时标量（constexpr 时 do_not_specialize 无效）
++    stride_q_h: tl.constexpr,  # 固定 head 维跨距（配置常量）
++    stride_q_d: tl.constexpr,  # 固定 head 维跨距（配置常量）
++    stride_kv_t,  # ⛔ 第6轮B1：降级为运行时标量（每 token/batch 变化）
+     stride_kv_c: tl.constexpr,
+     stride_kv_d: tl.constexpr,
+-    stride_slot_t: tl.constexpr,
++    stride_slot_t,  # ⛔ 第6轮B1：降级为运行时标量（每 token/batch 变化）
+     stride_slot_c: tl.constexpr,
+-    stride_state_t: tl.constexpr,
+-    stride_state_h: tl.constexpr,
+-    stride_acc_t: tl.constexpr,
+-    stride_acc_h: tl.constexpr,
+-    stride_acc_d: tl.constexpr,
++    stride_state_t,  # ⛔ 第6轮 B1：降级为运行时标量（constexpr 时 do_not_specialize 无效）
++    stride_state_h: tl.constexpr,  # 固定 head 维跨距（配置常量）
++    stride_acc_t,  # ⛔ 第6轮 B1：降级为运行时标量（constexpr 时 do_not_specialize 无效）
++    stride_acc_h: tl.constexpr,  # 固定 head 维跨距（配置常量）
++    stride_acc_d: tl.constexpr,  # 固定 head 维跨距（配置常量）
+     num_heads: tl.constexpr,
+     head_dim: tl.constexpr,
+     num_candidates,
+@@ -873,6 +895,23 @@
+     candidate_offset: int = 0,
+     slot_ids: torch.Tensor | None = None,
+ ) -> None:
++    # ⛔ [xtu 2026-11-01 第10轮审计裁定] 本内核**不把 slot_id 当地址**：
++    #    内核体内只有 `is_valid = slot_id >= 0` 的判定（kv 已在调用前 gather 完毕），
++    #    不存在"slot_id 越界 → 裸地址访存"的路径 ⇒ 站点本身无 C4 风险。
++    #    另：全树零调用（仅此定义），属死代码候选。
++    # ⛔ [xtu 2026-11-01 第11轮] 该内核只把 slot_id 用作 `is_valid = slot_id >= 0`（不作地址），
++    #    但本宿主仍须声明 slot_ids 与已 gather 的 kv 的容量关系（廉价、无设备规约）。
++    # ⛔ [xtu 2026-11-01 修正] 原写 `slot_ids.numel() <= kv.numel()` 是**量纲错误**
++    #    （条目数 vs 元素数）⇒ 真机启动时误报并打挂服务，已删除。
++    #    [xtu 2026-11-04] 改为**结构契约**：slot_ids 若给出，其 (token, candidate) 维必须与 kv 对齐
++    #    —— 内核按 `slot_id >= 0` 逐个取用，维度对不上会读到错位元素（真实风险），
++    #    且这是**恒真于正确调用**的检查，不会像量纲错误那样误杀。
++    if slot_ids is not None:
++        assert slot_ids.shape[0] == kv.shape[0] and slot_ids.shape[1] == kv.shape[1], (
++            f"slot_ids 形状 {tuple(slot_ids.shape[:2])} 与 kv 前两维 "
++            f"{tuple(kv.shape[:2])} 不一致"
++        )
++
+     if q.dim() == 4:
+         assert q.shape[1] == 1
+         q = q[:, 0]
+@@ -954,18 +993,18 @@
+     max_score_ptr,
+     denom_ptr,
+     acc_ptr,
+-    stride_q_t: tl.constexpr,
+-    stride_q_h: tl.constexpr,
+-    stride_q_d: tl.constexpr,
++    stride_q_t,  # ⛔ 第6轮 B1：降级为运行时标量（constexpr 时 do_not_specialize 无效）
++    stride_q_h: tl.constexpr,  # 固定 head 维跨距（配置常量）
++    stride_q_d: tl.constexpr,  # 固定 head 维跨距（配置常量）
+     stride_kv_t,
+     stride_kv_d: tl.constexpr,
+-    stride_indices_t: tl.constexpr,
+-    stride_indices_c: tl.constexpr,
+-    stride_state_t: tl.constexpr,
+-    stride_state_h: tl.constexpr,
+-    stride_acc_t: tl.constexpr,
+-    stride_acc_h: tl.constexpr,
+-    stride_acc_d: tl.constexpr,
++    stride_indices_t,  # ⛔ 第6轮 B1：降级为运行时标量（constexpr 时 do_not_specialize 无效）
++    stride_indices_c: tl.constexpr,  # 固定 head 维跨距（配置常量）
++    stride_state_t,  # ⛔ 第6轮 B1：降级为运行时标量（constexpr 时 do_not_specialize 无效）
++    stride_state_h: tl.constexpr,  # 固定 head 维跨距（配置常量）
++    stride_acc_t,  # ⛔ 第6轮 B1：降级为运行时标量（constexpr 时 do_not_specialize 无效）
++    stride_acc_h: tl.constexpr,  # 固定 head 维跨距（配置常量）
++    stride_acc_d: tl.constexpr,  # 固定 head 维跨距（配置常量）
+     num_heads: tl.constexpr,
+     head_dim: tl.constexpr,
+     num_candidates,
+@@ -1050,18 +1089,18 @@
+     max_score_ptr,
+     denom_ptr,
+     acc_ptr,
+-    stride_q_t: tl.constexpr,
+-    stride_q_h: tl.constexpr,
+-    stride_q_d: tl.constexpr,
++    stride_q_t,  # ⛔ 第6轮 B1：降级为运行时标量（constexpr 时 do_not_specialize 无效）
++    stride_q_h: tl.constexpr,  # 固定 head 维跨距（配置常量）
++    stride_q_d: tl.constexpr,  # 固定 head 维跨距（配置常量）
+     stride_kv_t,
+     stride_kv_d: tl.constexpr,
+-    stride_indices_t: tl.constexpr,
+-    stride_indices_c: tl.constexpr,
+-    stride_state_t: tl.constexpr,
+-    stride_state_h: tl.constexpr,
+-    stride_acc_t: tl.constexpr,
+-    stride_acc_h: tl.constexpr,
+-    stride_acc_d: tl.constexpr,
++    stride_indices_t,  # ⛔ 第6轮 B1：降级为运行时标量（constexpr 时 do_not_specialize 无效）
++    stride_indices_c: tl.constexpr,  # 固定 head 维跨距（配置常量）
++    stride_state_t,  # ⛔ 第6轮 B1：降级为运行时标量（constexpr 时 do_not_specialize 无效）
++    stride_state_h: tl.constexpr,  # 固定 head 维跨距（配置常量）
++    stride_acc_t,  # ⛔ 第6轮 B1：降级为运行时标量（constexpr 时 do_not_specialize 无效）
++    stride_acc_h: tl.constexpr,  # 固定 head 维跨距（配置常量）
++    stride_acc_d: tl.constexpr,  # 固定 head 维跨距（配置常量）
+     num_heads: tl.constexpr,
+     head_dim: tl.constexpr,
+     num_candidates,
+@@ -1278,19 +1317,19 @@
+     max_score_ptr,
+     denom_ptr,
+     acc_ptr,
+-    stride_q_t: tl.constexpr,
++    stride_q_t,  # ⛔ 第6轮B1：降级为运行时标量（每 token/batch 变化）
+     stride_q_h: tl.constexpr,
+     stride_q_d: tl.constexpr,
+-    stride_slot_t: tl.constexpr,
++    stride_slot_t,  # ⛔ 第6轮B1：降级为运行时标量（每 token/batch 变化）
+     stride_slot_c: tl.constexpr,
+-    stride_state_t: tl.constexpr,
++    stride_state_t,  # ⛔ 第6轮B1：降级为运行时标量（每 token/batch 变化）
+     stride_state_h: tl.constexpr,
+-    stride_acc_t: tl.constexpr,
++    stride_acc_t,  # ⛔ 第6轮B1：降级为运行时标量（每 token/batch 变化）
+     stride_acc_h: tl.constexpr,
+     stride_acc_d: tl.constexpr,
+     cache_block_size: tl.constexpr,
+     token_data_size: tl.constexpr,
+-    block_stride: tl.constexpr,
++    block_stride,  # ⛔ 第6轮B1：由 .stride(0)/.shape[0] 派生 ⇒ 降级为运行时标量
+     fp8_dim: tl.constexpr,
+     scale_dim: tl.constexpr,
+     quant_block: tl.constexpr,
+@@ -1393,6 +1432,15 @@
+     acc: torch.Tensor,
+     candidate_offset: int = 0,
+ ) -> None:
++    # ⛔ [xtu 2026-11-01 修正] 内核按 slot 裸地址取页（无 mask）⇒ 主机侧取值上界契约。
++    #    旧版写的是 `slot_ids.numel() <= k_cache.shape[0] * block_size` —— **量纲错误**
++    #    （条目数 vs 索引空间），批量一大必失败；且 f-string 用 `{{}}` 成了字面量、从未真正报错。
++    #    ⇒ 改为**取值**上界，并在 capture 期跳过（capture 期 `.max()` 属非法操作）。
++    if not _bt_bound_skip(("smk_slot", int(slot_ids.numel()))):
++        _cap = int(k_cache.shape[0]) * int(block_size)
++        assert int(slot_ids.max()) < _cap, (
++            f"slot 越界：max={int(slot_ids.max())} ≥ 容量 {_cap}"
++        )
+     if q.dim() == 4:
+         assert q.shape[1] == 1
+         q = q[:, 0]
+@@ -1461,7 +1509,7 @@
+     )
+ 
+ 
+-@triton.jit
++@triton.jit(do_not_specialize=["stride_slot_t", "stride_state_t", "stride_acc_t"])
+ def _accumulate_fp8ds_global_slots_attention_chunk_multihead_kernel(
+     q_ptr,
+     k_cache_ptr,
+@@ -1470,19 +1518,19 @@
+     max_score_ptr,
+     denom_ptr,
+     acc_ptr,
+-    stride_q_t: tl.constexpr,
++    stride_q_t,  # ⛔ 第6轮B1：降级为运行时标量（每 token/batch 变化）
+     stride_q_h: tl.constexpr,
+     stride_q_d: tl.constexpr,
+-    stride_slot_t: tl.constexpr,
++    stride_slot_t,  # ⛔ 第6轮审计B1：曾为 tl.constexpr；do_not_specialize 对 constexpr **无效**（Triton 3.7.1 jit.py:399-403），故降级为运行时标量。仅用于索引算术。
+     stride_slot_c: tl.constexpr,
+-    stride_state_t: tl.constexpr,
++    stride_state_t,  # ⛔ 第6轮审计B1：曾为 tl.constexpr；do_not_specialize 对 constexpr **无效**（Triton 3.7.1 jit.py:399-403），故降级为运行时标量。仅用于索引算术。
+     stride_state_h: tl.constexpr,
+-    stride_acc_t: tl.constexpr,
++    stride_acc_t,  # ⛔ 第6轮审计B1：曾为 tl.constexpr；do_not_specialize 对 constexpr **无效**（Triton 3.7.1 jit.py:399-403），故降级为运行时标量。仅用于索引算术。
+     stride_acc_h: tl.constexpr,
+     stride_acc_d: tl.constexpr,
+     cache_block_size: tl.constexpr,
+     token_data_size: tl.constexpr,
+-    block_stride: tl.constexpr,
++    block_stride,  # ⛔ 第6轮B1：由 .stride(0)/.shape[0] 派生 ⇒ 降级为运行时标量
+     fp8_dim: tl.constexpr,
+     scale_dim: tl.constexpr,
+     quant_block: tl.constexpr,
+@@ -1608,6 +1656,15 @@
+     candidate_offset: int = 0,
+     head_block_size: int = 2,
+ ) -> None:
++    # ⛔ [xtu 2026-11-01 修正] 内核按 slot 裸地址取页（无 mask）⇒ 主机侧取值上界契约。
++    #    旧版写的是 `slot_ids.numel() <= k_cache.shape[0] * block_size` —— **量纲错误**
++    #    （条目数 vs 索引空间），批量一大必失败；且 f-string 用 `{{}}` 成了字面量、从未真正报错。
++    #    ⇒ 改为**取值**上界，并在 capture 期跳过（capture 期 `.max()` 属非法操作）。
++    if not _bt_bound_skip(("smk_slot", int(slot_ids.numel()))):
++        _cap = int(k_cache.shape[0]) * int(block_size)
++        assert int(slot_ids.max()) < _cap, (
++            f"slot 越界：max={int(slot_ids.max())} ≥ 容量 {_cap}"
++        )
+     if q.dim() == 4:
+         assert q.shape[1] == 1
+         q = q[:, 0]
+@@ -1685,14 +1742,14 @@
+     indices_ptr,
+     lens_ptr,
+     scores_ptr,
+-    stride_q_t: tl.constexpr,
++    stride_q_t,  # ⛔ 第6轮B1：降级为运行时标量（每 token/batch 变化）
+     stride_q_h: tl.constexpr,
+     stride_q_d: tl.constexpr,
+     stride_kv_t,
+     stride_kv_d: tl.constexpr,
+-    stride_indices_t: tl.constexpr,
++    stride_indices_t,  # ⛔ 第6轮B1：由 .stride(0)/.shape[0] 派生 ⇒ 降级为运行时标量
+     stride_indices_c: tl.constexpr,
+-    stride_scores_t: tl.constexpr,
++    stride_scores_t,  # ⛔ 第6轮B1：由 .stride(0)/.shape[0] 派生 ⇒ 降级为运行时标量
+     stride_scores_h: tl.constexpr,
+     stride_scores_c: tl.constexpr,
+     num_heads: tl.constexpr,
+@@ -1754,10 +1811,10 @@
+     lens_ptr,
+     max_score_ptr,
+     denom_ptr,
+-    stride_scores_t: tl.constexpr,
++    stride_scores_t,  # ⛔ 第6轮B1：由 .stride(0)/.shape[0] 派生 ⇒ 降级为运行时标量
+     stride_scores_h: tl.constexpr,
+     stride_scores_c: tl.constexpr,
+-    stride_state_t: tl.constexpr,
++    stride_state_t,  # ⛔ 第6轮B1：降级为运行时标量（每 token/batch 变化）
+     stride_state_h: tl.constexpr,
+     num_candidates: tl.constexpr,
+     BLOCK_C: tl.constexpr,
+@@ -1798,16 +1855,16 @@
+     lens_ptr,
+     max_score_ptr,
+     acc_ptr,
+-    stride_scores_t: tl.constexpr,
++    stride_scores_t,  # ⛔ 第6轮B1：由 .stride(0)/.shape[0] 派生 ⇒ 降级为运行时标量
+     stride_scores_h: tl.constexpr,
+     stride_scores_c: tl.constexpr,
+     stride_kv_t,
+     stride_kv_d: tl.constexpr,
+-    stride_indices_t: tl.constexpr,
++    stride_indices_t,  # ⛔ 第6轮B1：由 .stride(0)/.shape[0] 派生 ⇒ 降级为运行时标量
+     stride_indices_c: tl.constexpr,
+-    stride_state_t: tl.constexpr,
++    stride_state_t,  # ⛔ 第6轮B1：降级为运行时标量（每 token/batch 变化）
+     stride_state_h: tl.constexpr,
+-    stride_acc_t: tl.constexpr,
++    stride_acc_t,  # ⛔ 第6轮B1：降级为运行时标量（每 token/batch 变化）
+     stride_acc_h: tl.constexpr,
+     stride_acc_d: tl.constexpr,
+     num_heads: tl.constexpr,
+@@ -2010,9 +2067,9 @@
+     acc_ptr,
+     chunk_max_score_ptr,
+     chunk_acc_ptr,
+-    stride_state_t: tl.constexpr,
++    stride_state_t,  # ⛔ 第6轮B1：降级为运行时标量（每 token/batch 变化）
+     stride_state_h: tl.constexpr,
+-    stride_acc_t: tl.constexpr,
++    stride_acc_t,  # ⛔ 第6轮B1：降级为运行时标量（每 token/batch 变化）
+     stride_acc_h: tl.constexpr,
+     stride_acc_d: tl.constexpr,
+     num_heads: tl.constexpr,
+@@ -2079,7 +2136,7 @@
+     denom_ptr,
+     chunk_max_score_ptr,
+     chunk_denom_ptr,
+-    stride_state_t: tl.constexpr,
++    stride_state_t,  # ⛔ 第6轮B1：降级为运行时标量（每 token/batch 变化）
+     stride_state_h: tl.constexpr,
+     num_heads: tl.constexpr,
+ ):
+@@ -2257,18 +2314,18 @@
+     max_score_ptr,
+     denom_ptr,
+     acc_ptr,
+-    stride_q_t: tl.constexpr,
++    stride_q_t,  # ⛔ 第6轮B1：降级为运行时标量（每 token/batch 变化）
+     stride_q_h: tl.constexpr,
+     stride_q_d: tl.constexpr,
+     stride_block_table_t,
+-    stride_state_t: tl.constexpr,
++    stride_state_t,  # ⛔ 第6轮B1：降级为运行时标量（每 token/batch 变化）
+     stride_state_h: tl.constexpr,
+-    stride_acc_t: tl.constexpr,
++    stride_acc_t,  # ⛔ 第6轮B1：降级为运行时标量（每 token/batch 变化）
+     stride_acc_h: tl.constexpr,
+     stride_acc_d: tl.constexpr,
+     cache_block_size: tl.constexpr,
+     token_data_size: tl.constexpr,
+-    block_stride: tl.constexpr,
++    block_stride,  # ⛔ 第6轮B1：由 .stride(0)/.shape[0] 派生 ⇒ 降级为运行时标量
+     fp8_dim: tl.constexpr,
+     scale_dim: tl.constexpr,
+     quant_block: tl.constexpr,
+@@ -2373,6 +2430,19 @@
+     candidate_offset: int,
+     num_candidates: int,
+ ) -> None:
++    if not _bt_bound_skip(("b", int(block_table.shape[-1]))):
++        assert int(block_table.max()) < int(k_cache.shape[0]) * int(block_size), (
++            f"越界：max={{int(block_table.max())}} ≥ {{int(k_cache.shape[0])}}*{{int(block_size)}}"
++        )
++    # ⛔ [xtu 2026-11-01] 内核按块表裸地址取页（无 mask）⇒ 主机侧契约（无设备规约、capture 安全）。
++    assert block_table.shape[-1] > 0, "块表列数必须 > 0（内核按宽度算行指针）"
++    assert block_table.stride(0) == block_table.shape[-1], "块表必须行内连续"
++    # ⛔ [xtu 2026-11-01 第6轮审计 C4] 块表裸地址取页（无 mask）⇒ 主机侧廉价契约（无设备规约）。
++    assert block_table.dim() == 2 and block_table.stride(1) == 1, (
++        f"block_table 必须是行内连续二维块表：dim={block_table.dim()}"
++    )
++    if block_table.shape[1] <= 0:
++        raise AssertionError("block_table 列数为 0")
+     if q.dim() == 4:
+         assert q.shape[1] == 1
+         q = q[:, 0]
+@@ -2448,18 +2518,18 @@
+     max_score_ptr,
+     denom_ptr,
+     acc_ptr,
+-    stride_q_t: tl.constexpr,
++    stride_q_t,  # ⛔ 第6轮B1：降级为运行时标量（每 token/batch 变化）
+     stride_q_h: tl.constexpr,
+     stride_q_d: tl.constexpr,
+     stride_block_table_t,
+-    stride_state_t: tl.constexpr,
++    stride_state_t,  # ⛔ 第6轮B1：降级为运行时标量（每 token/batch 变化）
+     stride_state_h: tl.constexpr,
+-    stride_acc_t: tl.constexpr,
++    stride_acc_t,  # ⛔ 第6轮B1：降级为运行时标量（每 token/batch 变化）
+     stride_acc_h: tl.constexpr,
+     stride_acc_d: tl.constexpr,
+     cache_block_size: tl.constexpr,
+     token_data_size: tl.constexpr,
+-    block_stride: tl.constexpr,
++    block_stride,  # ⛔ 第6轮B1：由 .stride(0)/.shape[0] 派生 ⇒ 降级为运行时标量
+     fp8_dim: tl.constexpr,
+     scale_dim: tl.constexpr,
+     quant_block: tl.constexpr,
+@@ -2587,6 +2657,19 @@
+     num_candidates: int,
+     head_block_size: int = 2,
+ ) -> None:
++    if not _bt_bound_skip(("b", int(block_table.shape[-1]))):
++        assert int(block_table.max()) < int(k_cache.shape[0]) * int(block_size), (
++            f"越界：max={{int(block_table.max())}} ≥ {{int(k_cache.shape[0])}}*{{int(block_size)}}"
++        )
++    # ⛔ [xtu 2026-11-01] 内核按块表裸地址取页（无 mask）⇒ 主机侧契约（无设备规约、capture 安全）。
++    assert block_table.shape[-1] > 0, "块表列数必须 > 0（内核按宽度算行指针）"
++    assert block_table.stride(0) == block_table.shape[-1], "块表必须行内连续"
++    # ⛔ [xtu 2026-11-01 第6轮审计 C4] 块表裸地址取页（无 mask）⇒ 主机侧廉价契约（无设备规约）。
++    assert block_table.dim() == 2 and block_table.stride(1) == 1, (
++        f"block_table 必须是行内连续二维块表：dim={block_table.dim()}"
++    )
++    if block_table.shape[1] <= 0:
++        raise AssertionError("block_table 列数为 0")
+     if q.dim() == 4:
+         assert q.shape[1] == 1
+         q = q[:, 0]
+@@ -2663,16 +2746,16 @@
+     block_table_ptr,
+     sink_ptr,
+     output_ptr,
+-    stride_q_t: tl.constexpr,
++    stride_q_t,  # ⛔ 第6轮B1：降级为运行时标量（每 token/batch 变化）
+     stride_q_h: tl.constexpr,
+     stride_q_d: tl.constexpr,
+     stride_block_table_t,
+-    stride_output_t: tl.constexpr,
++    stride_output_t,  # ⛔ 第6轮B1：每 token 变化 ⇒ 降级为运行时标量
+     stride_output_h: tl.constexpr,
+     stride_output_d: tl.constexpr,
+     cache_block_size: tl.constexpr,
+     token_data_size: tl.constexpr,
+-    block_stride: tl.constexpr,
++    block_stride,  # ⛔ 第6轮B1：由 .stride(0)/.shape[0] 派生 ⇒ 降级为运行时标量
+     fp8_dim: tl.constexpr,
+     scale_dim: tl.constexpr,
+     quant_block: tl.constexpr,
+@@ -2808,6 +2891,19 @@
+     head_block_size: int = 1,
+     num_heads: int | None = None,
+ ) -> None:
++    if not _bt_bound_skip(("b", int(block_table.shape[-1]))):
++        assert int(block_table.max()) < int(k_cache.shape[0]) * int(block_size), (
++            f"越界：max={{int(block_table.max())}} ≥ {{int(k_cache.shape[0])}}*{{int(block_size)}}"
++        )
++    # ⛔ [xtu 2026-11-01] 内核按块表裸地址取页（无 mask）⇒ 主机侧契约（无设备规约、capture 安全）。
++    assert block_table.shape[-1] > 0, "块表列数必须 > 0（内核按宽度算行指针）"
++    assert block_table.stride(0) == block_table.shape[-1], "块表必须行内连续"
++    # ⛔ [xtu 2026-11-01 第6轮审计 C4] 块表裸地址取页（无 mask）⇒ 主机侧廉价契约（无设备规约）。
++    assert block_table.dim() == 2 and block_table.stride(1) == 1, (
++        f"block_table 必须是行内连续二维块表：dim={block_table.dim()}"
++    )
++    if block_table.shape[1] <= 0:
++        raise AssertionError("block_table 列数为 0")
+     if q.dim() == 4:
+         assert q.shape[1] == 1
+         q = q[:, 0]
+@@ -2882,19 +2978,19 @@
+     block_table_ptr,
+     sink_ptr,
+     output_ptr,
+-    stride_q_t: tl.constexpr,
++    stride_q_t,  # ⛔ 第6轮B1：降级为运行时标量（每 token/batch 变化）
+     stride_q_h: tl.constexpr,
+     stride_q_d: tl.constexpr,
+-    stride_slot_t: tl.constexpr,
++    stride_slot_t,  # ⛔ 第6轮B1：降级为运行时标量（每 token/batch 变化）
+     stride_slot_c: tl.constexpr,
+     stride_block_table_t,
+-    stride_output_t: tl.constexpr,
++    stride_output_t,  # ⛔ 第6轮B1：每 token 变化 ⇒ 降级为运行时标量
+     stride_output_h: tl.constexpr,
+     stride_output_d: tl.constexpr,
+     compressed_cache_block_size: tl.constexpr,
+-    compressed_block_stride: tl.constexpr,
++    compressed_block_stride,  # ⛔ 第6轮B1：由 .stride(0)/.shape[0] 派生 ⇒ 降级为运行时标量
+     swa_cache_block_size: tl.constexpr,
+-    swa_block_stride: tl.constexpr,
++    swa_block_stride,  # ⛔ 第6轮B1：由 .stride(0)/.shape[0] 派生 ⇒ 降级为运行时标量
+     token_data_size: tl.constexpr,
+     fp8_dim: tl.constexpr,
+     scale_dim: tl.constexpr,
+@@ -3074,6 +3170,20 @@
+     head_block_size: int = 1,
+     num_heads: int | None = None,
+ ) -> None:
++    # ⛔ 第10轮 N9：同一次启动里 `block_table` 是**裸地址**取页（physical_block*swa_block_stride），
++    #    而上面只有 slot 断言 ⇒ 块表的值域也必须单独校验。
++    if not _bt_bound_skip(("btb", int(block_table.shape[-1]), int(swa_block_size))):
++        assert int(block_table.max()) < int(swa_k_cache.shape[0]), (
++            f"physical_block 越界：max={int(block_table.max())} ≥ {int(swa_k_cache.shape[0])}"
++        )
++    if not _bt_bound_skip(("gcm", int(slot_ids.numel()))):
++        assert int(slot_ids.max()) < int(compressed_k_cache.shape[0]) * int(compressed_block_size), (
++            f"slot 越界：max={int(slot_ids.max())} ≥ "
++            f"{int(compressed_k_cache.shape[0])}*{int(compressed_block_size)}"
++        )
++    # ⛔ [xtu 2026-11-01] 内核按块表裸地址取页（无 mask）⇒ 主机侧契约（无设备规约、capture 安全）。
++    assert block_table.shape[-1] > 0, "块表列数必须 > 0（内核按宽度算行指针）"
++    assert block_table.stride(0) == block_table.shape[-1], "块表必须行内连续"
+     if q.dim() == 4:
+         assert q.shape[1] == 1
+         q = q[:, 0]
+@@ -3158,15 +3268,15 @@
+     acc_ptr,
+     output_ptr,
+     lse_ptr,
+-    stride_state_t: tl.constexpr,
++    stride_state_t,  # ⛔ 第6轮B1：降级为运行时标量（每 token/batch 变化）
+     stride_state_h: tl.constexpr,
+-    stride_acc_t: tl.constexpr,
++    stride_acc_t,  # ⛔ 第6轮B1：降级为运行时标量（每 token/batch 变化）
+     stride_acc_h: tl.constexpr,
+     stride_acc_d: tl.constexpr,
+-    stride_output_t: tl.constexpr,
++    stride_output_t,  # ⛔ 第6轮B1：每 token 变化 ⇒ 降级为运行时标量
+     stride_output_h: tl.constexpr,
+     stride_output_d: tl.constexpr,
+-    stride_lse_t: tl.constexpr,
++    stride_lse_t,  # ⛔ 第6轮B1：由 .stride(0)/.shape[0] 派生 ⇒ 降级为运行时标量
+     stride_lse_h: tl.constexpr,
+     num_heads: tl.constexpr,
+     head_dim: tl.constexpr,
+@@ -3266,12 +3376,12 @@
+     acc_ptr,
+     sink_ptr,
+     output_ptr,
+-    stride_state_t: tl.constexpr,
++    stride_state_t,  # ⛔ 第6轮B1：降级为运行时标量（每 token/batch 变化）
+     stride_state_h: tl.constexpr,
+-    stride_acc_t: tl.constexpr,
++    stride_acc_t,  # ⛔ 第6轮B1：降级为运行时标量（每 token/batch 变化）
+     stride_acc_h: tl.constexpr,
+     stride_acc_d: tl.constexpr,
+-    stride_output_t: tl.constexpr,
++    stride_output_t,  # ⛔ 第6轮B1：每 token 变化 ⇒ 降级为运行时标量
+     stride_output_h: tl.constexpr,
+     stride_output_d: tl.constexpr,
+     num_heads: tl.constexpr,
+@@ -3334,17 +3444,17 @@
+     acc1_ptr,
+     sink_ptr,
+     output_ptr,
+-    stride_state0_t: tl.constexpr,
++    stride_state0_t,  # ⛔ 第6轮B1：每 token 变化 ⇒ 降级为运行时标量
+     stride_state0_h: tl.constexpr,
+-    stride_acc0_t: tl.constexpr,
++    stride_acc0_t,  # ⛔ 第6轮B1：每 token 变化 ⇒ 降级为运行时标量
+     stride_acc0_h: tl.constexpr,
+     stride_acc0_d: tl.constexpr,
+-    stride_state1_t: tl.constexpr,
++    stride_state1_t,  # ⛔ 第6轮B1：每 token 变化 ⇒ 降级为运行时标量
+     stride_state1_h: tl.constexpr,
+-    stride_acc1_t: tl.constexpr,
++    stride_acc1_t,  # ⛔ 第6轮B1：每 token 变化 ⇒ 降级为运行时标量
+     stride_acc1_h: tl.constexpr,
+     stride_acc1_d: tl.constexpr,
+-    stride_output_t: tl.constexpr,
++    stride_output_t,  # ⛔ 第6轮B1：每 token 变化 ⇒ 降级为运行时标量
+     stride_output_h: tl.constexpr,
+     stride_output_d: tl.constexpr,
+     num_heads: tl.constexpr,
+@@ -3526,10 +3636,10 @@
+     attn_sink_ptr,
+     output_ptr,
+     stride_q_t,
+-    stride_q_h,
+-    stride_q_d,
++    stride_q_h: tl.constexpr,  # 固定 head 维跨距（配置常量）
++    stride_q_d: tl.constexpr,  # 固定 head 维跨距（配置常量）
+     stride_kv_r,
+-    stride_kv_d,
++    stride_kv_d: tl.constexpr,  # 固定 head 维跨距（配置常量）
+     stride_idx_t,
+     stride_idx_k,
+     stride_out_t,
+@@ -3746,7 +3856,7 @@
+     dst_ptr,
+     src_row_ptr,
+     dst_row_ptr,
+-    stride_dst_r: tl.constexpr,
++    stride_dst_r,  # ⛔ 第6轮B1：由 .stride(0)/.shape[0] 派生 ⇒ 降级为运行时标量
+     stride_dst_d: tl.constexpr,
+     cache_block_size: tl.constexpr,
+     entry_stride: tl.constexpr,
+@@ -3830,10 +3940,41 @@
+     assert src_cache.dtype == torch.uint8, src_cache.dtype
+     assert src_cache.dim() == 3, src_cache.shape
+     assert dst.dtype == torch.bfloat16, dst.dtype
++    # ⛔ [xtu 2026-11-01 第三方审计 F5·CRITICAL] `rope_bytes` 原**恒为 128**，但同一入口
++    #    也被 GLM 的 **528 B 无 RoPE 行**复用，而它的工作区行宽只有 512（head_size）⇒
++    #    内核无 mask 地写 `base + 512 + arange(0,64)`（bf16 元素），即**写到下一行的
++    #    0..63 列**（内核内并发 ⇒ 竞态抹掉已有 NoPE 结果），末行还会越出 tensor 末尾 128 B。
++    #    正确做法：RoPE 字节数由**目标行宽**推导——没有 rope 的行就是 0。
++    # ⛔ [xtu 2026-11-01 第三方审计 F5 二次修订] 上一版用 `max(0, ...)`：
++    #    任何 `dst.shape[-1] < 512` 都会得到 rope_bytes=0 并**通过**断言，随后内核仍以
++    #    `mask = offs < 512`（恒真）写 512 个元素 ⇒ 窄行串写 / 末行越界。
++    #    改为**枚举**合法行宽，并把"行内连续"这一前提也断言掉（rope 存储假定 stride(1)==1）。
++    _row_w = int(dst.shape[-1])
++    assert _row_w in (
++        FP8_DS_MLA_DATA_BYTES,
++        FP8_DS_MLA_DATA_BYTES + FP8_DS_MLA_ROPE_BYTES // 2,
++    ), (
++        f"dst 行宽 {_row_w} 非法：只允许 {FP8_DS_MLA_DATA_BYTES}（无 RoPE）或 "
++        f"{FP8_DS_MLA_DATA_BYTES + FP8_DS_MLA_ROPE_BYTES // 2}（含 RoPE）"
++    )
++    rope_bytes = (_row_w - FP8_DS_MLA_DATA_BYTES) * 2
++    assert dst.stride(1) == 1, f"dst 行内必须连续（stride(1)==1），实际 {dst.stride(1)}"
++    # 行跨距必须真的是"一行的字节数"，否则取数地址会错到 page 倍数之外。
++    assert entry_stride == src_cache.stride(1), (
++        f"entry_stride 应为 src_cache.stride(1)={src_cache.stride(1)}，实际 {entry_stride}"
++    )
++    # ⛔ [同审计 第 7 条] 内核用 `block_idx * cache_block_size * entry_stride` 反推页基址，
++    #    即**假定页跨距 = block_size × 行跨距**。`block_stride_alignment` 是受支持的
++    #    KV spec 字段（kv_cache_interface.py:164，由 mla_attention.py:1384 施加），
++    #    带填充的页跨距会静默取错页 ⇒ 这里显式校验该假定。
++    assert src_cache.stride(0) == cache_block_size * src_cache.stride(1), (
++        f"页跨距假定不成立：stride(0)={src_cache.stride(0)} 应为 "
++        f"block_size({cache_block_size}) × stride(1)({src_cache.stride(1)})"
++    )
+     num_rows = src_rows.numel()
+     if num_rows == 0:
+         return
+-    # 656 B ds_mla row: 512 B fp8 data + 16 B scales + 128 B bf16 RoPE.
++    # 656 B ds_mla 行 = 512 B fp8 数据 + 16 B 尺度 + 128 B bf16 RoPE（GLM 528B 行无 RoPE）。
+     _gather_dequant_fp8ds_nope_kernel[(num_rows,)](
+         src_cache,
+         dst,
+@@ -3845,7 +3986,7 @@
+         entry_stride=entry_stride,
+         data_bytes=FP8_DS_MLA_DATA_BYTES,
+         scale_count=FP8_DS_MLA_SCALE_COUNT,
+-        rope_bytes=FP8_DS_MLA_ROPE_BYTES,
++        rope_bytes=rope_bytes,
+         BLOCK_D=triton.next_power_of_2(FP8_DS_MLA_DATA_BYTES),
+         num_warps=4,
+     )
+@@ -3885,7 +4026,13 @@
+     )
+     pos_in_req = (rows - workspace_starts[req_of_row]).clamp_min(0)
+     invalid = pos_in_req >= (ends[req_of_row] - workspace_starts[req_of_row]).clamp_min(0)
+-    block_idx = (pos_in_req // block_size).clamp_max(block_table.shape[1] - 1)
++    # ⛔ [xtu 2026-11-01 第三方审计 C4] 原实现对块索引做 `clamp_max(shape[1]-1)`：
++    #    越界的位置会被**静默夹到最后一页**，读到错页且不报错。
++    #    改为：越界位置标记为 invalid（最终落 -1，由调用方跳过），不再夹取。
++    _n_blk = int(block_table.shape[1])
++    _raw_idx = pos_in_req // block_size
++    invalid = invalid | (_raw_idx >= _n_blk)
++    block_idx = _raw_idx.clamp_max(max(_n_blk - 1, 0))
+     block = block_table[req_of_row, block_idx]
+     src_rows = (block * block_size + (pos_in_req % block_size)).to(torch.int32)
+     invalid = invalid | (block < 0)
+--- a/vllm/v1/worker/gpu/attn_utils.py	2026-11-06 14:37:18.832877053 +0800
++++ b/vllm/v1/worker/gpu/attn_utils.py	2026-11-03 00:06:40.386512221 +0800
+@@ -141,6 +141,7 @@
+         if spec := attn_module.get_kv_cache_spec(vllm_config):
+             if isinstance(spec, AttentionSpec):
+                 spec = attn_module.get_attn_backend().customize_spec(spec)
++            print(f"[xtu-kv-spec] {layer_name} block={getattr(spec, 'block_size', None)}", flush=True)
+             kv_cache_spec[layer_name] = spec
+     if vllm_config.attention_config.hisparse_config is not None:
+         kv_cache_spec = resolve_hisparse_specs(vllm_config, kv_cache_spec, attn_layers)
+--- a/vllm/v1/worker/gpu/model_runner.py	2026-11-06 14:37:18.836877165 +0800
++++ b/vllm/v1/worker/gpu/model_runner.py	2026-11-03 02:58:29.591172898 +0800
+@@ -578,6 +578,12 @@
+ 
+     def get_kv_cache_spec(self):
+         kv_cache_spec = get_kv_cache_spec(self.vllm_config)
++        if __import__("os").environ.get("XIAOTU_DSPARK_REMOTE", "") not in ("", "0", "false", "False"):
++            _draft_names = getattr(getattr(self, "speculator", None), "draft_attn_layer_names", set())
++            kv_cache_spec = {
++                _name: _spec for _name, _spec in kv_cache_spec.items()
++                if _name not in _draft_names
++            }
+         # A draft running at DCP=1 under a DCP target keeps a replicated cache.
+         if (
+             isinstance(self.speculator, DraftModelSpeculator)
+@@ -598,6 +604,17 @@
+         self.cp_interleave = self.parallel_config.cp_kv_cache_interleave_size
+         kv_cache_config = deepcopy(kv_cache_config)
+         self.kv_cache_config = kv_cache_config
++        try:
++            for _gid, _g in enumerate(kv_cache_config.kv_cache_groups):
++                _spec = _g.kv_cache_spec
++                print(
++                    f"[xtu-kv-group] gid={_gid} layers={len(_g.layer_names)} "
++                    f"block_size={getattr(_spec, 'block_size', None)} "
++                    f"spec={type(_spec).__name__}",
++                    flush=True,
++                )
++        except Exception as _e:
++            print(f"[xtu-kv-group] log failed: {_e}", flush=True)
+ 
+         block_table_max_model_len = self.max_model_len
+         if self.is_encoder_decoder:
+@@ -662,6 +679,9 @@
+         attn_cg_support = attn_cg_support.narrow(*additional_attn_cg_support)
+         # The speculator clears the flag at load time when the checkpoint has
+         # no confidence head, so it holds the effective value.
++        _xtu_varlen = bool(__import__("os").environ.get("XTU_VARLEN_K"))
++        if _xtu_varlen and self.speculative_config is not None:
++            self.speculative_config.enable_adaptive_verification = False
+         self.adaptive_verification = maybe_create_adaptive_verification_manager(
+             enable_adaptive_verification=getattr(
+                 self.speculator, "enable_adaptive_verification", False
+@@ -2252,6 +2272,7 @@
+             self.draft_tokens_handler.set_draft_tokens(
+                 input_batch,
+                 self.req_states.draft_tokens[input_batch.idx_mapping],
++                lens=getattr(self.speculator, "draft_lens", None),
+             )
+             if self.pp_handler is not None:
+                 self.pp_handler.broadcast_drafts(
+--- a/vllm/v1/worker/gpu/spec_decode/dspark/speculator.py	2026-11-06 14:37:18.836877165 +0800
++++ b/vllm/v1/worker/gpu/spec_decode/dspark/speculator.py	2026-11-05 11:04:18.740005017 +0800
+@@ -23,6 +23,7 @@
+ backbone forward AND the sequential Markov sampling.
+ """
+ 
++import os
+ from typing import Any
+ 
+ import torch
+@@ -103,8 +104,10 @@
+                 dtype=self.draft_logits.dtype,
+                 device=self.device,
+             )
++        _varlen_k = bool(__import__("os").environ.get("XTU_VARLEN_K"))
++        self._xtu_varlen_k = _varlen_k
+         self.use_confidence_head = (
+-            self.enable_adaptive_verification
++            (self.enable_adaptive_verification or _varlen_k)
+             and model.model.confidence_head is not None
+         )
+         if self.use_confidence_head:
+@@ -190,6 +193,7 @@
+             prev = draft_sampled_i
+ 
+         if self.use_confidence_head:
++            self._xtu_n_spec = n_spec
+             confidence = self.model.compute_confidence(
+                 sample_hidden,
+                 torch.stack(confidence_markov_embeds, dim=1).flatten(0, 1),
+@@ -197,6 +201,27 @@
+             self.draft_token_confidence_probs[:num_reqs] = confidence.view(
+                 num_reqs, n_spec
+             )
++            # [xtu] per-request variable draft length: keep drafts whose
++            # cumulative survival probability stays above a threshold.
++            _surv = confidence.view(num_reqs, n_spec).float().cumprod(dim=1)
++            _ratio = float(__import__("os").environ.get("XTU_VARLEN_BUDGET_RATIO", "0.8"))
++            _flat = _surv.flatten()
++            _budget = max(1, int(round(_ratio * _flat.numel())))
++            _budget = min(_budget, _flat.numel())
++            _winners = _flat.topk(_budget).indices
++            _mask = torch.zeros_like(_flat, dtype=torch.bool).index_fill_(0, _winners, True)
++            _lens = _mask.view(num_reqs, n_spec).sum(dim=1).clamp_(min=1, max=n_spec)
++            self.draft_lens = _lens.to(torch.int32)
++            if (__import__("os").environ.get("XTU_VARLEN_DEBUG")
++                    and not torch.cuda.is_current_stream_capturing()):
++                _n = int(_lens.numel())
++                _m = float(_lens.float().mean().item())
++                _mx = int(_lens.max().item())
++                _prof = [float(_surv[:, j].mean()) for j in range(_surv.shape[1])]
++                print(f"[xtu-varlen] reqs={_n} mean_k={_m:.2f} max_k={_mx} "
++                      f"surv_mean={['%.3f' % v for v in _prof]}", flush=True)
++        else:
++            self.draft_lens = None
+ 
+     def _sample_sequential_topk(self, num_reqs: int, head_hidden: torch.Tensor) -> None:
+         """Apply the sequential Markov head only to top-k base-logit candidates.
+@@ -256,6 +281,16 @@
+         num_tokens_across_dp: torch.Tensor | None,
+         cudagraph_runtime_mode: CUDAGraphMode = CUDAGraphMode.NONE,
+     ) -> None:
++        # ⛔ [xtu 2026-11-05 · 仅测量，默认关闭] `XIAOTU_DRAFT_TIMING=1` 时用 CUDA event
++        #    量**dspark 自身**的每步墙钟。目的：反推法只能得到"一步 41 ms"，无法定位
++        #    是哪一段慢；这里直接给出 draft 的 ms/step 与 ms/token。
++        #    捕获期不记（事件会被捕获进图，读数无意义）。
++        _xtu_t0 = None
++        if (os.environ.get("XIAOTU_DRAFT_TIMING") == "1"
++                and not torch.cuda.is_current_stream_capturing()):
++            _xtu_t0 = torch.cuda.Event(enable_timing=True)
++            _xtu_t1 = torch.cuda.Event(enable_timing=True)
++            _xtu_t0.record()
+         # Full draft step (captured under CUDA graph): parallel backbone forward
+         # then sequential Markov sampling over its hidden state outputs.
+         head_hidden = self._run_model(
+@@ -266,3 +301,20 @@
+             cudagraph_runtime_mode,
+         )
+         self._sample_sequential(num_reqs, head_hidden)
++        if _xtu_t0 is not None:
++            # 异步：把事件对塞进环形表，**读的是早已完成的老条目**，不插同步
++            _xtu_t1.record()
++            _ring = getattr(self, "_xtu_dt_ring", None)
++            if _ring is None:
++                _ring = self._xtu_dt_ring = []
++            _ring.append((_xtu_t0, _xtu_t1))
++            if len(_ring) >= 24:
++                _done = _ring[:-4]          # 末尾 4 条可能还没跑完，跳过
++                _ms = [a.elapsed_time(b) for a, b in _done]
++                self._xtu_dt_ring = []
++                _avg = sum(_ms) / len(_ms)
++                _k = max(1, int(getattr(self, "num_speculative_steps", 1)))
++                _per = _avg / _k
++                print(f"[xtu-draft] step={_avg:.2f} ms  per_token={_per:.2f} ms "
++                      f"n={len(_ms)} spec_steps={_k} "
++                      f"draft_tok_per_s={1000.0 / max(1e-9, _per):.0f}", flush=True)
+--- a/vllm/v1/worker/gpu/spec_decode/utils.py	2026-11-06 14:37:18.840877276 +0800
++++ b/vllm/v1/worker/gpu/spec_decode/utils.py	2026-10-23 22:41:02.131778121 +0800
+@@ -38,10 +38,14 @@
+         self.num_draft_tokens: int = 0
+ 
+     def set_draft_tokens(
+-        self, input_batch: InputBatch, draft_tokens: torch.Tensor
++        self,
++        input_batch: InputBatch,
++        draft_tokens: torch.Tensor,
++        lens: torch.Tensor | None = None,
+     ) -> None:
+         self.req_ids = input_batch.req_ids
+         self.num_draft_tokens = draft_tokens.shape[1]
++        self.lens_np = None if lens is None else lens[: len(input_batch.req_ids)].cpu().numpy()
+         if not input_batch.has_structured_output_reqs:
+             # No draft token validation needs to be performed by
+             # the scheduler for this batch.
+@@ -66,7 +70,16 @@
+             draft_token_ids = self.draft_tokens_np.tolist()
+         else:
+             # This case only happens when async scheduling is disabled.
+-            draft_token_ids = [[-1] * self.num_draft_tokens for _ in self.req_ids]
++            if self.lens_np is not None:
++                draft_token_ids = [
++                    [-1] * int(self.lens_np[i]) for i in range(len(self.req_ids))
++                ]
++            else:
++                draft_token_ids = [[-1] * self.num_draft_tokens for _ in self.req_ids]
++        if self.draft_tokens_np is not None and self.lens_np is not None:
++            draft_token_ids = [
++                row[: int(self.lens_np[i])] for i, row in enumerate(draft_token_ids)
++            ]
+         return DraftTokenIds(self.req_ids, draft_token_ids)
+ 
+ 
+--- a/vllm/v1/worker/gpu_model_runner.py	2026-11-06 14:37:18.840877276 +0800
++++ b/vllm/v1/worker/gpu_model_runner.py	2026-11-03 00:10:57.449990404 +0800
+@@ -7443,6 +7443,7 @@
+             if spec := attn_module.get_kv_cache_spec(self.vllm_config):
+                 if isinstance(spec, AttentionSpec):
+                     spec = attn_module.get_attn_backend().customize_spec(spec)
++                print(f"[xtu-legacy-kv-spec] {layer_name} block={getattr(spec, 'block_size', None)}", flush=True)
+                 kv_cache_spec[layer_name] = spec
+ 
+         return kv_cache_spec
+--- a/vllm/v1/worker/gpu_worker.py	2026-11-06 14:37:18.840877276 +0800
++++ b/vllm/v1/worker/gpu_worker.py	2026-11-04 02:07:19.386531788 +0800
+@@ -814,6 +814,7 @@
+     @instrument(span_name="Allocate KV cache")
+     def initialize_from_config(self, kv_cache_config: KVCacheConfig) -> None:
+         """Allocate GPU KV cache with the specified kv_cache_config."""
++        # Remote DSpark: keep all target KV groups. The draft has no KV group here.
+         # Update local config with adjusted num blocks after profiling,
+         # so that it's available to the warmup stage.
+         self.cache_config.num_gpu_blocks = kv_cache_config.num_blocks

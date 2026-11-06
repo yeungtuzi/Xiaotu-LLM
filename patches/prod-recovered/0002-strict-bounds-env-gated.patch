@@ -1,0 +1,80 @@
+--- a/vllm/models/deepseek_v41/common/ops/cache_utils.py	2026-11-04 22:19:50.185713884 +0800
++++ b/vllm/models/deepseek_v41/common/ops/cache_utils.py	2026-11-06 15:18:19.035584348 +0800
+@@ -639,6 +639,17 @@
+     ⛔ [xtu 2026-11-01 第6轮审计 N4] capture 期 `.max()/.item()` 属非法操作，
+     且 decode 热路径每步做全设备规约代价不可接受 ⇒ 只在首见签名、非 capture 时校验一次。
+     """
++    # ⭐ [xtu 2026-11-06] 严格模式：XIAOTU_STRICT_BOUNDS=1 时除图捕获期外**每次都校验**，
++    #    把"静默越界"变成显式 AssertionError。默认关闭，不改变生产行为。
++    import os as _os
++    if _os.environ.get("XIAOTU_STRICT_BOUNDS") == "1":
++        try:
++            import torch as _tt
++            if _tt.cuda.is_current_stream_capturing():
++                return True
++        except Exception:
++            pass
++        return False
+     try:
+         import torch as _t
+         if _t.cuda.is_current_stream_capturing():
+--- a/vllm/models/deepseek_v41/common/ops/fused_compress_quant_cache.py	2026-11-01 21:58:48.922634395 +0800
++++ b/vllm/models/deepseek_v41/common/ops/fused_compress_quant_cache.py	2026-11-06 15:18:19.039584448 +0800
+@@ -36,6 +36,17 @@
+ 
+ def _bound_check_skip(sig) -> bool:
+     """capture 中或本轮不需校验 ⇒ True（capture 期 `.max()` 属非法操作）。"""
++    # ⭐ [xtu 2026-11-06] 严格模式：XIAOTU_STRICT_BOUNDS=1 时除图捕获期外**每次都校验**，
++    #    把"静默越界"变成显式 AssertionError。默认关闭，不改变生产行为。
++    import os as _os
++    if _os.environ.get("XIAOTU_STRICT_BOUNDS") == "1":
++        try:
++            import torch as _tt
++            if _tt.cuda.is_current_stream_capturing():
++                return True
++        except Exception:
++            pass
++        return False
+     try:
+         import torch as _t
+         if _t.cuda.is_current_stream_capturing():
+--- a/vllm/models/deepseek_v41/common/ops/indexer_k_store.py	2026-11-01 21:23:23.025518256 +0800
++++ b/vllm/models/deepseek_v41/common/ops/indexer_k_store.py	2026-11-06 15:18:19.039584448 +0800
+@@ -37,6 +37,17 @@
+ 
+ def _bound_check_skip(sig) -> bool:
+     """capture 中或本轮不需校验 ⇒ True（capture 期 `.max()` 属非法操作）。"""
++    # ⭐ [xtu 2026-11-06] 严格模式：XIAOTU_STRICT_BOUNDS=1 时除图捕获期外**每次都校验**，
++    #    把"静默越界"变成显式 AssertionError。默认关闭，不改变生产行为。
++    import os as _os
++    if _os.environ.get("XIAOTU_STRICT_BOUNDS") == "1":
++        try:
++            import torch as _tt
++            if _tt.cuda.is_current_stream_capturing():
++                return True
++        except Exception:
++            pass
++        return False
+     try:
+         import torch as _t
+         if _t.cuda.is_current_stream_capturing():
+--- a/vllm/v1/attention/backends/mla/sparse_mla_kernels.py	2026-11-04 15:33:43.518634407 +0800
++++ b/vllm/v1/attention/backends/mla/sparse_mla_kernels.py	2026-11-06 15:18:19.043584547 +0800
+@@ -20,6 +20,17 @@
+ 
+ def _bt_bound_skip(sig) -> bool:
+     """capture 中或该签名本轮不需校验 ⇒ True（capture 期 `.max()` 属非法操作）。"""
++    # ⭐ [xtu 2026-11-06] 严格模式：XIAOTU_STRICT_BOUNDS=1 时除图捕获期外**每次都校验**，
++    #    把"静默越界"变成显式 AssertionError。默认关闭，不改变生产行为。
++    import os as _os
++    if _os.environ.get("XIAOTU_STRICT_BOUNDS") == "1":
++        try:
++            import torch as _tt
++            if _tt.cuda.is_current_stream_capturing():
++                return True
++        except Exception:
++            pass
++        return False
+     try:
+         import torch as _t
+         if _t.cuda.is_current_stream_capturing():

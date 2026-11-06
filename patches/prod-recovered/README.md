@@ -33,3 +33,20 @@ git apply <dir>/../prod-recovered/0001-production-tree-delta-20261106.patch   # 
 
 本增量同时是**退化嫌疑范围**：退化只可能出现在「生产独有」或「两边不同」的代码里，
 纯补丁系列独有的改动可以排除。
+
+---
+
+## 0002-strict-bounds-env-gated.patch
+
+把四处**采样式**越界守卫（`_bound_check_skip` / `_bt_bound_skip`，原本 1/256 抽样、
+图捕获期跳过）改成**环境变量门控的严格模式**：
+
+```bash
+XIAOTU_STRICT_BOUNDS=1   # 除图捕获期外，每次都校验
+```
+
+目的：把"静默越界"变成显式 `AssertionError`，用于定位长期漂移的写入点。
+**默认不设该变量 ⇒ 行为与生产完全一致**，可安全留在树上。
+
+⚠️ 适用范围：只覆盖 **eager 路径（prefill）**。decode 跑在 CUDA 图里，
+`.max()` 在捕获期非法 ⇒ 图内 path 仍然无法校验，这是本补丁的已知盲区。

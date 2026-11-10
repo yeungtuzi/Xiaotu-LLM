@@ -81,6 +81,37 @@ def aggregate(path: str) -> int:
     if not rows:
         print("⛔ 没有可聚合的记录")
         return 1
+    # 时间戳归一化：新记录写的是 epoch 浮点；手写/旧文件可能是 ISO 字符串。
+    # 不归一化时 `r["t"] - t0` 会抛 TypeError，把 4 小时的数据全部作废（实测踩过）。
+    def _ts(v):
+        if isinstance(v, (int, float)):
+            return float(v)
+        if isinstance(v, str):
+            try:
+                return float(v)
+            except ValueError:
+                pass
+            try:
+                from datetime import datetime
+                return datetime.fromisoformat(v.replace("Z", "+00:00")).timestamp()
+            except ValueError:
+                return None
+        return None
+
+    norm, dropped = [], 0
+    for r in rows:
+        ts = _ts(r.get("t"))
+        if ts is None:
+            dropped += 1
+            continue
+        r = dict(r); r["t"] = ts
+        norm.append(r)
+    if dropped:
+        print(f"⚠️ 跳过 {dropped} 条时间戳无法解析的记录")
+    if not norm:
+        print("⛔ 没有可聚合的记录（时间戳全部无法解析）")
+        return 1
+    rows = norm
     t0 = rows[0]["t"]
     buckets: dict[int, list[bool]] = defaultdict(list)
     for r in rows:

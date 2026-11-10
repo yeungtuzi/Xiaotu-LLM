@@ -61,6 +61,15 @@ fi
 say "原始输出：$OUT"
 tail -n "$CNT" "$OUT" | sed 's/^/[e1]   /'
 
+# 基线若 8/8 全过 ⇒ "没复现"，必须先对比口径，不能当成"已修好"
+_sum=$(grep -aoE "汇总 ok=[0-9]+ bad=[0-9]+" "$OUT" 2>/dev/null | tail -1)
+say "复现汇总：${_sum:-（未取得）}"
+case "$_sum" in
+    *"bad=0"*) say "⚠️ 本次 **未复现**（8 条全过）⇒ 不要当成'已修好'：先对比口径（权重/SPEC/PC/PIN/MAXLEN/MBT）与历史复现那次是否一致" ;;
+    "")        say "⚠️ 没读到汇总行 ⇒ 先看上面的原始输出，可能是请求失败而非'复现'" ;;
+    *)         say "✅ 出现失败（与历史'第 8 条起错'同向）⇒ 基线成立" ;;
+esac
+
 # ③b 保证"一定有缓存命中"的两次同 prompt（degen_repro 每条都用不同 uuid ⇒ cached=0，
 #     只有这一步能保证仪器里出现 hit=1 的重放步；否则 --verdict 会报"没有 hit=1 的 prefill 步"）
 HITOUT="$RUN_DIR/${TAG}_hits.txt"

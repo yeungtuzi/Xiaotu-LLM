@@ -59,6 +59,14 @@ fi
 shards=$(ls "$MODEL_DIR"/model-*-of-*.safetensors 2>/dev/null | wc -l)
 inc=$(ls "$MODEL_DIR"/*.incomplete 2>/dev/null | wc -l)
 say "分片：完整 $shards 个，未完成 $inc 个"
+# ⛔ 有 .incomplete ⇒ 下载未完成 ⇒ 必须 fail-closed（否则会得出"可以起服务"的错误结论，实测踩过）
+if [ "$inc" -gt 0 ]; then
+    say "❌ 还有 $inc 个分片未下载完（.incomplete）⇒ 不能起服务；等下载完成后再跑本脚本"
+    fail=1
+fi
+if [ "$shards" -lt 48 ]; then
+    say "⚠️ 完整分片 $shards < 48 ⇒ 权重不齐（若该模型确实不是 48 片，请忽略此行）"
+fi
 if [ -f "$MODEL_DIR/model.safetensors.index.json" ]; then
     say "✅ model.safetensors.index.json"
 elif [ "$WRITE_INDEX" = "1" ]; then

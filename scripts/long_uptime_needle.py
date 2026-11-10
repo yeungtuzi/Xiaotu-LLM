@@ -169,12 +169,30 @@ def aggregate(path: str) -> int:
         print(f"{h:>4}  {hits:>4}/{total:<5}  {100.0 * hits / total:>6.0f}%")
     tail = rows[-min(9, len(rows)):]
     later = [r for r in rows if (r["t"] - t0) >= 4 * 3600]
-    if later:
-        rate = 100.0 * sum(bool(r["hit"]) for r in later) / len(later)
-        print(f"\n>4h 段命中率 {rate:.0f}%（{sum(bool(r['hit']) for r in later)}/{len(later)}）"
-              f"  判据 ≥67% ⇒ {'✅ 通过' if rate >= 66.67 else '❌ 未通过'}")
+    # ⚠️ 2026-11-10 补（台账 #260）：**结论必须进退出码**。
+    #    原实现无论命中率多少都 `return 0`，于是"C 未通过"在自动化里等于"通过"（同 #259 的形态）。
+    #    返回码：0=通过 / 1=命中率不达标 / 2=口径存疑（不是 142K）/ 4=>4h 数据不足
+    if not later:
+        print(f"\n⚠️ 还没有 >4h 的数据（已覆盖 {tail[-1]['t'] - t0:.0f}s）⇒ 不足以判定")
+        return 4
+    hits = sum(bool(r["hit"]) for r in later)
+    rate = 100.0 * hits / len(later)
+    ok_rate = rate >= 66.67
+    print(f"\n>4h 段命中率 {rate:.0f}%（{hits}/{len(later)}）"
+          f"  判据 ≥67% ⇒ {'✅ 通过' if ok_rate else '❌ 未通过'}")
+
+    caliber_bad = False
+    if ptoks:
+        med = ptoks[len(ptoks) // 2]
+        if med < 120_000 or med > 170_000:
+            caliber_bad = True
     else:
-        print(f"\n⚠️ 还没有 >4h 的数据（已覆盖 {tail[-1]['t'] - t0:.0f}s）")
+        caliber_bad = True          # 无 ptok ⇒ 无法自证是 142K 上下文
+    if caliber_bad:
+        print("⛔ 口径存疑 ⇒ 本轮**不算通过**（先把上下文做成 142K±15%，或让服务回 usage.prompt_tokens）")
+        return 2
+    if not ok_rate:
+        return 1
     return 0
 
 

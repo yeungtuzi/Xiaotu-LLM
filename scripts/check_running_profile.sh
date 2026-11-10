@@ -18,8 +18,10 @@ REPO=${REPO:-/home/user/lvllm/vllm-xiaotu-moe}
 SSH=(timeout 60 ssh -o ConnectTimeout=8 -o BatchMode=yes -F "$SSH_CFG" "$HOST")
 "${SSH[@]}" true >/dev/null 2>&1 || { echo "⛔ 连不上远端 ⇒ 本脚本必须在【本地 harness】执行"; exit 2; }
 
+# ⚠️ PID 文件在 RUN_DIR（默认 /home/user/lvllm/run），**不是**仓库下的 run/（台账 #273）
+RUN_DIR=${RUN_DIR:-/home/user/lvllm/run}
 out=$("${SSH[@]}" "cd $REPO || exit 9
-pidf=\$(ls run/ds41_${TAG}.pid 2>/dev/null || true)
+pidf=\$(ls $RUN_DIR/ds41_${TAG}.pid 2>/dev/null || true)
 [ -n \"\$pidf\" ] || { echo 'NOPID'; exit 0; }
 pid=\$(tr -dc '0-9' < \"\$pidf\")
 [ -n \"\$pid\" ] || { echo 'NOPID'; exit 0; }

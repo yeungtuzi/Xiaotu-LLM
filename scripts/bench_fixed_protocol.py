@@ -12,6 +12,7 @@
 """
 import argparse
 import json
+import uuid
 import statistics as st
 import threading
 import time
@@ -82,9 +83,28 @@ def main():
     ap.add_argument("--dataset", required=True)
     ap.add_argument("--timeout", type=int, default=3600)
     ap.add_argument("--jsonl", default="")
+    ap.add_argument("--salt", action="store_true",
+                    help="给每条请求加唯一前缀，避免 prefix cache 命中污染 prefill")
+    ap.add_argument("--warmup", type=int, default=0,
+                    help="计时前先跑 N 条带唯一 salt 的预热请求")
     a = ap.parse_args()
 
     rows = [json.loads(x) for x in open(a.dataset, encoding="utf-8") if x.strip()][: a.n]
+
+    def prompt_of(prompt):
+        if not a.salt:
+            return prompt
+        # 唯一前缀 ⇒ 每条请求的 token 前缀都不同，prefix cache 不会命中；
+        # 同时保留原 15K 正文，只增加少量 token。
+        return "[bench-salt %s] " % uuid.uuid4().hex + prompt
+
+    for _ in range(a.warmup):
+        warm = prompt_of(rows[0]["prompt"])
+        try:
+            one(warm, a.outlen, a.port, a.model, a.timeout)
+        except Exception as exc:  # noqa: BLE001
+            print(f"⚠️ warmup 失败: {type(exc).__name__}: {exc}", flush=True)
+
     out = [None] * len(rows)
     slots = threading.Semaphore(a.conc)
     t0 = time.time()   # ⭐ 批次起点:所有 16 条的 ttft 都从这里算(含排队)
@@ -96,7 +116,7 @@ def main():
             except Exception as exc:  # noqa: BLE001
                 out[i] = {"err": f"{type(exc).__name__}: {exc}"}
 
-    ths = [threading.Thread(target=work, args=(i, r["prompt"])) for i, r in enumerate(rows)]
+    ths = [threading.Thread(target=work, args=(i, prompt_of(r["prompt"]))) for i, r in enumerate(rows)]
     for t in ths:
         t.start()
     for t in ths:
@@ -128,6 +148,7 @@ def main():
         "step_ms_median": round(1000 * st.median(gaps), 2) if gaps else None,
         "prompt_tokens_sum": sum_pre, "out_tokens_sum": sum_tok,
         "prefill_valid": len(errs) == 0,
+        "salt": bool(a.salt), "warmup": a.warmup,
     }
     print(json.dumps(res, ensure_ascii=False))
     if a.jsonl:

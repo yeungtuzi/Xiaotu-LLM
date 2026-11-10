@@ -21,6 +21,13 @@
 # License: Apache-2.0
 set -euo pipefail
 
+# MUSA is built as a CPU-only engine (no cudart/libcuda).  Force the flag
+# before CUDA runtime detection so a MUSA-only build does not fail earlier.
+if [[ "${XIAOTU_MOE_MUSA:-0}" == "1" && "${NO_CUDA:-0}" != "1" ]]; then
+  echo ">> XIAOTU_MOE_MUSA=1 forces NO_CUDA=1"
+  NO_CUDA=1
+fi
+
 ROOT="$(cd "$(dirname "${BASH_SOURCE[0]}")/../xiaotu_moe" && pwd)"
 SRC="$ROOT/csrc/python_binding/binding.cpp"
 OUT_DIR="$ROOT/build"
@@ -105,6 +112,21 @@ else
   exit 2
 fi
 fi  # NO_CUDA
+
+# MUSA runtime: opt-in, keeps the CPU-only build unchanged.  Link order and
+# --no-as-needed matter: -lmusart before the source would otherwise be dropped
+# by distributions that default to --as-needed, leaving undefined symbols.
+if [[ "${XIAOTU_MOE_MUSA:-0}" == "1" ]]; then
+  MUSA_ROOT="${MUSA_ROOT:-/usr/local/musa}"
+  if [[ ! -f "$MUSA_ROOT/include/musa_runtime.h" ]]; then
+    echo "!! MUSA_ROOT has no include/musa_runtime.h: $MUSA_ROOT" >&2
+    exit 2
+  fi
+  CUDA_FLAGS+=(-DXIAOTU_MOE_MUSA -I"$MUSA_ROOT/include"
+               -L"$MUSA_ROOT/lib" -Wl,--no-as-needed -lmusart -Wl,--as-needed
+               -Wl,-rpath,"$MUSA_ROOT/lib")
+  echo ">> MUSA runtime: $MUSA_ROOT"
+fi
 
 COMMON="-std=c++17 -shared -fPIC -O3 -ffast-math -fno-finite-math-only"
 # 【§629c】编译器可切(`CXX=g++-14` 或 conda 的

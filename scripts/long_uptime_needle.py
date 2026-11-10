@@ -76,10 +76,12 @@ def measure_ratio(port: int) -> float | None:
 
 
 def ask(port: int, prompt: str, max_tokens: int) -> tuple[str, float, dict]:
-    payload = {"model": "DeepSeek-V4.1-Flash", "prompt": prompt,
+    # ⛔ 2026-11-10 实测更正（台账 #274）：必须走 chat/completions（真权重下 completions 会立刻 EOS）。
+    payload = {"model": "DeepSeek-V4.1-Flash",
+               "messages": [{"role": "user", "content": prompt}],
                "max_tokens": max_tokens, "temperature": 0.0, "seed": 0}
     req = urllib.request.Request(
-        f"http://127.0.0.1:{port}/v1/completions",
+        f"http://127.0.0.1:{port}/v1/chat/completions",
         data=json.dumps(payload).encode(),
         headers={"Content-Type": "application/json"})
     t0 = time.time()
@@ -87,7 +89,9 @@ def ask(port: int, prompt: str, max_tokens: int) -> tuple[str, float, dict]:
         d = json.loads(r.read())
     # ⚠️ 必须带出 usage.prompt_tokens：填充用的"单字母"并不严格 1 token/项，
     #    不看这个数就无法证明本轮真的是 142K 上下文（判据会变成"我以为的 142K"）。
-    return d["choices"][0]["text"], time.time() - t0, (d.get("usage") or {})
+    _ch = d["choices"][0]
+    _text = (_ch.get("message") or {}).get("content") or ""
+    return _text, time.time() - t0, (d.get("usage") or {})
 
 
 def probe_once(port: int, tokens: int, max_tokens: int,
@@ -203,7 +207,7 @@ def main() -> int:
     ap.add_argument("--interval-min", type=float, default=10.0)
     ap.add_argument("--rounds", type=int, default=3)
     ap.add_argument("--tokens", type=int, default=142000)
-    ap.add_argument("--max-tokens", type=int, default=32)
+    ap.add_argument("--max-tokens", type=int, default=2048)
     ap.add_argument("--aggregate")
     ap.add_argument("--dry-run", action="store_true")
     a = ap.parse_args()

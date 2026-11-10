@@ -45,6 +45,17 @@ apply)
     if [ "$d1" = "1" ] && { [ "$f1" = "0" ] || [ "$f1" = "2" ]; }; then say "✅ 已应用（d1=$d1 f1=$f1），跳过"; exit 0; fi
     if [ "$d1" != "0" ] || [ "$f1" != "0" ]; then say "⛔ 非法状态（d1=$d1 f1=$f1），拒绝叠加"; exit 1; fi
     [ -f "$PATCH" ] || { say "⛔ 找不到补丁 $PATCH（先 scp 过来）"; exit 2; }
+    # ⚠️ md5 白名单：远端 run/ 里同时躺着 d1.patch 与 **旧版 D1.patch / D1_step_mask_recompute.patch**
+    #    （md5 1cb78e4e…，2907 B，与本地权威 74378ee2… 不同）⇒ 按名字拿到旧版会白验一轮。
+    _md5=$(md5sum "$PATCH" | awk '{print $1}')
+    case "$_md5" in
+        74378ee29e7d31975c23f7a49594a7ce) say "补丁 = d1.patch（D1 单独，权威）" ;;
+        8a02b436a8db80e7d1859e3562202015) say "补丁 = combo.patch（D1+F1）" ;;
+        5a7600e98fa1b9eadbe8f7633902f173) say "补丁 = f1.patch（仅 F1，非常规）" ;;
+        *) say "⛔ 补丁 md5 不在白名单：$_md5 ($PATCH)"; \
+           say "   已知陷阱：旧版 D1.patch/D1_step_mask_recompute.patch = 1cb78e4e72b25d443a48bf9d3f202415（不要用）"; \
+           say "   权威文件见本地 patches/replay/D1_step_mask_recompute.patch = 74378ee2…"; exit 1 ;;
+    esac
     if ! (cd "$TREE" && patch -p1 --dry-run < "$PATCH" >/dev/null 2>&1); then
         say "⛔ dry-run 失败（上下文不符）⇒ 不要强行应用"; exit 1
     fi

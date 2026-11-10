@@ -66,19 +66,14 @@ else
     run "部署一致性（远端副本 vs 本地真源）" bash "$ROOT/scripts/check_deploy_parity.sh"
     # 4b) 仪器补丁**是否已打进远端那棵树**（只看本地 md5 不够：文件在 ≠ 已应用）
     #     不通过就别起服务 —— 否则 E1 会缺 `[xtu-swa-bounded-replay]` 证据行，白烧 20–40 分钟。
-    run "仪器补丁已在远端 vLLM 树里" bash -c '
-      n=$(timeout 30 ssh -o ConnectTimeout=8 -o BatchMode=yes -F "${SSH_CFG:-/root/lvllm/tmp/sshcfg}" "${HOST:-gpu}" \
-          "grep -c xtu-swa-bounded-replay /home/user/lvllm/process_data/ref/repos/vllm-mainline/vllm/models/deepseek_v41/nvidia/model_state.py 2>/dev/null || echo 0")
-      echo "   命中行数=$n"
-      [ "${n:-0}" -ge 2 ] || { echo "   未应用 ⇒ 先按 RESUME 2.6 打补丁（$n 行 < 2）"; exit 1; }
-      # 6b) 基线轮里 **D1 必须还没打**：若已应用，E1 测的就不是"未修基线"，整轮作废。
-      #     第二阶段（E2 前）用 EXPECT_D1=1 跑同一条总闸。
-      d1=$(timeout 30 ssh -o ConnectTimeout=8 -o BatchMode=yes -F "${SSH_CFG:-/root/lvllm/tmp/sshcfg}" "${HOST:-gpu}" \
-           "grep -c 'Recompute the validity mask' /home/user/lvllm/process_data/ref/repos/vllm-mainline/vllm/v1/attention/backends/mla/sparse_swa.py 2>/dev/null || echo 0")
-      echo "   D1 已应用标记数=$d1（EXPECT_D1=${EXPECT_D1:-0}）"
-      bash "$ROOT/scripts/check_d1_state.sh" "$d1" "${EXPECT_D1:-0}" || exit 1' _
-    # 注意：这里**不**跑 --sha（对两个 101 GB 分片做 sha256 要 ~10 分钟）；
-    # sha 已由远端常驻守望 `weights_watch_remote.sh` 在落盘 WEIGHTS_READY 前算过（见 #241）。
+    run "仪器补丁已应用 / D1 阶段（远端树状态）" bash -c '
+      out=$(timeout 60 ssh -o ConnectTimeout=8 -o BatchMode=yes -F "${SSH_CFG:-/root/lvllm/tmp/sshcfg}" "${HOST:-gpu}" \
+            "bash /home/user/lvllm/vllm-xiaotu-moe/scripts/check_tree_state.sh")
+      echo "$out" | sed "s/^/   /"
+      n=$(echo "$out" | awk "\$1==\"INSTRUMENT\"{print \$2}")
+      d=$(echo "$out" | awk "\$1==\"D1\"{print \$2}")
+      [ "${n:-0}" -ge 2 ] || { echo "   仪器补丁未应用（$n 行 < 2）⇒ 先按 RESUME 2.6 打补丁"; exit 1; }
+      bash "'"$ROOT"'/scripts/check_d1_state.sh" "${d:-0}" "${EXPECT_D1:-0}" || exit 1' _
     run "权重就绪（分片齐备 + 模型口径）" bash "$ROOT/scripts/check_weights_ready.sh"
     run "远端已落盘 WEIGHTS_READY（含 sha256 校验结论）" bash -c '
       out=$(timeout 30 ssh -o ConnectTimeout=8 -o BatchMode=yes -F "${SSH_CFG:-/root/lvllm/tmp/sshcfg}" "${HOST:-gpu}" \

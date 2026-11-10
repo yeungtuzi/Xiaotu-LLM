@@ -42,7 +42,7 @@ ROUNDS = int(os.environ.get("ROUNDS", "3"))
 N = int(os.environ.get("N", "1200"))
 ARM_FILTER = [a for a in os.environ.get("ARM_FILTER", "").split(",") if a]
 NEEDLE = int(os.environ.get("NEEDLE", "981273"))
-MAXTOK = int(os.environ.get("MAXTOK", "64"))
+MAXTOK = int(os.environ.get("MAXTOK", "2048"))
 UUID_FIXED = os.environ.get("UUID_FIXED", "")
 
 BASE = "You are a helpful assistant. Answer using only the document.\n\n"
@@ -89,12 +89,14 @@ def metrics_hits():
 def ask(prompt):
     # ⚠️ 2026-11-10：官方 1017 权重**没有 chat template**（tokenizer_config 里没有该键），
     #    因此 `/v1/chat/completions` 在真权重上不可依赖 ⇒ 与 probe_dump_long.py 一致改用 completions。
+    # ⛔ 2026-11-10 实测更正（台账 #274）：走 `/v1/chat/completions`。
+    #    /v1/completions 在真权重下会立刻 EOS（text=''），ignore_eos 后输出胡话。
     body = json.dumps({
         "model": "DeepSeek-V4.1-Flash",
-        "prompt": prompt,
+        "messages": [{"role": "user", "content": prompt}],
         "max_tokens": MAXTOK, "temperature": 0, "top_p": 1,
     }).encode()
-    req = urllib.request.Request("http://127.0.0.1:%d/v1/completions" % PORT,
+    req = urllib.request.Request("http://127.0.0.1:%d/v1/chat/completions" % PORT,
                                  data=body, headers={"Content-Type": "application/json"})
     h0 = metrics_hits()
     t0 = time.time()
@@ -102,7 +104,7 @@ def ask(prompt):
         d = json.loads(resp.read())
     dt = time.time() - t0
     h1 = metrics_hits()
-    out = d["choices"][0].get("text") or ""
+    out = (d["choices"][0].get("message") or {}).get("content") or ""
     usage = d.get("usage") or {}
     cached = (usage.get("prompt_tokens_details") or {}).get("cached_tokens")
     if cached is None and h0 is not None and h1 is not None:

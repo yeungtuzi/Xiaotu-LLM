@@ -21,6 +21,9 @@ set -uo pipefail
 
 N="${N:-7430}"
 CNT="${CNT:-8}"
+# 口径门槛：单条必须真有这么长（N=7430 ⇒ ≈131,774 tokens，台账 #221）。
+# 低于它说明服务截断/参数不对，此时"8/8 未复现"测的不是 131K，不能算数（台账 #226）。
+MIN_PTOK="${MIN_PTOK:-120000}"
 DEPTH="${DEPTH:-0.5}"
 TAG="${TAG:-repro}"
 PORT="${PORT:-8700}"
@@ -32,7 +35,9 @@ LOG="$OUT_DIR/${TAG}-$(date +%Y%m%d-%H%M%S).log"
 cd "$(dirname "$0")/.." || exit 1
 
 # 就绪自检：只读端口，不重启
+# SKIP_HEALTH=1 仅用于**离线回归测试**（用假探针替身，见 test_repro_guard.sh）；生产绝不要设。
 code=$(curl -s -o /dev/null -w '%{http_code}' --max-time 5 "http://127.0.0.1:${PORT}/health" || true)
+[ "${SKIP_HEALTH:-0}" = "1" ] && code=200
 if [ "$code" != "200" ]; then
     echo "⛔ 服务未就绪（health=$code, port=$PORT）；先起服务，本脚本不会替你重启" | tee -a "$LOG"
     exit 2
@@ -40,18 +45,30 @@ fi
 
 echo "=== degen_repro tag=$TAG N=$N cnt=$CNT depth=$DEPTH port=$PORT $(date -Iseconds)" | tee -a "$LOG"
 
-ok=0; bad=0; first_bad=""
+ok=0; bad=0; first_bad=""; short_ctx=0
 for i in $(seq 1 "$CNT"); do
     uuid=$(printf "%s%02d%010x" "${TAG:0:2}" "$i" $((RANDOM * RANDOM)))
-    line=$("$PY" scripts/probe_dump_long.py --n "$N" --uuid "$uuid" --depth "$DEPTH" --maxtok 64 2>&1 | tail -1)
+    line=$("$PY" scripts/probe_dump_long.py --n "$N" --uuid "$uuid" --depth "$DEPTH" --maxtok "${MAXTOK:-2048}" 2>&1 | tail -1)
     echo "[$i] $(date -Iseconds) $line" | tee -a "$LOG"
+    # 先判口径（长度）再判命中：长度不对的条目既不算通过也不算失败，而是让整轮作废
+    if ! bash "$(dirname "$0")/ptok_check.sh" "$line" "$MIN_PTOK" > /dev/null 2>&1; then
+        echo "[$i] ⛔ 口径不符（ptok < $MIN_PTOK 或无 ptok 字段）⇒ 本条不计分" | tee -a "$LOG"
+        echo "[$i]    原始行：${line:0:120}" | tee -a "$LOG"
+        short_ctx=$((short_ctx + 1))
+        continue
+    fi
     case "$line" in
         *"命中=✓"*) ok=$((ok + 1)) ;;
         *) bad=$((bad + 1)); [ -z "$first_bad" ] && first_bad="$i" ;;
     esac
 done
 
-echo "=== 汇总 ok=$ok bad=$bad 首个失败=$([ -n "$first_bad" ] && echo "#$first_bad" || echo 无)" | tee -a "$LOG"
+echo "=== 汇总 ok=$ok bad=$bad 口径不符=$short_ctx 首个失败=$([ -n "$first_bad" ] && echo "#$first_bad" || echo 无)" | tee -a "$LOG"
+if [ "$short_ctx" -gt 0 ]; then
+    echo "⛔ 有 $short_ctx 条上下文不足 $MIN_PTOK tokens ⇒ 本轮不能当作 131K 的结论" | tee -a "$LOG"
+    echo "   先查 MAXLEN / MAX_NUM_BATCHED_TOKENS / 服务是否截断" | tee -a "$LOG"
+    exit 2
+fi
 
 if [ "$ok" = "$CNT" ]; then
     echo "✅ 未复现退化（$CNT/$CNT）：该口径可作为修复候选，需再跑 (A)(B)(C) 正式验收" | tee -a "$LOG"

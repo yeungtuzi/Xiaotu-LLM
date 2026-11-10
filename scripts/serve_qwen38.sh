@@ -59,12 +59,18 @@ GPU_PREFILL_MIN="${GPU_PREFILL_MIN:-2048}"
 # ⭐ 2026-10-19【最优默认】12 层精选常驻(按 CPU 时间/活跃专家数选出;B1053/B1055)
 #   实测 15K 自然结束:decode 46.0/43.8/44.0(C=1/2/4),比无常驻的 45.6 更高、步时更低 ✓
 #   ⛔ 不要再叠加热专家池:12 层 + 64 槽会挤爆 KV(实测 `No available memory for the cache blocks`)
-XIAOTU_MOE_GPU_RESIDENT_LAYERS="${XIAOTU_MOE_GPU_RESIDENT_LAYERS:-15,9,11,16,31,3,39,25,7,23,24,13}"  # ⭐ 0.2.9 实测最优:>0 才启用 tile 环(0=关!)
+# `-` 而不是 `:-`:显式传空串表示"关闭常驻",不会被默认 12 层重新填回。
+# 同时接受 none/off/disabled/0;`0` 不再被误解释为"只常驻 layer 0"。
+XIAOTU_MOE_GPU_RESIDENT_LAYERS="${XIAOTU_MOE_GPU_RESIDENT_LAYERS-15,9,11,16,31,3,39,25,7,23,24,13}"
+case "${XIAOTU_MOE_GPU_RESIDENT_LAYERS,,}" in
+  none|off|disabled|false|0) XIAOTU_MOE_GPU_RESIDENT_LAYERS="" ;;
+esac
 # MUSA correctness profile: opt-in, conservative; never touches the CUDA defaults above.
 if [ "${XTU_MUSA_CORRECTNESS:-0}" = "1" ]; then
   echo "[qwen38] MUSA correctness profile: CPU experts, no resident, no GPU prefill, eager, 8K"
   export GPU_DEVICE=MUSA
   export VLLM_EXPERTS_LOAD_DEVICE=cpu
+  EXPERTS_LOAD_DEVICE=cpu
   export XIAOTU_MOE_GPU_RESIDENT_LAYERS=""
   export XIAOTU_PLE_CPU=0
   export XIAOTU_SPEC_DECODE=0
@@ -75,6 +81,9 @@ if [ "${XTU_MUSA_CORRECTNESS:-0}" = "1" ]; then
   SEQS="${MUSA_SEQS:-1}"
   MBT="${MUSA_MBT:-8192}"
 fi
+# ⚠️ 必须在 MUSA 块之后快照:MUSA profile 会把 VLLM_EXPERTS_LOAD_DEVICE 强制为 cpu,
+# 若在块之前取值,调用方显式 gpu 会绕过 profile,出现“打印 CPU experts 却用 gpu 启动”。
+EXPERTS_LOAD_DEVICE="${VLLM_EXPERTS_LOAD_DEVICE:-cpu}"
 KV_DTYPE="${KV_DTYPE:-auto}"
 TOOL_PARSER="${TOOL_PARSER:-}"
 REASONING_PARSER="${REASONING_PARSER:-}"
@@ -99,7 +108,7 @@ NCTL=(); [ -n "$NUMA_CMD" ] && NCTL=($NUMA_CMD)
 {
   echo "XIAOTU_MOE_THREADS=$THREADS"
   echo "XIAOTU_MOE_SPIN_IDLE_US=${SPIN_IDLE_US:-300}"
-  echo "VLLM_EXPERTS_LOAD_DEVICE=${VLLM_EXPERTS_LOAD_DEVICE:-gpu}"
+  echo "VLLM_EXPERTS_LOAD_DEVICE=$EXPERTS_LOAD_DEVICE"
   echo "VLLM_XIAOTU_GPU_PREFILL_MIN_TOKENS=$GPU_PREFILL_MIN"
   echo "XIAOTU_PLE_CPU=$PLE_CPU"
   echo "XIAOTU_RELEASE_SOURCE=${XIAOTU_RELEASE_SOURCE:-1}"
@@ -122,10 +131,11 @@ NCTL=(); [ -n "$NUMA_CMD" ] && NCTL=($NUMA_CMD)
   if [ -n "${XIAOTU_MOE_ASYNC:-}" ]; then echo "XIAOTU_MOE_ASYNC=$XIAOTU_MOE_ASYNC"; fi
   # ⭐ 2026-10-19:第一步=静态驻留(启动期装载,decode 期零传输)⇒ 该开关必须能被透传
   if [ -n "${XIAOTU_PIN_STATIC:-}" ]; then echo "XIAOTU_PIN_STATIC=$XIAOTU_PIN_STATIC"; fi
-  if [ -n "${XIAOTU_MOE_GPU_RESIDENT_LAYERS:-}" ]; then echo "XIAOTU_MOE_GPU_RESIDENT_LAYERS=$XIAOTU_MOE_GPU_RESIDENT_LAYERS"; fi
+  # 无条件写:关闭时写空行,日志可见且能覆盖启动器环境/旧 /tmp 桥的残留值。
+  echo "XIAOTU_MOE_GPU_RESIDENT_LAYERS=$XIAOTU_MOE_GPU_RESIDENT_LAYERS"
   # qfn NVFP4：必须经 env 桥，否则 worker 子进程看不到
   if [ -n "${XTU_NVFP4_GPU:-}" ]; then echo "XTU_NVFP4_GPU=$XTU_NVFP4_GPU"; fi
-  if [ -n "${VLLM_EXPERTS_LOAD_DEVICE:-}" ]; then echo "VLLM_EXPERTS_LOAD_DEVICE=$VLLM_EXPERTS_LOAD_DEVICE"; fi
+
   # ⭐ 2026-10-19:逐层 CPU 计时(选常驻层要用)与池的逐层集中度统计
   if [ -n "${XIAOTU_CD_TIMING:-}" ]; then echo "XIAOTU_CD_TIMING=$XIAOTU_CD_TIMING"; fi
   if [ -n "${XIAOTU_CD_TIMING_EVERY:-}" ]; then echo "XIAOTU_CD_TIMING_EVERY=$XIAOTU_CD_TIMING_EVERY"; fi
@@ -178,13 +188,14 @@ fi
 
 echo "[qwen38] tag=$TAG port=$PORT gpus=$GPUS tp=$TP maxlen=$MAXLEN mbt=$MBT load=$LOAD"
 echo "[qwen38] PLE_CPU=$PLE_CPU(必须=1,否则单卡 OOM)  eager=$EAGER  gpu_prefill_min=$GPU_PREFILL_MIN"
+echo "[qwen38] experts_load=$EXPERTS_LOAD_DEVICE  resident=${XIAOTU_MOE_GPU_RESIDENT_LAYERS:-<空=全CPU>}"
 echo "[qwen38] ckpt=$CKPT"
 echo "[qwen38] log=$LOG   envfile=$XTU_ENV_FILE"
 
 if [ "${DRYRUN:-0}" = "1" ]; then
   printf '[qwen38] DRYRUN gpus=%s tp=%s: ' "$GPUS" "$TP"
   printf '%q ' env CUDA_VISIBLE_DEVICES="$GPUS" PYTHONPATH="${XTU_TREE:-/home/user/lvllm/process_data/ref/repos/vllm-mainline}" \
-    VLLM_EXPERTS_LOAD_DEVICE=cpu XIAOTU_ENV_FILE="$XTU_ENV_FILE" "$PY" -m vllm.entrypoints.openai.api_server "${ARGS[@]}"
+    VLLM_EXPERTS_LOAD_DEVICE="$EXPERTS_LOAD_DEVICE" XIAOTU_ENV_FILE="$XTU_ENV_FILE" "$PY" -m vllm.entrypoints.openai.api_server "${ARGS[@]}"
   printf '\n'; exit 0
 fi
 
@@ -349,7 +360,7 @@ rm -f "$LOG" 2>/dev/null || true
     VLLM_ENGINE_READY_TIMEOUT_S="${VLLM_ENGINE_READY_TIMEOUT_S:-7200}" \
     VLLM_HANDSHAKE_TIMEOUT_MINS="${VLLM_HANDSHAKE_TIMEOUT_MINS:-120}" \
     VLLM_USE_FLASHINFER_SAMPLER=0 \
-    VLLM_EXPERTS_LOAD_DEVICE=cpu \
+    VLLM_EXPERTS_LOAD_DEVICE="$EXPERTS_LOAD_DEVICE" \
     XIAOTU_ENV_FILE="$XTU_ENV_FILE" \
     XIAOTU_PLE_CPU="$PLE_CPU" \
     VLLM_XIAOTU_GPU_PREFILL_MIN_TOKENS="$GPU_PREFILL_MIN" \

@@ -32,7 +32,7 @@ def main() -> int:
     ap.add_argument("--n", type=int, default=800)
     ap.add_argument("--uuid", default="")
     ap.add_argument("--depth", type=float, default=0.5)
-    ap.add_argument("--maxtok", type=int, default=16)
+    ap.add_argument("--maxtok", type=int, default=2048)
     a = ap.parse_args()
     needle_row = int(a.n * a.depth)
     uid = a.uuid or os.urandom(8).hex()
@@ -40,13 +40,16 @@ def main() -> int:
     prompt = ("You are a helpful assistant. Answer using only the document.\n\n"
               + uid + "\n\n" + body
               + "\n\nWhat is the access code for project Q? Answer with the number only.")
-    # ⚠️ 2026-11-10 预检发现：1017 的官方权重目录**不含 chat template**
-    #    （tokenizer_config.json 里没有 chat_template 键，也没有 chat_template.jinja），
-    #    因此 `/v1/chat/completions` 这条路径不可依赖 ⇒ 这里直接用 `/v1/completions`。
-    #    语义不变：仍然是把整段文档喂进去、问一个数字。
-    payload = {"model": "DeepSeek-V4.1-Flash", "prompt": prompt,
+    # ⛔ 2026-11-10 23:xx 实测更正（台账 #274）：**必须走 `/v1/chat/completions`**。
+    #    早先据"tokenizer_config 里没有 chat_template 键"推断 chat 路径不可用 ⇒ 改用 /v1/completions，
+    #    结果真权重下模型**立刻 EOS**（text='' / completion_tokens=1），加 ignore_eos 后输出
+    #    完全不相关的胡话（它把这当成续写任务）。
+    #    实测 `/v1/chat/completions` ⇒ `740317`（正确、44 tokens）⇒ 本模型是**指令/对话**形态，
+    #    服务端有其自带的对话模板。
+    payload = {"model": "DeepSeek-V4.1-Flash",
+               "messages": [{"role": "user", "content": prompt}],
                "max_tokens": a.maxtok, "temperature": 0, "top_p": 1}
-    req = urllib.request.Request("http://127.0.0.1:%d/v1/completions" % PORT,
+    req = urllib.request.Request("http://127.0.0.1:%d/v1/chat/completions" % PORT,
                                  data=json.dumps(payload).encode(),
                                  headers={"Content-Type": "application/json"})
     t0 = time.time()
@@ -54,7 +57,7 @@ def main() -> int:
         d = json.loads(resp.read())
     dt = time.time() - t0
     ch = d["choices"][0]
-    text = ch.get("text") or ""
+    text = (ch.get("message") or {}).get("content") or ""
     usage = d.get("usage") or {}
     details = usage.get("prompt_tokens_details") or {}
     cached = details.get("cached_tokens")

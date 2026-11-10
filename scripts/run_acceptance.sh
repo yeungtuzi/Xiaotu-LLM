@@ -20,8 +20,11 @@ A_ROUNDS="${A_ROUNDS:-10}"
 B_ROUNDS="${B_ROUNDS:-3}"
 N="${N:-1200}"
 # 验收 A 的**口径**必须够长：退化只在长上下文出现（台账 #224）。
-# 词表近似 1.3 token/词 ⇒ 100000 词 ≈130K tokens；不足 REQUIRE_LONG_TOKENS 时 A 会自行判不通过。
-LEN="${LEN:-100000}"
+# 【2026-11-10 实测·台账 #255】用**真 tokenizer** 数过（不是估）：
+#   LEN=100000 词 → 156,184 tokens（ratio 1.563）
+#   LEN= 80000 词 → 125,044 tokens  ← 默认值（比门槛 120,000 留 4.2% 余量，且比 10 万词省 ~20% 时间）
+#   LEN= 77000 词 → 120,326 tokens（余量仅 0.3%，太薄，不用）
+LEN="${LEN:-80000}"
 REQUIRE_LONG_TOKENS="${REQUIRE_LONG_TOKENS:-120000}"
 MAXTOK="${MAXTOK:-64}"
 RUN_DIR="${RUN_DIR:-/home/user/lvllm/run}"

@@ -83,7 +83,12 @@ else
       timeout 120 ssh -o ConnectTimeout=8 -o BatchMode=yes -F "${SSH_CFG:-/root/lvllm/tmp/sshcfg}" "${HOST:-gpu}" \
         "cd /home/user/lvllm/vllm-xiaotu-moe && bash scripts/prelaunch_mem_gate.sh --need-gib 900 --gpus 1,2 --tag prod" 2>&1 | tail -6
       rc=${PIPESTATUS[0]:-1}
-      [ "$rc" = 0 ] || { echo "   内存门 rc=$rc（0 才许启动）"; exit 1; }' _
+      [ "$rc" = 0 ] || { echo "   内存门 rc=$rc（0 才许启动）"; exit 1; }
+      # 磁盘：权重 510 GB + 日志/转储。少于 50 GB 就别起（避免跑一半写满盘）。
+      avail=$(timeout 30 ssh -o ConnectTimeout=8 -o BatchMode=yes -F "${SSH_CFG:-/root/lvllm/tmp/sshcfg}" "${HOST:-gpu}" \
+              "df -BG --output=avail /home | tail -1 | tr -dc 0-9")
+      echo "   /home 可用 ${avail:-?} GB"
+      [ "${avail:-0}" -ge 50 ] || { echo "   磁盘不足 50 GB（当前 ${avail:-?} GB）"; exit 1; }' _
 fi
 
 printf '\n════════ 结论：'

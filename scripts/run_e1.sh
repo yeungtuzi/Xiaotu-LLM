@@ -50,7 +50,8 @@ mkdir -p "$(dirname "$TRIG")" && touch "$TRIG" && say "✅ 触发文件已就位
 # ③ 8 条 131K 连发（复用既有复现器，避免两套逻辑）
 OUT="$RUN_DIR/${TAG}_e1.txt"
 say "… 开始 ${CNT} 条 131K（每条约 2.3 min prefill，总计约 $((CNT * 3)) 分钟）"
-if ! CNT="$CNT" TAG="$TAG" bash "$HERE/degen_repro.sh" > "$OUT" 2>&1; then
+# ⚠️ PORT 必须一起传：degen_repro.sh 自己也读 PORT=${PORT:-8700}，不传就会打到 8700
+if ! PORT="$PORT" CNT="$CNT" TAG="$TAG" bash "$HERE/degen_repro.sh" > "$OUT" 2>&1; then
     say "⚠️ degen_repro 返回非 0（仍继续分析，看是哪几条失败）"
 fi
 say "原始输出：$OUT"

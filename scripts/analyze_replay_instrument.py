@@ -54,6 +54,7 @@ def verdict(path: str) -> int:
         return 1
     print(f"共 {len(steps)} 个重放步；逐条按三条判据检查：")
     bad = []
+    skipped_chunks = 0
     for i, g in enumerate(steps, 1):
         comp = [x.strip() for x in g["computed"].split(",") if x.strip()]
         start = [x.strip() for x in g["start"].split(",") if x.strip()]
@@ -62,17 +63,27 @@ def verdict(path: str) -> int:
         for j in idxs:
             c = comp[j] if j < len(comp) else "?"
             st = start[j] if j < len(start) else "?"
-            ok_computed = (c == st)
-            ok_pad = (pad == 128)
-            if not (ok_computed and ok_pad):
-                reason = []
-                if not ok_computed:
-                    reason.append(f"computed({c}) != replay_start({st}) ⇒ 调度侧重绕")
-                if not ok_pad:
-                    reason.append(f"pad_added={pad} != 128 ⇒ pad 语义")
-                bad.append((i, j, "; ".join(reason)))
+            try:
+                ci, si = int(c), int(st)
+            except ValueError:
+                bad.append((i, j, f"字段不可解析 computed={c} replay_start={st}"))
+                continue
+            # ⚠️ 关键：长 prompt 会被**分块 prefill** ⇒ 同一请求出现在多个步里。
+            #   只有"首个 chunk"带重放与 pad：那一步 computed == replay_start 且 pad_added == 128。
+            #   后续 chunk 的 computed > replay_start、pad_added == 0 属于**正常**，必须跳过，
+            #   否则会在真权重上产生假告警（本脚本的 dummy 演练实测踩到，见台账 #158）。
+            if ci == si:
+                if pad != 128:
+                    bad.append((i, j, f"重放步 pad_added={pad} != 128 ⇒ pad 语义"))
+            elif ci > si:
+                skipped_chunks += 1
+                if pad != 0:
+                    bad.append((i, j, f"非首个 chunk 却发生 pad（pad_added={pad}）⇒ pad 语义"))
+            else:
+                bad.append((i, j, f"computed({ci}) < replay_start({si}) ⇒ 调度侧重绕"))
     if not bad:
-        print("✅ 三条判据全满足：hit=1 / computed == replay_start / pad_added=128")
+        print("✅ 三条判据全满足：hit=1 / computed == replay_start / pad_added=128"
+              f"（另外跳过 {skipped_chunks} 个'后续 chunk'，属正常分块 prefill）")
         return 0
     for i, j, why in bad[:12]:
         print(f"❌ 第 {i} 个重放步（批内第 {j} 个请求）：{why}")

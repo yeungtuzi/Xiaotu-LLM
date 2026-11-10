@@ -13,13 +13,14 @@
 set -uo pipefail
 PORT="${PORT:-8700}"
 CNT="${CNT:-8}"
-TAG="${TAG:-e1}"
+TAG="${TAG:-e1}"                 # 复现产物的标签
+INSTANCE_TAG="${INSTANCE_TAG:-prod}"  # 服务的 TAG（决定读哪份实例日志）
 RUN_DIR="${RUN_DIR:-/home/user/lvllm/run}"
 TREE="${TREE:-/home/user/lvllm/process_data/ref/repos/vllm-mainline}"
 HERE="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
 DBG="$TREE/../run/dbg.patch"
 TRIG="$RUN_DIR/triggers/swa_bounded_replay_dbg"
-LOG="$RUN_DIR/ds41_prod.log"
+LOG="$RUN_DIR/ds41_${INSTANCE_TAG}.log"
 
 say() { printf '[e1] %s\n' "$*"; }
 
@@ -60,7 +61,7 @@ tail -n "$CNT" "$OUT" | sed 's/^/[e1]   /'
 # ④ 判据
 VD="$RUN_DIR/${TAG}_verdict.txt"
 if [ ! -f "$LOG" ]; then
-    say "⛔ 找不到实例日志 $LOG ⇒ 无法分析仪器输出"
+    say "⛔ 找不到实例日志 $LOG ⇒ 用 INSTANCE_TAG=<服务TAG> 指定（当前 $INSTANCE_TAG）"
     exit 2
 fi
 python3 "$HERE/analyze_replay_instrument.py" "$LOG" --verdict | tee "$VD"

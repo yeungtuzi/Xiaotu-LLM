@@ -17,6 +17,9 @@ TAG="${TAG:-e1}"                 # 复现产物的标签
 INSTANCE_TAG="${INSTANCE_TAG:-prod}"  # 服务的 TAG（决定读哪份实例日志）
 RUN_DIR="${RUN_DIR:-/home/user/lvllm/run}"
 TREE="${TREE:-/home/user/lvllm/process_data/ref/repos/vllm-mainline}"
+PY_BIN="${PY_BIN:-/home/user/anaconda3/envs/vllm-xiaotu-moe/bin/python}"
+N="${N:-7430}"
+DEPTH="${DEPTH:-0.5}"
 HERE="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
 DBG="$TREE/../run/dbg.patch"
 TRIG="$RUN_DIR/triggers/swa_bounded_replay_dbg"
@@ -57,6 +60,15 @@ if ! PORT="$PORT" CNT="$CNT" TAG="$TAG" bash "$HERE/degen_repro.sh" > "$OUT" 2>&
 fi
 say "原始输出：$OUT"
 tail -n "$CNT" "$OUT" | sed 's/^/[e1]   /'
+
+# ③b 保证"一定有缓存命中"的两次同 prompt（degen_repro 每条都用不同 uuid ⇒ cached=0，
+#     只有这一步能保证仪器里出现 hit=1 的重放步；否则 --verdict 会报"没有 hit=1 的 prefill 步"）
+HITOUT="$RUN_DIR/${TAG}_hits.txt"
+say "… 追加 2 条**完全相同**的长 prompt（固定 uuid）以确保出现命中重放步"
+for k in 1 2; do
+    PORT="$PORT" "$PY_BIN" "$HERE/probe_dump_long.py" --n "${N:-7430}" --uuid "e1fixed00" \
+        --depth "${DEPTH:-0.5}" --maxtok 8 2>&1 | tail -1 | sed "s/^/[e1]  hit#$k /" | tee -a "$HITOUT"
+done
 
 # ④ 判据
 VD="$RUN_DIR/${TAG}_verdict.txt"

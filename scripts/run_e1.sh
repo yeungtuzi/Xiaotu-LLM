@@ -34,6 +34,23 @@ if ! curl -s -o /dev/null --max-time 4 "http://127.0.0.1:${PORT}/health"; then
 fi
 say "✅ 服务在 ${PORT}"
 
+# ①b 口径自检：只认**引擎日志里的自报**（不是"旗标传了"）
+if [ -f "$LOG" ]; then
+    if grep -aq "开关开但表缺失\|建池失败" "$LOG"; then
+        say "⛔ 日志里出现 'PIN 表缺失 / 建池失败' ⇒ 这不是生产口径（GPU 专家驻留没生效）"
+        say "   先把 XIAOTU_PIN_TABLE 指到存在的表并重启，再跑 E1"
+        exit 2
+    fi
+    grep -aq "Decoder SWA bounded replay: in eager prefill steps" "$LOG" \
+        && say "✅ 日志确认 decoder-side SWA bounded replay 生效" \
+        || say "⚠️ 日志里没看到重放生效的自报行（对照 RUNBOOK 五查第 ⑤ 条）"
+    grep -aq "enable_prefix_caching=True" "$LOG" \
+        && say "✅ 日志确认内存前缀缓存开启" \
+        || say "⚠️ 日志里没看到 enable_prefix_caching=True（对照 RUNBOOK 五查第 ⑤ 条）"
+else
+    say "⚠️ 找不到日志 $LOG ⇒ 跳过口径自检（INSTANCE_TAG=${INSTANCE_TAG}）"
+fi
+
 # ② 仪器补丁（幂等：已打过就跳过）
 if grep -qs "xtu-swa-bounded-replay" "$TREE/vllm/models/deepseek_v41/nvidia/model_state.py"; then
     say "✅ 仪器补丁已在树里"

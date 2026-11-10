@@ -182,9 +182,36 @@ def main():
         #    ⇒ 它的 cached 本来就应该"大"。旧检查把它和 `unique` 归为一类（要求 cached 小），
         #    与 design 自相矛盾 —— 一旦生效就会在"一切正常"时打印 ARM-BROKEN。
         #    改为：只报告、不否决（其值在汇总里可见）。
+    # ⚠️ 2026-11-10 补：**没有证据也算不通过** —— 原实现每个检查都写成 `and c`，
+    #    当 cached_tokens 全为 None（没回 usage、/metrics 也拿不到）时，四个检查全部静默跳过，
+    #    于是"命中率 100%"照常打印、退出码 0。这正是 B 最危险的假通过通道（同台账 #223）。
+    no_ev = [a for a in arms if not any(isinstance(x, int) for x in st[a]["cached"])]
+    if no_ev:
+        print("ARM-BROKEN: 这些臂缺少 cached_tokens 证据（既无 usage.prompt_tokens_details.cached_tokens，"
+              "也无 /metrics 差值）⇒ 无法证明缓存参与过，本轮结论作废：%s" % no_ev, flush=True)
+        return 3
     if bad:
         print("ARM-BROKEN: 这些臂的 cached_tokens 与预期不符 ⇒ 本轮结论作废：%s" % bad, flush=True)
         return 3
+    # ⚠️ 2026-11-10 补（台账 #259）：**判据必须包含命中率**。
+    #    原实现只校验 cached_tokens 的形态，命中数只打印、不影响退出码 ⇒
+    #    "unique 臂答错一半"也会 rc=0，于是验收 B（要求 unique 100%）形同虚设。
+    acc_bad = []
+    for arm in arms:
+        s_ = st[arm]
+        if s_["n"] == 0:
+            acc_bad.append("%s(未执行)" % arm)
+        elif arm == "unique" and s_["ok"] < s_["n"]:
+            acc_bad.append("unique(%d/%d)" % (s_["ok"], s_["n"]))
+    if acc_bad:
+        print("ACC-FAIL: 命中率不达标 ⇒ 本轮不算通过：%s" % acc_bad, flush=True)
+        return 4
+    # shared/tail 的命中率只报告不否决（B 的判据只要求 unique 100%），但必须可见
+    for arm in arms:
+        s_ = st[arm]
+        if arm != "unique" and s_["ok"] < s_["n"]:
+            print("⚠️ 注意：%s 臂命中 %d/%d（B 判据不要求它 100%%，但异常值应追查）"
+                  % (arm, s_["ok"], s_["n"]), flush=True)
     return 0
 
 

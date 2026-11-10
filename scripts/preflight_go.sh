@@ -64,6 +64,13 @@ if [ "$DRY" = 1 ]; then
     skip "GPU/内存门 + 端口/PID 归属"
 else
     run "部署一致性（远端副本 vs 本地真源）" bash "$ROOT/scripts/check_deploy_parity.sh"
+    # 4b) 仪器补丁**是否已打进远端那棵树**（只看本地 md5 不够：文件在 ≠ 已应用）
+    #     不通过就别起服务 —— 否则 E1 会缺 `[xtu-swa-bounded-replay]` 证据行，白烧 20–40 分钟。
+    run "仪器补丁已在远端 vLLM 树里" bash -c '
+      n=$(timeout 30 ssh -o ConnectTimeout=8 -o BatchMode=yes -F "${SSH_CFG:-/root/lvllm/tmp/sshcfg}" "${HOST:-gpu}" \
+          "grep -c xtu-swa-bounded-replay /home/user/lvllm/process_data/ref/repos/vllm-mainline/vllm/models/deepseek_v41/nvidia/model_state.py 2>/dev/null || echo 0")
+      echo "   命中行数=$n"
+      [ "${n:-0}" -ge 2 ] || { echo "   未应用 ⇒ 先按 RESUME 2.6 打补丁（$n 行 < 2）"; exit 1; }' _
     # 注意：这里**不**跑 --sha（对两个 101 GB 分片做 sha256 要 ~10 分钟）；
     # sha 已由远端常驻守望 `weights_watch_remote.sh` 在落盘 WEIGHTS_READY 前算过（见 #241）。
     run "权重就绪（分片齐备 + 模型口径）" bash "$ROOT/scripts/check_weights_ready.sh"

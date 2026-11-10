@@ -73,8 +73,11 @@ def verdict(path: str) -> int:
             #   后续 chunk 的 computed > replay_start、pad_added == 0 属于**正常**，必须跳过，
             #   否则会在真权重上产生假告警（本脚本的 dummy 演练实测踩到，见台账 #158）。
             if ci == si:
-                if pad != 128:
-                    bad.append((i, j, f"重放步 pad_added={pad} != 128 ⇒ pad 语义"))
+                # 期望 pad 数 = min(窗口, 命中长度)：命中不足一个窗口时，重放行数就是命中长度。
+                # 固定写 128 会在"短命中"（生产并发下很常见）时产生假告警。
+                want = min(128, si)
+                if pad != want:
+                    bad.append((i, j, f"重放步 pad_added={pad} != min(128, replay_start)={want} ⇒ pad 语义"))
             elif ci > si:
                 skipped_chunks += 1
                 if pad != 0:

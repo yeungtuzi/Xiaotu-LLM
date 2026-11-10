@@ -7,7 +7,7 @@
   * `computed  < replay_start`  ⇒ 异常（调度重绕）
 
 本测试用**合成日志**覆盖 5 种形态，断言退出码与结论文字。无需 GPU / 无需服务。
-退出码：0 = 5 个分支都符合预期；1 = 有偏差。
+退出码：0 = 7 个分支都符合预期；1 = 有偏差。
 """
 from __future__ import annotations
 
@@ -37,6 +37,12 @@ CASES = [
     ("后续 chunk 却发生 pad ⇒ 异常",
      LINE.format(reqs=1, pf="[1]", ql="[8178]", comp="[16242]", st="[8064]", hit=1, pad=128), 1,
      "非首个 chunk 却发生 pad"),
+    ("短命中：replay_start=64 ⇒ pad 期望 64",
+     LINE.format(reqs=1, pf="[1]", ql="[128]", comp="[64]", st="[64]", hit=1, pad=64), 0,
+     "三条判据全满足"),
+    ("短命中却按 128 pad ⇒ 异常",
+     LINE.format(reqs=1, pf="[1]", ql="[128]", comp="[64]", st="[64]", hit=1, pad=128), 1,
+     "pad 语义"),
     ("computed < replay_start ⇒ 调度重绕",
      LINE.format(reqs=1, pf="[1]", ql="[212]", comp="[1024]", st="[9216]", hit=1, pad=128), 1,
      "调度侧重绕"),
@@ -69,4 +75,4 @@ print()
 if fail:
     print(f"❌ {fail} 个分支不符合预期")
     raise SystemExit(1)
-print("✅ 5 个分支全部符合预期（健康/跳过后继 chunk/缺 pad/多余 pad/调度重绕）")
+print("✅ 7 个分支全部符合预期（健康/跳过后继 chunk/缺 pad/多余 pad/调度重绕）")

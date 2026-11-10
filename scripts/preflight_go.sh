@@ -72,6 +72,7 @@ else
             "cat /home/user/lvllm/logs/WEIGHTS_READY 2>/dev/null || echo __MISSING__")
       case "$out" in __MISSING__|"") echo "   没有 WEIGHTS_READY（守望还没通过 sha 校验）"; exit 1;; esac
       echo "   $out"' _
+    run "PIN 表可用（存在 / XTUP 魔数 / 大小合理）" bash "$ROOT/scripts/check_pin_table.sh"
     run "模型配置可解析（vLLM get_config）" bash "$ROOT/scripts/check_model_config.sh"
     if [ "$SKIP_MARLIN" = 1 ]; then
         skip "MARLIN 融合内核可用" "SKIP_MARLIN=1（⚠️ 本轮 MARLIN=1 将是假口径，报告须注明）"

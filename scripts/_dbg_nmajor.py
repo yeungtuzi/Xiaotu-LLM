@@ -48,4 +48,5 @@ if not torch.equal(ia,ib):
     d=(ia.float()-ib.float()).abs()
     print(f"       inter |Δ| max={d.max():.3e} 不同元素 {int((d>0).sum())}/{d.numel()}")
 print(f"  ⭐⭐ out 逐位相同 = {bool(torch.equal(oa,ob))}")
-print(f"  ⇒ 结论:{"祸在【_gate_up_kernel】" if not torch.equal(ia,ib) else "gate_up 一致 ⇒ 祸在【_down_kernel】"}")
+_where = "祸在【_gate_up_kernel】" if not torch.equal(ia, ib) else "gate_up 一致 ⇒ 祸在【_down_kernel】"
+print(f"  ⇒ 结论:{_where}")

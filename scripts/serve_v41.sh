@@ -248,7 +248,9 @@ DEFAULT_CHAT_KWARGS="${DEFAULT_CHAT_KWARGS-{\"thinking\":true}}"   # 解析器�
 #
 #   ⚠️ 该机制要求 **Model Runner V2**(否则 attention.py 会 warning_once 后自行关闭):
 #   日志里若出现 "SWA bounded replay needs model runner V2" 就说明 CED 没生效。
-CED="${CED:-1}"
+# decoder-side SWA bounded replay 总闸（1=开，0=关）。
+# 历史别名 CED 仍接受（弃用），语义相同。
+SWA_BOUNDED_REPLAY="${SWA_BOUNDED_REPLAY:-${CED:-1}}"
 
 # COMPILE(默认 0 = 与 cellV/参考实现一致的 vLLM 默认:mode=NONE + cudagraph
 #   FULL_AND_PIECEWISE)。=1 时用参考实现 lk 的那组旗标
@@ -657,7 +659,7 @@ fi
     $( [ -n "$_KV_OFF_NORM" ] && [ -n "$KV_OFFLOAD_BACKEND" ] && printf -- '--kv-offloading-backend %s' "$KV_OFFLOAD_BACKEND" ) \
     $( [ "${PROMPT_TOKENS_DETAILS:-1}" = "1" ] && echo --enable-prompt-tokens-details ) \
     $( [ "${EAGER:-0}" = "1" ] && echo --enforce-eager )  \
-    $( [ "${CED:-1}" = "0" ] && echo --no-swa-bounded-replay ) \
+    $( [ "${SWA_BOUNDED_REPLAY:-1}" = "0" ] && echo --no-swa-bounded-replay ) \
     $( [ "${NO_CUSTOM_AR:-0}" = "1" ] && echo --disable-custom-all-reduce ) \
     $( [ "${SPEC:-1}" = "1" ] && echo --speculative-config "$SPEC_CONFIG" )  \
     $( [ -n "$CC_JSON" ] && printf -- '--compilation-config %s' "$CC_JSON" ) \

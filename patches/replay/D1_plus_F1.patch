@@ -1,0 +1,102 @@
+--- a/vllm/v1/attention/ops/metadata.py	2026-11-10 10:02:05.983055834 +0800
++++ b/vllm/v1/attention/ops/metadata.py	2026-11-10 13:02:13.636136189 +0800
+@@ -2,6 +2,8 @@
+ # SPDX-FileCopyrightText: Copyright contributors to the vLLM project
+ """Device-side request mapping and sparse indexer metadata."""
+ 
++import torch
++
+ from vllm.triton_utils import tl, triton
+ 
+ 
+@@ -27,6 +29,28 @@
+     tl.store(output + token, tl.where(token < num_mapped, req, 0), token < num_tokens)
+ 
+ 
++def compute_token_to_req_indices(
++    query_start_loc: torch.Tensor,
++    out: torch.Tensor,
++    num_mapped_tokens: int,
++    num_tokens: int,
++) -> torch.Tensor:
++    """Map each of the first ``num_tokens`` tokens to its request index.
++
++    Reads only the device ``query_start_loc``, so it is safe to record in a
++    CUDA graph. Tokens at or past ``num_mapped_tokens`` are mapped to 0.
++    """
++    _token_request_mapping_kernel[((num_tokens + 255) // 256,)](
++        query_start_loc,
++        out,
++        query_start_loc.shape[0] - 1,
++        num_mapped_tokens,
++        num_tokens,
++        num_warps=4,
++    )
++    return out[:num_tokens]
++
++
+ @triton.jit(
+     do_not_specialize=[
+         "num_reqs",
+--- a/vllm/v1/attention/backends/mla/sparse_swa.py	2026-11-10 10:02:05.983055834 +0800
++++ b/vllm/v1/attention/backends/mla/sparse_swa.py	2026-11-10 13:02:13.636136189 +0800
+@@ -32,6 +32,7 @@
+     get_dspark_swa_index_width,
+ )
+ from vllm.v1.attention.backends.utils import split_decodes_and_prefills
++from vllm.v1.attention.ops.metadata import compute_token_to_req_indices
+ from vllm.v1.attention.ops.flashmla import FlashMLASchedMeta, get_mla_metadata
+ from vllm.v1.kv_cache_interface import (
+     KVCacheSpec,
+@@ -830,7 +831,8 @@
+         self,
+         metadata: DeepseekSparseSWAMetadata,
+     ) -> None:
+-        if metadata.num_decode_tokens == 0:
++        num_decode_tokens = metadata.num_decode_tokens
++        if num_decode_tokens == 0:
+             return
+         assert metadata.query_start_loc is not None
+         assert metadata.seq_lens is not None
+@@ -840,6 +842,18 @@
+         assert metadata.decode_swa_lens is not None
+         assert metadata.replay_start is not None
+ 
++        # Recompute the validity mask and the token->request map from the device
++        # buffers every step: their padding differs from the dummy batch the
++        # graph was captured with, so a cached copy maps padded tokens to the
++        # wrong request (and the SWA readers then gather through stale slots).
++        torch.ge(metadata.slot_mapping, 0, out=metadata.is_valid_token)
++        compute_token_to_req_indices(
++            metadata.query_start_loc,
++            metadata.token_to_req_indices,
++            num_decode_tokens,
++            num_decode_tokens,
++        )
++
+         _COMPUTE_SWA_INDICES_AND_LENS_KERNEL(
+             metadata.decode_swa_indices,
+             metadata.decode_swa_lens,
+--- a/vllm/models/deepseek_v41/nvidia/model.py	2026-11-10 10:02:04.715025826 +0800
++++ b/vllm/models/deepseek_v41/nvidia/model.py	2026-11-10 13:02:13.636136189 +0800
+@@ -666,7 +666,10 @@
+             init_mhc_all_reduce(vllm_config)
+ 
+         # Reserved topk indices buffer for all Indexer layers to reuse.
+-        self.topk_indices_buffer = torch.empty(
++        # 【xtu-F1 2026-11-09】原先 torch.empty ⇒ 分配器残留会被 consumer 层读到
++        # （无层维度、无版本校验，见 dev-docs/DEGEN_STAGE_COMPARISON.md #92）。
++        # 先改为显式清零，验证"陈旧共享缓冲"是否就是长会话退化的根因。
++        self.topk_indices_buffer = torch.zeros(
+             vllm_config.scheduler_config.max_num_batched_tokens,
+             config.index_topk,
+             dtype=torch.int32,
+@@ -679,7 +682,7 @@
+         candidate_source_layer = getattr(config, "candidate_source_layer_id", -1)
+         candidate_topk_blocks = getattr(config, "candidate_topk_blocks", 0)
+         if candidate_source_layer >= 0 and candidate_topk_blocks > 0:
+-            self.candidate_block_buffer = torch.empty(
++            self.candidate_block_buffer = torch.zeros(   # xtu-F1：同上，显式清零
+                 vllm_config.scheduler_config.max_num_batched_tokens,
+                 candidate_topk_blocks,
+                 dtype=torch.int32,

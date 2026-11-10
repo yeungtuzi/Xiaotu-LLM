@@ -1,0 +1,23 @@
+--- a/vllm/models/deepseek_v41/nvidia/model.py	2026-10-03 21:02:24.171890000 +0800
++++ b/vllm/models/deepseek_v41/nvidia/model.py	2026-11-09 11:46:10.675794971 +0800
+@@ -666,7 +666,10 @@
+             init_mhc_all_reduce(vllm_config)
+ 
+         # Reserved topk indices buffer for all Indexer layers to reuse.
+-        self.topk_indices_buffer = torch.empty(
++        # 【xtu-F1 2026-11-09】原先 torch.empty ⇒ 分配器残留会被 consumer 层读到
++        # （无层维度、无版本校验，见 dev-docs/DEGEN_STAGE_COMPARISON.md #92）。
++        # 先改为显式清零，验证"陈旧共享缓冲"是否就是长会话退化的根因。
++        self.topk_indices_buffer = torch.zeros(
+             vllm_config.scheduler_config.max_num_batched_tokens,
+             config.index_topk,
+             dtype=torch.int32,
+@@ -679,7 +682,7 @@
+         candidate_source_layer = getattr(config, "candidate_source_layer_id", -1)
+         candidate_topk_blocks = getattr(config, "candidate_topk_blocks", 0)
+         if candidate_source_layer >= 0 and candidate_topk_blocks > 0:
+-            self.candidate_block_buffer = torch.empty(
++            self.candidate_block_buffer = torch.zeros(   # xtu-F1：同上，显式清零
+                 vllm_config.scheduler_config.max_num_batched_tokens,
+                 candidate_topk_blocks,
+                 dtype=torch.int32,

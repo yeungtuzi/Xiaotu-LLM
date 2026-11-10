@@ -16,9 +16,10 @@
 #   bash scripts/serve_ds41.sh restart [NAME=VAL ...] [+--flag=值 ...]
 #
 # 可覆盖的 NAME=VAL（白名单外一律拒绝）：
-#   TAG=prod PORT=8700 TP=2 GPU_UTIL=0.90 MAXSEQS=4 MBT=8192 MAXLEN=524288
+#   TAG=prod PORT=8700 TP=2 GPU_UTILIZATION=0.90 MAX_NUM_SEQS=4 MAX_NUM_BATCHED_TOKENS=8192 MAXLEN=524288
+#   （旧短名 GPU_UTIL / MAXSEQS / MBT / NOPC / EXPANDABLE / CED 仍接受但弃用，见 dev-docs/GLOSSARY.md）
 #   THREADS=60 IMAGE_MAX=128 COMPILE_RANGES=32,256,8192
-#   PIN=1 PIN_SLOTS=15 PIN_MAXQ=16 PIN_CUDA_MOE=0 MARLIN=0 CED=1 WARMUP=1 KV_DTYPE=fp8_ds_mla
+#   PIN=1 PIN_SLOTS=15 PIN_MAXQ=16 PIN_CUDA_MOE=0 MARLIN=0 SWA_BOUNDED_REPLAY=1 WARMUP=1 KV_DTYPE=fp8_ds_mla
 #   IDLE_EC=0 IDLE_EC_SECONDS=60   预热收尾即归还 torch 缓存（**默认关**；1=开）
 #                                  ⚠️ 2026-11-05 回退：C 判据（≥2h 带流量）未通过 ——
 #                                  实测窗口内无推理流量、且时长仅 1h50m，无证据支撑默认开启。
@@ -28,8 +29,8 @@
 #                                  ⚠️ WARMUP=0 时**不会归还**（没有预热高水位，且空闲线程已让位）。
 #   SPEC=1 MODEL_DIR=<路径>
 #   LOG_KEEP=3     启动时保留几份历史日志（环境变量；归档命名 <log>.<时间戳>，上限 50）
-#   EXPANDABLE=1   1=expandable_segments:True（**默认**，碎片治理）；0=关 + 追加 --disable-custom-all-reduce；
-#                  0=显式 expandable_segments:False（自定义 allreduce 保持开启）
+#   EXPANDABLE=1（默认）  expandable_segments:True + 追加 --disable-custom-all-reduce（碎片治理；
+#                        custom AR 退回 NCCL）。=0 ⇒ expandable_segments:False，custom AR 保持开启。
 #
 #
 # ⛔ 启动冒烟（2026-11-04 起，**独立于 WARMUP**）：start 返回后仍会在后台跑一次
@@ -49,6 +50,41 @@ set -uo pipefail
 REPO_DIR="${REPO_DIR:-/home/user/lvllm/vllm-xiaotu-moe}"
 RUN_DIR="${RUN_DIR:-/home/user/lvllm/run}"
 PYTHON="${PYTHON:-/home/user/anaconda3/envs/vllm-xiaotu-moe/bin/python}"
+# ⭐ 2026-11-10：系统盘重装后系统 libstdc++ 只到 CXXABI_1.3.13，而 xiaotu_moe 扩展需要
+# CXXABI_1.3.15（conda env 的 libstdc++ 有）⇒ 必须把 env 的 lib 放进 LD_LIBRARY_PATH，
+# 否则 worker 子进程 import 扩展直接失败（已实测）。
+# ⭐ 2026-11-10 审计 §三.2：收窄写法——只前置**该 python 的** libdir，并断言里面真有
+#    CXXABI_1.3.15；否则兜底静默无效、故障会原样复发。
+case "$PYTHON" in
+    /*) ;;
+    *) echo "[ds41] ⛔ PYTHON 必须是绝对路径（得到 '$PYTHON'）" >&2; exit 2 ;;
+esac
+#    候选顺序：① `sys.prefix/lib`（conda env 自己的 lib，**正确的那一个**；
+#    ⚠️ 不能用 sysconfig 的 LIBDIR —— 实测它返回系统 `/usr/lib/x86_64-linux-gnu`）② 由 PYTHON 路径推
+_XTU_PYLIB=""
+_xtu_cands=""
+if [ -x "$PYTHON" ]; then
+    _xtu_cands="$("$PYTHON" -c 'import sys;print(sys.prefix+"/lib")' 2>/dev/null || true)"
+fi
+_xtu_cands="$_xtu_cands $(dirname "$(dirname "$PYTHON")")/lib"
+_xtu_has_sym=0; command -v strings >/dev/null 2>&1 && _xtu_has_sym=1
+for _c in $_xtu_cands; do
+    [ -f "$_c/libstdc++.so.6" ] || continue
+    if [ "$_xtu_has_sym" = "1" ]; then
+        # ⛔ 不能用 `strings | grep -q`：`set -o pipefail` 下 grep -q 提前退出会让 strings
+        #    吃到 SIGPIPE（141）⇒ 管道整体返回失败 ⇒ 误判"没有该符号"（本脚本踩过一次）
+        _xtu_syms="$(strings "$_c/libstdc++.so.6" 2>/dev/null || true)"
+        case "$_xtu_syms" in *CXXABI_1.3.15*) ;; *) continue ;; esac
+    fi
+    _XTU_PYLIB="$_c"; break
+done
+if [ -n "$_XTU_PYLIB" ]; then
+    export LD_LIBRARY_PATH="$_XTU_PYLIB${LD_LIBRARY_PATH:+:$LD_LIBRARY_PATH}"
+    echo "[ds41] libstdc++ 兜底生效（CXXABI_1.3.15 已确认）：$_XTU_PYLIB" >&2
+else
+    echo "[ds41] ⚠️ 未找到含 CXXABI_1.3.15 的 libstdc++（候选：$_xtu_cands）⇒ 不前置；插件可能 import 失败" >&2
+fi
+
 MODEL_DIR_DEFAULT="/home/user/.cache/modelscope/models/deepseek-ai--DeepSeek-V4.1-Flash-1017/snapshots/master"
 SERVED_NAME="DeepSeek-V4.1-Flash"
 CACHE_DIR="/home/user/.cache/vllm/torch_compile_cache/xtu-master-tp2-vllm_compile-f03026a548-9afa2a11"
@@ -57,9 +93,29 @@ MEM_GATE="${MEM_GATE:-$REPO_DIR/scripts/prelaunch_mem_gate.sh}"
 # 本机实际部署树（REPO_DIR/vllm 不存在；跨树校验按真实位置比对，不按名字猜）
 VLLM_DIR="${VLLM_DIR:-/home/user/lvllm/process_data/ref/repos/vllm-mainline/vllm}"   # 注意：vpath 是包目录 dirname(vllm.__file__)
 
-TAG="prod"; PORT=8700; TP=2; GPU_UTIL=0.9; MAXSEQS=4; MBT=8192; MAXLEN=524288
+_XTU_PORT_ENV="${PORT:-}"   # ⭐ 审计 B2：必须先记住"调用者是否显式给了 PORT"，再赋默认值
+TAG="${TAG:-prod}"; PORT="${PORT:-8700}"; TP="${TP:-2}"
+# ⭐ 2026-11-10 审计 B1：短名/全名的**环境变量**形式都必须生效（原先这行会把 env 值覆盖掉）
+GPU_UTIL="${GPU_UTIL:-0.9}"; MAXSEQS="${MAXSEQS:-4}"; MBT="${MBT:-8192}"; MAXLEN="${MAXLEN:-524288}"
 THREADS=60; IMAGE_MAX=128; COMPILE_RANGES="32,256,8192"
-PIN=1; PIN_SLOTS=15; PIN_MAXQ=16; PIN_CUDA_MOE=0; MARLIN=0; CED=1; WARMUP=1
+PIN=1; PIN_SLOTS=15; PIN_MAXQ=16; PIN_CUDA_MOE=0; MARLIN=0; WARMUP=1
+# ⭐⭐ 2026-11-10 复审 N1：必须在赋默认值**之前**记下"调用者是否显式给了 SWA_BOUNDED_REPLAY"，
+#    否则 SWA_EXPLICIT 恒为 1 ⇒ 单独写 `CED=0` 会被误判成"与显式 SWA 冲突"（fail-closed 但挡住合法用法）。
+_XTU_SWA_ENV="${SWA_BOUNDED_REPLAY:-}"
+SWA_BOUNDED_REPLAY="${SWA_BOUNDED_REPLAY:-1}"
+SWA_EXPLICIT=0; [ -n "$_XTU_SWA_ENV" ] && SWA_EXPLICIT=1
+PORT_EXPLICIT=0; [ -n "$_XTU_PORT_ENV" ] && PORT_EXPLICIT=1
+# 无歧义参数名（推荐）；旧短名为别名，见 dev-docs/GLOSSARY.md
+NO_PREFIX_CACHE="${NO_PREFIX_CACHE:-${NOPC:-0}}"
+MAX_NUM_BATCHED_TOKENS="${MAX_NUM_BATCHED_TOKENS:-${MBT:-8192}}"
+MAX_NUM_SEQS="${MAX_NUM_SEQS:-${MAXSEQS:-4}}"
+GPU_UTILIZATION="${GPU_UTILIZATION:-${GPU_UTIL:-0.9}}"
+EXPANDABLE_SEGMENTS="${EXPANDABLE_SEGMENTS:-${EXPANDABLE:-1}}"
+NOPC_ALIAS=0; MBT_ALIAS=0; MAXSEQS_ALIAS=0; GPU_UTIL_ALIAS=0; EXPANDABLE_ALIAS=0
+# 历史别名（弃用）：CED=0/1 —— 语义等同于 SWA_BOUNDED_REPLAY=0/1；设置它会在启动时警告
+CED_ALIAS=""; CED_EXPLICIT=0
+# 环境变量形式的历史别名（CED=0/1）
+if [ -n "${CED:-}" ]; then CED_ALIAS="$CED"; CED_EXPLICIT=1; fi
 IDLE_EC=0; IDLE_EC_SECONDS=60   # 预热收尾即归还显存缓存（实测单卡归还 10.4–10.73 GiB；默认开）
 PC=0; PC_GB=64; PC_BLOCKS=16; PC_ROOT="/home/user/.cache/prefix-cache"
 PC_FREE_MIN_MIB="${PC_FREE_MIN_MIB:-524288}"
@@ -70,7 +126,8 @@ EXTRA_ARGS=()
 
 die() { printf '[ds41] ⛔ %s\n' "$1" >&2; exit "${2:-2}"; }
 say() { printf '[ds41] %s\n' "$*"; }
-usage() { sed -n '2,29p' "$0" | sed 's/^# \{0,1\}//'; }
+# ⭐ 审计 §五.8：原先是 2,29p，把 30-33 行（MODEL_DIR / LOG_KEEP / EXPANDABLE）的帮助切掉了
+usage() { sed -n '2,34p' "$0" | sed 's/^# \{0,1\}//'; }
 
 # ── 参数解析 ───────────────────────────────────────────────────────────────
 CMD="${1:-}"; shift || true
@@ -83,11 +140,14 @@ while [ $# -gt 0 ]; do
             k="${1%%=*}"; v="${1#*=}"
             case "$k" in
                 TAG) TAG="$v" ;;
-                PORT) PORT="$v" ;;
+                PORT) PORT="$v"; PORT_EXPLICIT=1 ;;
                 TP) TP="$v" ;;
-                GPU_UTIL) GPU_UTIL="$v" ;;
-                MAXSEQS) MAXSEQS="$v" ;;
-                MBT) MBT="$v" ;;
+                GPU_UTIL) GPU_UTIL="$v"; GPU_UTILIZATION="$v"; GPU_UTIL_ALIAS=1 ;;
+                # ↑ GPU_UTIL 为历史短名，等价于 GPU_UTILIZATION（弃用）
+                MAXSEQS) MAXSEQS="$v"; MAX_NUM_SEQS="$v"; MAXSEQS_ALIAS=1 ;;
+                # ↑ MAXSEQS 为历史短名，等价于 MAX_NUM_SEQS（弃用）
+                MBT) MBT="$v"; MAX_NUM_BATCHED_TOKENS="$v"; MBT_ALIAS=1 ;;
+                # ↑ MBT 为历史短名，等价于 MAX_NUM_BATCHED_TOKENS（弃用）
                 MAXLEN) MAXLEN="$v" ;;
                 THREADS) THREADS="$v" ;;
                 IMAGE_MAX) IMAGE_MAX="$v" ;;
@@ -99,7 +159,18 @@ while [ $# -gt 0 ]; do
                 IDLE_EC) IDLE_EC="$v" ;;
                 IDLE_EC_SECONDS) IDLE_EC_SECONDS="$v" ;;
                 PIN_MAXQ) PIN_MAXQ="$v" ;;
-                CED) CED="$v" ;;
+                SWA_BOUNDED_REPLAY) SWA_BOUNDED_REPLAY="$v"; SWA_EXPLICIT=1 ;;
+                NO_PREFIX_CACHE) NO_PREFIX_CACHE="$v"; NOPC="$v" ;;
+                # ↑ NOPC 为历史短名（CLI 亦可写 NOPC=1，审计 B1 修正）
+                NOPC) NOPC="$v"; NO_PREFIX_CACHE="$v"; NOPC_ALIAS=1 ;;
+                MAX_NUM_BATCHED_TOKENS) MAX_NUM_BATCHED_TOKENS="$v"; MBT="$v" ;;
+                MAX_NUM_SEQS) MAX_NUM_SEQS="$v"; MAXSEQS="$v" ;;
+                PIN_EXPERTS_TO_GPU) PIN="$v" ;;
+                PIN_MAX_PENDING_REQUESTS) PIN_MAXQ="$v" ;;
+                GPU_UTILIZATION) GPU_UTILIZATION="$v"; GPU_UTIL="$v" ;;
+                EXPANDABLE_SEGMENTS) EXPANDABLE_SEGMENTS="$v"; EXPANDABLE="$v" ;;
+                CED) CED_ALIAS="$v"; CED_EXPLICIT=1 ;;
+                # ↑ CED 是历史别名，语义 = SWA_BOUNDED_REPLAY（弃用，仅兼容旧命令行）
                 WARMUP) WARMUP="$v" ;;
                 PC) PC="$v" ;;
                 PC_GB) PC_GB="$v" ;;
@@ -108,7 +179,8 @@ while [ $# -gt 0 ]; do
                 KV_DTYPE) KV_DTYPE="$v" ;;
                 SPEC) SPEC="$v" ;;
                 MODEL_DIR) MODEL_DIR="$v" ;;
-                EXPANDABLE) EXPANDABLE="$v" ;;
+                EXPANDABLE) EXPANDABLE="$v"; EXPANDABLE_SEGMENTS="$v" ;;
+                # ↑ EXPANDABLE 为历史短名，等价于 EXPANDABLE_SEGMENTS（弃用）
                 *) die "未知参数 '$k'（可用项见文件头；新增参数请改本脚本，不要绕过入口）" ;;
             esac
             shift ;;
@@ -122,7 +194,19 @@ case "$TAG" in ''|*[!A-Za-z0-9_-]*) die "TAG 只允许 [A-Za-z0-9_-]（得到 '$
 PID_FILE="$RUN_DIR/ds41_${TAG}.pid"
 LOG_FILE="$RUN_DIR/ds41_${TAG}.log"
 LOG_KEEP="${LOG_KEEP:-3}"   # 启动时保留几份历史日志（归档命名 <log>.<时间戳>）
-LOCK_FILE="$RUN_DIR/ds41_${TAG}.lock"
+# ⭐⭐ 2026-11-10 审计 B2（blocking）：PORT 必须可回读。
+#    `stop TAG=x` 不带 PORT 时，原先会拿默认 8700 去比归属 ⇒ 失败后**删掉在跑实例的 PID 文件**。
+PORT_FILE="$RUN_DIR/ds41_${TAG}.port"
+if [ "$PORT_EXPLICIT" = "0" ] && [ -f "$PORT_FILE" ]; then
+    _xtu_p="$(tr -dc '0-9' < "$PORT_FILE" 2>/dev/null || true)"
+    if [ -n "$_xtu_p" ]; then
+        PORT="$_xtu_p"
+        echo "[ds41] 端口从 $PORT_FILE 回读为 $PORT" >&2
+    fi
+fi
+# ⭐⭐ 2026-11-10 审计 B4（blocking）：锁**按 PORT**，否则两个 TAG 抢同一端口可同时通过检查。
+#    ⚠️ 复审 N2：这一行必须在**PORT 回读之后**，否则不带 PORT 的 start 会锁错端口。
+LOCK_FILE="$RUN_DIR/ds41_port_${PORT}.lock"
 
 # ══ 端口归属三态：free / owned:PID / unknown —— unknown 一律按拒绝处理 ════════
 port_state() {
@@ -184,6 +268,28 @@ resolve_alloc_conf() {
 
 # ══ 校验（fail-closed） ═══════════════════════════════════════════════════════
 validate() {
+    # ⭐⭐ 2026-11-10 审计 B1（blocking）：**先同步、后校验**。
+    #   原先同步块在范围校验之后 ⇒ 用全长名（CLI 或环境变量）传 MAX_NUM_SEQS /
+    #   MAX_NUM_BATCHED_TOKENS / GPU_UTILIZATION 时，校验读到的是旧默认值 ⇒ **非法值直接进 vllm**。
+    MBT="$MAX_NUM_BATCHED_TOKENS"
+    MAXSEQS="$MAX_NUM_SEQS"
+    GPU_UTIL="$GPU_UTILIZATION"
+    EXPANDABLE="$EXPANDABLE_SEGMENTS"
+    NOPC="$NO_PREFIX_CACHE"
+    # ⭐ 2026-11-10 审计 B3（blocking）：CED 不得**静默**覆盖显式 SWA_BOUNDED_REPLAY。
+    if [ -n "$CED_ALIAS" ]; then
+        if [ "$CED_EXPLICIT" = "1" ] && [ "$SWA_EXPLICIT" = "1" ] \
+           && [ "$SWA_BOUNDED_REPLAY" != "$CED_ALIAS" ]; then
+            die "CED=$CED_ALIAS 与显式 SWA_BOUNDED_REPLAY=$SWA_BOUNDED_REPLAY 冲突（CED 已弃用）：只写 SWA_BOUNDED_REPLAY" 2
+        fi
+        say "⚠️ 参数 CED 已弃用（它实际控制 decoder-side SWA bounded replay）；请改用 SWA_BOUNDED_REPLAY=${CED_ALIAS}"
+        SWA_BOUNDED_REPLAY="$CED_ALIAS"
+    fi
+    if [ "$MBT_ALIAS" = "1" ]; then say "⚠️ 参数 MBT 已弃用；请改用 MAX_NUM_BATCHED_TOKENS=$MBT"; fi
+    if [ "$MAXSEQS_ALIAS" = "1" ]; then say "⚠️ 参数 MAXSEQS 已弃用；请改用 MAX_NUM_SEQS=$MAXSEQS"; fi
+    if [ "$GPU_UTIL_ALIAS" = "1" ]; then say "⚠️ 参数 GPU_UTIL 已弃用；请改用 GPU_UTILIZATION=$GPU_UTIL"; fi
+    if [ "$EXPANDABLE_ALIAS" = "1" ]; then say "⚠️ 参数 EXPANDABLE 已弃用；请改用 EXPANDABLE_SEGMENTS=$EXPANDABLE"; fi
+    if [ "$NOPC_ALIAS" = "1" ]; then say "⚠️ 参数 NOPC 已弃用；请改用 NO_PREFIX_CACHE=$NOPC"; fi
     is_uint "$PORT" && [ "$PORT" -ge 1024 ] && [ "$PORT" -le 65535 ] || die "PORT 非法：'$PORT'"
     is_uint "$TP" && [ "$TP" -ge 1 ] && [ "$TP" -le 2 ] || die "TP 只能是 1 或 2（本机只放 GPU1/2）"
     is_uint "$MAXSEQS" && [ "$MAXSEQS" -ge 1 ] && [ "$MAXSEQS" -le 256 ] || die "MAXSEQS 越界：'$MAXSEQS'"
@@ -206,7 +312,7 @@ validate() {
     fi
     [ "$PIN_MAXQ" -le 256 ] || die "PIN_MAXQ 上限 256（得到 '$PIN_MAXQ'）"
     awk -v u="$GPU_UTIL" 'BEGIN{exit !(u+0>0.05 && u+0<=1.0)}' || die "GPU_UTIL 必须在 (0.05,1.0]（得到 '$GPU_UTIL'）"
-    case "$CED" in 0|1) ;; *) die "CED 只能是 0/1" ;; esac
+    case "$SWA_BOUNDED_REPLAY" in 0|1) ;; *) die "SWA_BOUNDED_REPLAY 只能是 0/1（旧名 CED 亦接受）" ;; esac
     case "$PIN" in 0|1) ;; *) die "PIN 只能是 0/1" ;; esac
     case "$SPEC" in 0|1) ;; *) die "SPEC 只能是 0/1" ;; esac
     case "$WARMUP" in 0|1) ;; *) die "WARMUP 只能是 0/1（得到 '$WARMUP'）" ;; esac
@@ -217,6 +323,7 @@ validate() {
     [ "$LOG_KEEP" -ge 1 ] && [ "$LOG_KEEP" -le 50 ] \
         || die "LOG_KEEP 越界 1..50（得到 $LOG_KEEP）"
     case "$EXPANDABLE" in 0|1) ;; *) die "EXPANDABLE 只能是 0/1" ;; esac
+    case "$NO_PREFIX_CACHE" in 0|1) ;; *) die "NO_PREFIX_CACHE 只能是 0/1（旧名 NOPC 亦接受；得到 '$NO_PREFIX_CACHE'）" ;; esac
     case "$PC" in 0|1) ;; *) die "PC 只能是 0/1（得到 '$PC'）" ;; esac
     if [ "$PC" = "0" ]; then
         :   # PC=0 时 PC_GB/PC_BLOCKS/PC_ROOT 一律不校验（不用的参数不该拦启动）
@@ -264,7 +371,7 @@ validate() {
 
     # 额外参数：必须 --flag，且不得覆盖本脚本保证的口径
     local _a _k
-    local deny='^(--port|--model|--served-model-name|--tensor-parallel-size|--gpu-memory-utilization|--max-model-len|--max-num-seqs|--max-num-batched-tokens|--compilation-config|--kv-cache-dtype|--limit-mm-per-prompt|--speculative-config|--kv-transfer-config|--kv-offloading-size|--kv-offloading-backend|--swa-bounded-replay|--no-swa-bounded-replay)$'
+    local deny='^(--port|--model|--served-model-name|--tensor-parallel-size|--gpu-memory-utilization|--max-model-len|--max-num-seqs|--max-num-batched-tokens|--compilation-config|--kv-cache-dtype|--limit-mm-per-prompt|--speculative-config|--kv-transfer-config|--kv-offloading-size|--kv-offloading-backend|--swa-bounded-replay|--no-swa-bounded-replay|--enforce-eager|--enable-sleep-mode|--swap-space|--num-gpu-blocks-override|--block-size|--dtype|--quantization|--load-format|--kernel-config|--mm-processor-cache-gb)$'
     for _a in ${EXTRA_ARGS[@]+"${EXTRA_ARGS[@]}"}; do
         case "$_a" in --*) ;; *) die "额外参数必须是 --flag 或 --flag=值（得到 '$_a'）" ;; esac
         _k="${_a%%=*}"
@@ -286,7 +393,14 @@ validate() {
             fi
         done
         if [[ "$_k" =~ $deny ]]; then
-            die "额外参数 '$_k' 会覆盖本脚本保证的口径/安全参数，拒绝（要改请改本脚本白名单）" 2
+            # ⭐ 2026-11-10 审计后加：调试用途（如 --load-format=dummy）需要显式旁路。
+            #   必须显式 ALLOW_EXTRA_OVERRIDE=1，且**大声警告** —— 这条旁路只供诊断实例，
+            #   生产口径仍然只能走白名单。
+            if [ "${ALLOW_EXTRA_OVERRIDE:-0}" = "1" ]; then
+                say "⚠️⚠️ ALLOW_EXTRA_OVERRIDE=1：放行受保护旗标 '$_a'（**非生产口径**，报告必须标注）"
+            else
+                die "额外参数 '$_k' 会覆盖本脚本保证的口径/安全参数，拒绝（调试旁路须显式 ALLOW_EXTRA_OVERRIDE=1）" 2
+            fi
         fi
         # ⛔ 族级硬门：EXPANDABLE=1 时 VMM 与 IPC 句柄互斥，任何 custom all-reduce 变体都不得混进来
         if [ "$EXPANDABLE" = "1" ] && [[ "$_k" =~ custom.*all-?reduce ]]; then
@@ -338,15 +452,18 @@ build_args() {
         say "prefix-cache=on root=$_pcroot L1=${PC_GB}GiB blocks/chunk=$PC_BLOCKS"
     fi
     [ "$EXPANDABLE" = "1" ] && ARGS+=(--disable-custom-all-reduce)
-    [ "$CED" = "0" ] && ARGS+=(--no-swa-bounded-replay)
+    [ "$SWA_BOUNDED_REPLAY" = "0" ] && ARGS+=(--no-swa-bounded-replay)
+    # ⭐【2026-11-08 · 诊断】关**内存前缀缓存**（默认开；仅诊断用，NOPC=1 才关）
+    #   目的：验证"第 8 条长请求开始错"是否由前缀缓存块累积（每请求 131K token 留在池里）触发。
+    [ "${NOPC:-0}" = "1" ] && { ARGS+=(--no-enable-prefix-caching); say "⚠️ NOPC=1：内存前缀缓存已关闭（诊断臂）"; }
     if [ ${#EXTRA_ARGS[@]} -gt 0 ]; then ARGS+=("${EXTRA_ARGS[@]}"); fi
     return 0
 }
 
 probe() {   # http_code；000 = 连不上/无 curl（--noproxy 防代理冒充）
     command -v curl >/dev/null 2>&1 || { echo 000; return; }
-    curl -sS --noproxy '*' -o /dev/null -w '%{http_code}' --max-time 3 \
-         "http://127.0.0.1:$1/health" 2>/dev/null || echo 000
+    { curl -sS --noproxy '*' -o /dev/null -w '%{http_code}' --max-time 3 \
+         "http://127.0.0.1:$1/health" 2>/dev/null || echo 000; } | head -1
 }
 
 eff_compilation_config() {   # 生效（最后一个）--compilation-config
@@ -396,7 +513,7 @@ start() {
 
     build_args
     say "启动 TAG=$TAG PORT=$PORT TP=$TP util=$GPU_UTIL seqs=$MAXSEQS MBT=$MBT maxlen=$MAXLEN"
-    say "线程=$THREADS PIN=$PIN/$PIN_SLOTS MAXQ=$PIN_MAXQ CUDA_MOE=$PIN_CUDA_MOE MARLIN=$MARLIN IDLE_EC=$IDLE_EC/$IDLE_EC_SECONDS CED=$CED SPEC=$SPEC image=$IMAGE_MAX"
+    say "线程=$THREADS PIN=$PIN/$PIN_SLOTS MAXQ=$PIN_MAXQ CUDA_MOE=$PIN_CUDA_MOE MARLIN=$MARLIN IDLE_EC=$IDLE_EC/$IDLE_EC_SECONDS SWA_BOUNDED_REPLAY=$SWA_BOUNDED_REPLAY SPEC=$SPEC image=$IMAGE_MAX"
     # ⛔ [2026-11-05 审计 B · M] 小 M 内核**只走 PIN 常驻槽位**（gpu_prefill.py:3017
     #    `slot is not None and _moe4_ok`）；`PIN=0` 时 slot 恒为 None ⇒ 内核永不生效。
     #    不提示的话会白烧一次启动，且 A/B 结论会被误读成"内核无效"。
@@ -419,7 +536,7 @@ start() {
     else
         say "EXPANDABLE=0：expandable_segments:False（历史设置；碎片靠其它手段）"
     fi
-    [ "$CED" = "0" ] && say "⚠️ CED=0：这是基线臂，报告中必须标注"
+    [ "$SWA_BOUNDED_REPLAY" = "0" ] && say "⚠️ SWA_BOUNDED_REPLAY=0：这是基线臂（关闭 decoder-side SWA bounded replay），报告中必须标注"
     [ "$PC" = "0" ] && say "⚠️ PC=0（稳定口径）：不启用磁盘前缀缓存；如需持久缓存实验臂用 PC=1，须加 ALLOW_PC1=1"
 
     if [ "$PC" = "1" ]; then
@@ -503,6 +620,13 @@ start() {
         export XIAOTU_MOE_SPIN_IDLE_US="${XIAOTU_MOE_SPIN_IDLE_US:-300}"
         export XIAOTU_GPF_STAGE_TILE_E="${XIAOTU_GPF_STAGE_TILE_E:-48}"
         export XIAOTU_MOE_MBT="$MBT"   # 必须跟随 --max-num-batched-tokens，否则 staging 预分配错配
+        # ⭐ 审计 B4：TAG nonce（端口派生 PID 的归属判据）+ 口径变量（供 status 读出）
+        export XTU_DS41_TAG="$TAG"
+        export SWA_BOUNDED_REPLAY NO_PREFIX_CACHE MAX_NUM_BATCHED_TOKENS MAX_NUM_SEQS GPU_UTILIZATION
+        export DS41_MAXLEN="$MAXLEN" DS41_TP="$TP" DS41_SPEC="$SPEC" DS41_KV_DTYPE="$KV_DTYPE"
+        export XIAOTU_PIN_MAX_PER_LAYER="$PIN_SLOTS" XIAOTU_IMAGE_MAX="$IMAGE_MAX"
+        # ⭐ 复审 N4：旁路必须留痕（事后只看 cmdline 是发现不了的）
+        export DS41_EXTRA_ARGS="${EXTRA_ARGS[*]:-}" DS41_ALLOW_EXTRA_OVERRIDE="${ALLOW_EXTRA_OVERRIDE:-0}"
         exec 9>&-      # 别把锁 fd 继承给服务（否则服务在跑时 start 会误报"已有 start/stop"）
         exec setsid "${ARGS[@]}"
     ) >> "$LOG_FILE" 2>&1 < /dev/null &
@@ -517,7 +641,19 @@ start() {
         say "launcher pid=$lp 不是服务本体（setsid 已 fork），改按端口归属取 PID…"
         for i in $(seq 1 120); do
             pid="$(port_state "$PORT" | sed -n 's/^owned://p')"
-            [ -n "$pid" ] && break
+            if [ -n "$pid" ]; then
+                # ⭐⭐ 审计 B4：必须确认端口属主**就是本次启动**（按 TAG nonce 比对），
+                #    否则会把别人的实例写进本 TAG 的 PID 文件 ⇒ `stop TAG=B` 停掉 A。
+                if ! tr '\0' '\n' < "/proc/$pid/environ" 2>/dev/null \
+                     | grep -qx "XTU_DS41_TAG=$TAG"; then
+                    die "端口 $PORT 的属主 pid=$pid 不是本次启动（缺 XTU_DS41_TAG=$TAG）⇒ 拒绝采纳；可能同端口被别人占用" 3
+                fi
+                break
+            fi
+            if ! pid_alive "$lp" && [ "${_xtu_warned:-0}" = "0" ]; then
+                _xtu_warned=1
+                say "launcher pid=$lp 已退出（setsid fork 后属正常），继续按端口等待；有错请看 $LOG_FILE"
+            fi
             sleep 5
         done
     fi
@@ -526,6 +662,7 @@ start() {
         die "启动 10 分钟内既认不出 launcher 也取不到端口 $PORT 归属（可能是孤儿，需人工确认）" 4
     fi
     printf '%s\n' "$pid" > "$PID_FILE" || die "PID 文件写入失败：$PID_FILE（已启动 pid=$pid）" 4
+    printf '%s\n' "$PORT" > "$PORT_FILE" 2>/dev/null || say "⚠️ PORT 文件写入失败：$PORT_FILE"
     say "已启动 pid=$pid 日志=$LOG_FILE"
 
     local ok=0
@@ -602,8 +739,8 @@ start() {
             fi' < /dev/null > /dev/null 2>&1 &
         say "PC 写入证据守护已起（最长 ${PC_WRITE_WAIT:-900}s，结果写 $LOG_FILE 的 [PC写入] 行）"
     fi
-    if [ "$CED" = "1" ] && grep -aq "SWA bounded replay needs model runner V2" "$LOG_FILE"; then
-        die "CED=1 但日志显示 CED 未生效（needs model runner V2）" 4
+    if [ "$SWA_BOUNDED_REPLAY" = "1" ] && grep -aq "SWA bounded replay needs model runner V2" "$LOG_FILE"; then
+        die "SWA_BOUNDED_REPLAY=1 但日志显示未生效（needs model runner V2）" 4
     fi
     if [ "$EXPANDABLE" = "1" ] && tr '\0' '\n' < "/proc/$pid/cmdline" 2>/dev/null \
             | grep -qE 'enable-custom-all-reduce'; then
@@ -698,7 +835,12 @@ stop() {
         case "$ps" in
             owned:*) die "PID 文件=${pid:-无} 与端口 $PORT 归属($ps)不符；拒绝按 PID 文件杀，请人工确认" 3 ;;
             unknown) die "无法判定端口 $PORT 归属（ss 不可用/取不到 pid）⇒ 缺省拒绝" 3 ;;
-            *) say "TAG=$TAG 未在运行（归属校验通过）"; rm -f "$PID_FILE"; return 0 ;;
+            *)
+                # ⭐ 审计 B2：只有进程**确实不在**时才删 PID 文件（否则 B2 事故复发）
+                if pid_alive "${pid:-}"; then
+                    die "PID 文件里的 pid=$pid 仍存活，但端口 $PORT 归属是 '$ps' ⇒ 拒绝删除 PID 文件（TAG/PORT 可能不匹配，检查 PORT=）" 3
+                fi
+                say "TAG=$TAG 未在运行（归属校验通过）"; rm -f "$PID_FILE"; return 0 ;;
         esac
     fi
 
@@ -767,7 +909,7 @@ status() {
     say "GPU: $(nvidia-smi --query-gpu=index,memory.used --format=csv,noheader | tr '\n' ' ')"
     say "实际口径:"
     tr '\0' '\n' < "/proc/$pid/environ" 2>/dev/null \
-        | grep -E '^(XIAOTU_MOE_THREADS|XIAOTU_PIN|XIAOTU_PIN_CUDA_MOE|XIAOTU_MOE4_MARLIN|XIAOTU_IDLE_EMPTY_CACHE|XIAOTU_IDLE_EC_SECONDS|XIAOTU_PIN_MAXQ|GPU_UTIL|MAXSEQS|COMPILE_RANGES|PYTORCH_CUDA_ALLOC_CONF|EXPANDABLE)=' \
+        | grep -E '^(XIAOTU_MOE_THREADS|XIAOTU_PIN|XIAOTU_PIN_CUDA_MOE|XIAOTU_PIN_MAX_PER_LAYER|XIAOTU_IMAGE_MAX|XIAOTU_MOE4_MARLIN|XIAOTU_IDLE_EMPTY_CACHE|XIAOTU_IDLE_EC_SECONDS|XIAOTU_PIN_MAXQ|GPU_UTIL|MAXSEQS|COMPILE_RANGES|PYTORCH_CUDA_ALLOC_CONF|EXPANDABLE|SWA_BOUNDED_REPLAY|NO_PREFIX_CACHE|MAX_NUM_BATCHED_TOKENS|MAX_NUM_SEQS|GPU_UTILIZATION|XIAOTU_MOE_MBT|DS41_MAXLEN|DS41_TP|DS41_SPEC|DS41_KV_DTYPE)=' \
         | sed 's/^/    /'
     cc="$(eff_compilation_config "$pid")"
     say "    [生效] --compilation-config $cc"

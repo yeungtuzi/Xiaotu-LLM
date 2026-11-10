@@ -1,0 +1,42 @@
+--- a/vllm/v1/attention/backends/mla/sparse_swa.py	2026-11-10 10:02:05.983055834 +0800
++++ b/vllm/v1/attention/backends/mla/sparse_swa.py	2026-11-10 10:56:17.940443848 +0800
+@@ -82,6 +82,7 @@
+         block_size: int = 64,
+         packed_bytes_per_token: int = 584,
+         packed_page_alignment: int = 576,
++        packed_block_stride_alignment: int | None = None,
+         bounded_replay: bool = False,
+     ):
+         super().__init__()
+@@ -96,6 +97,7 @@
+         self.dtype = dtype
+         self.packed_bytes_per_token = packed_bytes_per_token
+         self.packed_page_alignment = packed_page_alignment
++        self.packed_block_stride_alignment = packed_block_stride_alignment
+         compilation_config = get_current_vllm_config().compilation_config
+         if prefix in compilation_config.static_forward_context:
+             raise ValueError(f"Duplicate layer name: {prefix}")
+@@ -134,6 +136,11 @@
+             ),
+             # FlashMLA packing stride; 512B for FlashInfer sparse (#44577).
+             alignment=self.packed_page_alignment if uses_fp8_ds_mla_layout else 512,
++            # 2026-11-10 backport（对齐上游）：整块跨度必须是 SWA 记录与压缩记录
++            # 字节数的公倍数，否则相邻页在打包布局里互相踩尾。
++            block_stride_alignment=(
++                self.packed_block_stride_alignment if uses_fp8_ds_mla_layout else None
++            ),
+             model_version="deepseek_v4",
+             kv_quant_mode=get_kv_quant_mode(self.cache_config.cache_dtype),
+         )
+--- a/vllm/models/deepseek_v41/attention.py	2026-11-10 10:02:04.719025921 +0800
++++ b/vllm/models/deepseek_v41/attention.py	2026-11-10 10:56:17.940443848 +0800
+@@ -564,6 +564,9 @@
+             block_size=32,
+             packed_bytes_per_token=self.swa_bytes_per_token,
+             packed_page_alignment=self.kv_page_alignment,
++            packed_block_stride_alignment=math.lcm(
++                self.swa_bytes_per_token, self.compressed_bytes_per_token
++            ),
+             bounded_replay=swa_bounded_replay,
+         )
+ 

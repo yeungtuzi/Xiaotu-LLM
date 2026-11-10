@@ -1,0 +1,55 @@
+--- a/vllm/models/deepseek_v41/nvidia/model_state.py	2026-11-10 10:02:04.715025826 +0800
++++ b/vllm/models/deepseek_v41/nvidia/model_state.py	2026-11-10 12:53:37.035019924 +0800
+@@ -314,6 +314,22 @@
+             replay_start = self._replay_start_staging.copy_to_gpu(
+                 replay_start_np, out=self._replay_start[:num_reqs]
+             )
++            # >>> xtu-swa-bounded-replay-dbg（2026-11-10 v4）
++            # 触发文件：/home/user/lvllm/run/triggers/swa_bounded_replay_dbg
++            # 观测：本步是否重放 / 重放起点 / pad 掉多少 slot / 每请求的已算 token 数
++            _xtu_pad_before = -1
++            try:
++                import os as _o
++                _xtu_dbg = _o.path.exists(
++                    "/home/user/lvllm/run/triggers/swa_bounded_replay_dbg"
++                )
++            except Exception:
++                _xtu_dbg = False
++            if _xtu_dbg:
++                try:
++                    _xtu_pad_before = int((slot_mappings == PAD_SLOT_ID).sum().item())
++                except Exception:
++                    _xtu_pad_before = -1
+             if replay_start_np.any():
+                 # The replayed tokens rebuild window KV only: their slots in the
+                 # prefix-cacheable groups are padded so the cached KV stays as is.
+@@ -329,6 +345,29 @@
+                     NUM_GROUPS=cacheable_groups.numel(),
+                     BLOCK=1024,
+                 )
++            if _xtu_dbg:
++                try:
++                    _n = int((slot_mappings == PAD_SLOT_ID).sum().item())
++                    _q = np.diff(input_batch.query_start_loc_np[: num_reqs + 1])
++                    print(
++                        "[xtu-swa-bounded-replay] reqs=%d prefilling=%s qlen=%s "
++                        "computed=%s replay_start=%s hit=%d pad_added=%d pads_total=%d "
++                        "groups=%s" % (
++                            num_reqs,
++                            input_batch.is_prefilling_np[:num_reqs].astype(int).tolist(),
++                            _q.tolist(),
++                            input_batch.num_computed_tokens_np[:num_reqs].tolist(),
++                            replay_start_np.tolist(),
++                            int(bool(replay_start_np.any())),
++                            (_n - _xtu_pad_before) if _xtu_pad_before >= 0 else -1,
++                            _n,
++                            cacheable_groups.tolist(),
++                        ),
++                        flush=True,
++                    )
++                except Exception as _e:
++                    print("[xtu-swa-bounded-replay] dbg-failed:", _e, flush=True)
++            # <<< xtu-swa-bounded-replay-dbg
+             assert model_specific_attn_metadata is None
+             model_specific_attn_metadata = ReplayAttnMetadata(replay_start)
+         attn_metadata = super().prepare_attn(

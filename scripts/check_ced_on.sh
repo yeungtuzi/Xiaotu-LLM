@@ -1,19 +1,22 @@
 #!/usr/bin/env bash
-# check_ced_on.sh —— 机械检查：正在跑的服务是否**真正**开了 CED。
+# check_ced_on.sh —— 机械检查：正在跑的服务是否**真正**开了 decoder-side SWA bounded replay。
+#（文件名 check_ced_on.sh 为历史名保留；含义见 dev-docs/GLOSSARY.md）
 #
-# 背景（AGENTS.md「CED 默认必须开启」）：
-#   CED 由 `--swa-bounded-replay` 开启；`serve_v41.sh` 默认 CED=1，
-#   但**直接用 api_server 命令行起服务不会带这个旗标** ⇒ CED 静默关闭（2026-10-31 事故）。
+# 背景（AGENTS.md「decoder-side SWA bounded replay 默认必须开启」）：
+#   该项由 `--swa-bounded-replay` 控制；`serve_v41.sh` 默认 `SWA_BOUNDED_REPLAY=1`，
+#   但树里 `CacheConfig.swa_bounded_replay` 缺省本来就是 True ⇒ 只有显式
+#   `--no-swa-bounded-replay` 才会关掉它（2026-10-31 事故的根因是误以为"传旗标才开"）。
 #
 # 只读脚本：只读 /proc 与日志，不启停任何进程、不发信号。
 #
-# 判据（全部满足才算 CED 生效）：
+# 判据（全部满足才算 decoder-side SWA bounded replay 生效）：
 #   ⭐ 树的默认值是 **开**（`vllm/config/cache.py: swa_bounded_replay: bool = True`）
 #      ⇒ `--swa-bounded-replay` 是 no-op；**只有** `--no-swa-bounded-replay` 才关掉它。
 #   ① 进程存在
 #   ② 命令行**不含** `--no-swa-bounded-replay`
 #   ③ 日志里不出现 `SWA bounded replay needs model runner V2`（出现 = CED 没生效：
 #      该机制要求 use_v2_model_runner，见 vllm/models/deepseek_v41/attention.py:530）
+#      ⛔ 不要用缩写 CED 指代本机制（CED 只能指 Causal Encoder-Decoder，见 dev-docs/GLOSSARY.md）
 #
 # 退出码：0=生效；1=未生效；2=服务不存在
 #
@@ -67,7 +70,7 @@ CMD=$(tr '\0' ' ' < "/proc/$PID/cmdline")
 echo "服务 pid=$PID"
 
 if printf '%s' "$CMD" | grep -q -- '--no-swa-bounded-replay'; then
-    echo "✗ 命令行含 --no-swa-bounded-replay ⇒ CED 被显式关闭（基线臂）"
+    echo "✗ 命令行含 --no-swa-bounded-replay ⇒ decoder-side SWA bounded replay 被显式关闭（基线臂）"
     exit 1
 fi
 
@@ -75,11 +78,11 @@ echo "✓ 命令行不含 --no-swa-bounded-replay（树默认开）"
 
 if [ -n "$LOG" ] && [ -r "$LOG" ]; then
     if grep -aq 'SWA bounded replay needs model runner V2' "$LOG"; then
-        echo "✗ 日志出现「SWA bounded replay needs model runner V2」⇒ CED 未真正生效" >&2
+        echo "✗ 日志出现「SWA bounded replay needs model runner V2」⇒ decoder-side SWA bounded replay 未真正生效" >&2
         exit 1
     fi
     echo "✓ 日志未出现 model runner V2 警告"
 fi
 
-echo "CED 生效"
+echo "decoder-side SWA bounded replay 生效"
 exit 0

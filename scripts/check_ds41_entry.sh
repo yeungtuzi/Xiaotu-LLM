@@ -80,7 +80,7 @@ fi
 # ── BYPASS：端口有主但不受控 ────────────────────────────────────────────────
 if [ -n "$owner" ] && [ "$owner" != "${running_pid:-}" ]; then
     echo "✗ 端口 $PORT 由 pid=$owner 持有，但它不在 $RUN_DIR/ds41_*.pid 中" >&2
-    echo "    该实例**不是**由 serve_ds41.sh 启动 ⇒ 编译档位/CED/线程口径都不可信" >&2
+    echo "    该实例**不是**由 serve_ds41.sh 启动 ⇒ 编译档位/decoder-side SWA bounded replay/线程口径都不可信" >&2
     echo "    处置：停掉它，改用 bash scripts/serve_ds41.sh start" >&2
     exit 1
 fi
@@ -113,8 +113,8 @@ case "$cmdline" in
 esac
 
 case "$cmdline" in
-    *--no-swa-bounded-replay*) echo "⚠️ CED 关闭（基线臂，报告须标注）" ;;
-    *) echo "✓ CED 未关闭（树默认开启）" ;;
+    *--no-swa-bounded-replay*) echo "⚠️ decoder-side SWA bounded replay 已关闭（基线臂，报告须标注）" ;;
+    *) echo "✓ decoder-side SWA bounded replay 未关闭（树默认开启）" ;;
 esac
 
 threads="$(printf '%s\n' "$environ" | grep '^XIAOTU_MOE_THREADS=' | cut -d= -f2)"

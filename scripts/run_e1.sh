@@ -29,6 +29,16 @@ LOG="$RUN_DIR/ds41_${INSTANCE_TAG}.log"
 
 say() { printf '[e1] %s\n' "$*"; }
 
+# ⚠️ 仪器补丁里的触发文件路径是**硬编码**的；RUN_DIR 一旦被改，补丁就看不到触发文件，
+#    表现为"日志里没有任何 [xtu-swa-bounded-replay] 行"，极易被误判成"重放没生效"（台账 #267）。
+#    生产必须用默认 RUN_DIR；测试（SKIP_HEALTH=1）允许自定义。
+TRIG_EXPECT="/home/user/lvllm/run/triggers/swa_bounded_replay_dbg"
+if [ "${SKIP_HEALTH:-0}" != "1" ] && [ "$TRIG" != "$TRIG_EXPECT" ]; then
+    say "⛔ RUN_DIR=$RUN_DIR ⇒ 触发文件路径 $TRIG 与仪器硬编码的 $TRIG_EXPECT 不一致"
+    say "   仪器只会读后者 ⇒ 本轮拿不到任何重放证据。改用默认 RUN_DIR（不要自定义）"
+    exit 2
+fi
+
 # ① 服务在跑？
 # SKIP_HEALTH=1 仅用于离线回归（见 test_e1_rc_gate.sh）；生产绝不要设
 if [ "${SKIP_HEALTH:-0}" != "1" ] && ! curl -s -o /dev/null --max-time 4 "http://127.0.0.1:${PORT}/health"; then

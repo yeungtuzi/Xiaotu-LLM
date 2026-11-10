@@ -59,6 +59,10 @@ def test_a(port: int, rounds: int, n_words: int, max_tokens: int) -> bool:
     outs = [ask(port, prompt, max_tokens) for _ in range(rounds)]
     uniq = len(set(outs))
     print(f"[A] 同 prompt ×{rounds} ⇒ 不同输出 {uniq} 种（要求 1）", flush=True)
+    # ⛔ 空输出会让 uniq=1 变成"假通过"（全是 "" ⇒ 集合大小为 1）
+    if any(not o.strip() for o in outs):
+        print(f"[A] ❌ 有 {sum(1 for o in outs if not o.strip())} 条是**空输出** ⇒ uniq=1 无意义，不算通过")
+        return False
     if uniq != 1:
         for i, o in enumerate(outs[:4], 1):
             print(f"    #{i}: {o[:48]!r}")

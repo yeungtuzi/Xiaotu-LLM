@@ -46,9 +46,14 @@ for t in test_verdict_branches.py test_token_mapping_semantics.py test_b_pass_gu
          test_a_long_gate.py test_arms_no_evidence.py test_prefill_len_gate.py \
          test_ptok_check.sh test_repro_guard.sh test_repro_rc_verdict.sh \
          test_e1_rc_gate.sh test_e2_verdict.sh test_acceptance_wiring.sh \
-         test_report_check.sh test_pc_expandable.sh; do
+         test_report_check.sh test_pc_expandable.sh test_preflight_go.sh; do
     f="$HERE/$t"
     [ -f "$f" ] || { say "  ⏭  跳过（不存在）$t"; continue; }
+    # ⛔ 防递归：preflight_go.sh 会调用本套件，而 test_preflight_go.sh 又会调用 preflight_go.sh。
+    #    preflight 里跑自检时置 PREFLIGHT_ACTIVE=1，这里就跳过那个测试（否则无限递归）。
+    if [ "$t" = "test_preflight_go.sh" ] && [ "${PREFLIGHT_ACTIVE:-0}" = "1" ]; then
+        say "  ⏭  跳过（PREFLIGHT_ACTIVE=1，防递归）$t"; continue
+    fi
     case "$t" in
         *.py) out=$(cd "$ROOT" && python3 "$f" 2>&1); rc=$? ;;
         *.sh) out=$(cd "$ROOT" && bash "$f" 2>&1); rc=$? ;;

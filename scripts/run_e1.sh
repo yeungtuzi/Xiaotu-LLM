@@ -44,9 +44,7 @@ if [ -f "$LOG" ]; then
     grep -aq "Decoder SWA bounded replay: in eager prefill steps" "$LOG" \
         && say "✅ 日志确认 decoder-side SWA bounded replay 生效" \
         || say "⚠️ 日志里没看到重放生效的自报行（对照 RUNBOOK 五查第 ⑤ 条）"
-    grep -aq "enable_prefix_caching=True" "$LOG" \
-        && say "✅ 日志确认内存前缀缓存开启" \
-        || say "⚠️ 日志里没看到 enable_prefix_caching=True（对照 RUNBOOK 五查第 ⑤ 条）"
+    # 内存前缀缓存：本树**不打印** enable_prefix_caching 字面量 ⇒ 只能用行为判据（下面 ③b 的 cached>0）
 else
     say "⚠️ 找不到日志 $LOG ⇒ 跳过口径自检（INSTANCE_TAG=${INSTANCE_TAG}）"
 fi
@@ -95,6 +93,16 @@ for k in 1 2; do
     PORT="$PORT" "$PY_BIN" "$HERE/probe_dump_long.py" --n "${N:-7430}" --uuid "e1fixed00" \
         --depth "${DEPTH:-0.5}" --maxtok 8 2>&1 | tail -1 | sed "s/^/[e1]  hit#$k /" | tee -a "$HITOUT"
 done
+
+# ③b 的行为判据：第 2 条必须命中（cached>0），否则说明内存前缀缓存没生效
+_h2=$(grep -a "hit#2" "$HITOUT" 2>/dev/null | tail -1)
+_c2=$(printf '%s' "$_h2" | grep -oE "cached=[0-9]+" | head -1 | cut -d= -f2)
+if [ -n "${_c2:-}" ] && [ "${_c2:-0}" -gt 0 ]; then
+    say "✅ 行为判据：第 2 条同 prompt 命中 ${_c2} tokens ⇒ 内存前缀缓存确实开启"
+else
+    say "⛔ 第 2 条同 prompt 没有命中（cached=${_c2:-?}）⇒ 内存前缀缓存未生效，本轮结论无效"
+    exit 2
+fi
 
 # ④ 判据
 VD="$RUN_DIR/${TAG}_verdict.txt"

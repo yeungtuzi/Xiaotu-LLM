@@ -53,6 +53,9 @@ run "D1 补丁 md5 白名单（不依赖文件名）" bash -c '
   [ -n "$hit" ] || { echo "   patches/replay/ 下没有任何文件 md5=$want…"; ls -1 "$1"/patches/replay/ 2>/dev/null | sed "s/^/     /"; exit 1; }
   echo "   $(basename "$hit")  md5=$want… ✓"' _ "$ROOT"
 
+# 3b) 文档里的生产启动命令 vs 脚本白名单（纯本地；防止临场抄错参数被拒）
+run "文档启动命令与 serve_ds41 白名单一致" bash "$ROOT/scripts/check_launch_cmd.sh"
+
 if [ "$DRY" = 1 ]; then
     skip "部署一致性（远端副本 vs 本地真源）"
     skip "权重就绪 + sha256"

@@ -105,13 +105,21 @@ def main() -> int:
     ap.add_argument("--b-rounds", type=int, default=8)
     ap.add_argument("--len", type=int, default=4000)
     ap.add_argument("--max-tokens", type=int, default=32)
+    ap.add_argument("--a-only", action="store_true", help="只跑 A（B 用 probe_degen_arms.py 的既有四臂口径）")
+    ap.add_argument("--b-only", action="store_true", help="只跑本脚本的 B 变体（辅助，不替代既有口径）")
     a = ap.parse_args()
+    if a.a_only and a.b_only:
+        print("⛔ --a-only 与 --b-only 不能同时给")
+        return 2
 
     if not check_alive(a.port):
         print(f"⛔ 服务未就绪（port={a.port}）；本脚本不负责起停")
         return 2
-    ok_a = test_a(a.port, a.a_rounds, a.len, a.max_tokens)
-    ok_b = test_b(a.port, a.b_rounds, a.len, a.max_tokens)
+    # ⚠️ 验收 B 的**既有定义**是四臂（shared/unique/tail/suffix）：
+    #    `PORT=8700 ROUNDS=3 python3 scripts/probe_degen_arms.py`。
+    #    本脚本的 B 是"4 个前缀深度"的另一种构造，只作辅助，不替代既有口径（见台账 #155）。
+    ok_a = True if a.b_only else test_a(a.port, a.a_rounds, a.len, a.max_tokens)
+    ok_b = True if a.a_only else test_b(a.port, a.b_rounds, a.len, a.max_tokens)
     print(f"\n=== 汇总 A={'✅' if ok_a else '❌'} B={'✅' if ok_b else '❌'}")
     return 0 if (ok_a and ok_b) else 1
 

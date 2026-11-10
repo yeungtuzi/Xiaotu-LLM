@@ -18,7 +18,11 @@ set -uo pipefail
 PORT="${PORT:-8700}"
 A_ROUNDS="${A_ROUNDS:-10}"
 B_ROUNDS="${B_ROUNDS:-3}"
-N="${N:-1200}"
+# 【2026-11-10 实测·台账 #258】B 臂原来 N=1200 ⇒ 只有 **19,626 tokens**，与退化出现的 131K 尺度差 6.7 倍，
+#   很可能"修了一半也能过"。改为与最小复现同尺度：N=7430 ⇒ **131,765 tokens**（真 tokenizer 实测）。
+#   ⚠️ 但 suffix 臂 = docA + docB ≈ 2×131K ≈ 263K，会紧贴 KV 池（300K）⇒ 默认只跑 shared+unique 两臂
+#      （B 的验收判据只需要这两臂）；tail/suffix 归因留作单独诊断（N=1200，不计入 B 的通过与否）。
+N="${N:-7430}"
 # 验收 A 的**口径**必须够长：退化只在长上下文出现（台账 #224）。
 # 【2026-11-10 实测·台账 #255】用**真 tokenizer** 数过（不是估）：
 #   LEN=100000 词 → 156,184 tokens（ratio 1.563）
@@ -47,7 +51,7 @@ fi
 
 A_CMD=("$PY_BIN" "$HERE/accept_abc.py" --port "$PORT" --a-rounds "$A_ROUNDS" --max-tokens "$MAXTOK"
        --len "$LEN" --require-long-tokens "$REQUIRE_LONG_TOKENS" --a-only)
-B_ENV=(PORT="$PORT" ROUNDS="$B_ROUNDS" N="$N" MAXTOK="$MAXTOK")
+B_ENV=(PORT="$PORT" ROUNDS="$B_ROUNDS" N="$N" MAXTOK="$MAXTOK" ARM_FILTER="shared,unique")
 
 # DRY_RUN=1：只打印将要执行的命令（供回归测试断言"口径参数确实传了"，不真跑）
 if [ "${DRY_RUN:-0}" = "1" ]; then

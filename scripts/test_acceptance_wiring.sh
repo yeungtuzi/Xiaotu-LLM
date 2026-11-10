@@ -31,6 +31,15 @@ echo "$out" | grep -q "probe_degen_arms.py" \
     && echo "✅ B 臂走正式的四臂探针" \
     || { echo "❌ B 臂不是 probe_degen_arms"; fails=$((fails+1)); }
 
+# B 臂的**尺度**与**臂集合**也要断言（台账 #258：N=1200 只有 19.6K tokens，与 131K 尺度差 6.7 倍）
+want_n=$(grep -oP '(?<=^N="\$\{N:-)[0-9]+' "$HERE/run_acceptance.sh" | head -1); want_n=${want_n:-7430}
+echo "$out" | grep -q "N=$want_n" \
+    && echo "✅ B 臂 N=$want_n（≈131K tokens，与最小复现同尺度）" \
+    || { echo "❌ B 臂 N 不是 $want_n"; fails=$((fails+1)); }
+echo "$out" | grep -q "ARM_FILTER=shared,unique" \
+    && echo "✅ B 臂只跑 shared,unique（避免 suffix 的 2×131K 逼近 KV 池）" \
+    || { echo "❌ B 臂未限制 ARM_FILTER"; fails=$((fails+1)); }
+
 echo
 if [ "$fails" -ne 0 ]; then echo "❌ $fails 处不符合预期"; exit 1; fi
-echo "✅ 4/4 断言符合预期"
+echo "✅ 全部断言通过"

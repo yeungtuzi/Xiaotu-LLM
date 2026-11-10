@@ -6,7 +6,7 @@
 # 用法：
 #   bash scripts/run_e2_verify.sh [PORT=8700] [CNT=8] [N=7430] [INSTANCE_TAG=prod]
 # 产物：
-#   $RUN_DIR/e2_e2.txt / e2_verdict.txt      本轮原始输出
+#   $RUN_DIR/e2_e1.txt / e2_verdict.txt      本轮原始输出
 #   stdout                                   修前(E1)/修后(E2) 对照表
 # 退出码：0 = E2 全过（8/8 且判据 rc=0）；1 = 未过；2 = 环境不满足
 # =============================================================================
@@ -17,6 +17,8 @@ N="${N:-7430}"
 INSTANCE_TAG="${INSTANCE_TAG:-prod}"
 RUN_DIR="${RUN_DIR:-/home/user/lvllm/run}"
 HERE="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
+ROOT="${ROOT:-$(cd "$HERE/.." && pwd)}"
+pp=0
 PY_BIN="${PY_BIN:-/home/user/anaconda3/envs/vllm-xiaotu-moe/bin/python}"
 [ -x "$PY_BIN" ] || PY_BIN=python3
 
@@ -37,7 +39,9 @@ pick() {  # $1=文件 → 打印 "ok=.. bad=.."
     grep -aoE "汇总 ok=[0-9]+ bad=[0-9]+" "$1" 2>/dev/null | tail -1
 }
 before=$(pick "$RUN_DIR/e1_e1.txt")
-after=$(pick "$RUN_DIR/e2_e2.txt")
+# ⚠️ run_e1.sh 的产物名是 "${TAG}_e1.txt"（不是 "${TAG}_${TAG}.txt"）：
+#    TAG=e2 时是 e2_e1.txt。这里两者都试，避免"跑完了却读不到"（实测踩过）。
+after=$(pick "$RUN_DIR/e2_e1.txt"); [ -n "$after" ] || after=$(pick "$RUN_DIR/e2_e2.txt")
 
 va=0
 if [ -f "$RUN_DIR/e1_verdict.txt" ]; then
@@ -54,6 +58,18 @@ printf '%-22s %-26s %-26s\n' "项" "修前（E1）" "修后（E2，D1）"
 printf '%-22s %-26s %-26s\n' "8×长请求汇总" "${before:-未取得}" "${after:-未取得}"
 printf '%-22s %-26s %-26s\n' "仪器三条判据" "$([ "$va" = 0 ] && echo '✅ 全满足' || echo '❌ 有异常')" \
     "$([ "$vb" = 0 ] && echo '✅ 全满足' || echo '❌ 有异常')"
+# prefill 性能不许牺牲：用两侧"纯预填充行"的中位 tok/s 对照（见 #197）
+if command -v python3 >/dev/null 2>&1 && [ -f "$ROOT/scripts/prefill_perf.py" ]; then
+    _b=$(ls -t "$RUN_DIR"/e2_e1.txt "$RUN_DIR"/e1_*.txt 2>/dev/null | head -1)
+    _a=$(ls -t "$RUN_DIR"/e2_e2.txt 2>/dev/null | head -1)
+    if [ -n "${_b:-}" ] && [ -n "${_a:-}" ]; then
+        printf '\n---- prefill 吞吐对照（只算 cached=0 的纯预填充行）----\n'
+        python3 "$ROOT/scripts/prefill_perf.py" --compare "$_b" "$_a" || pp=1
+        printf '对照文件: 修前=%s  修后=%s\n' "$_b" "$_a"
+    else
+        printf '⚠️ 缺修前/修后输出文件 ⇒ 跳过 prefill 吞吐对照\n'
+    fi
+fi
 printf '原始输出: %s/e1_*.txt  %s/e2_*.txt\n' "$RUN_DIR" "$RUN_DIR"
 
 if [ "$rc_e1" = "0" ] && [ -n "$after" ] && [ "$vb" = "0" ]; then

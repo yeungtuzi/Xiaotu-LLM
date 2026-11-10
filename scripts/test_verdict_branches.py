@@ -6,8 +6,8 @@
   * `computed  > replay_start`  ⇒ 后续 chunk，**必须** `pad_added == 0`（有 pad 才是异常），且不参与判定
   * `computed  < replay_start`  ⇒ 异常（调度重绕）
 
-本测试用**合成日志**覆盖 5 种形态，断言退出码与结论文字。无需 GPU / 无需服务。
-退出码：0 = 7 个分支都符合预期；1 = 有偏差。
+本测试用**合成日志**覆盖 9 种形态，断言退出码与结论文字。无需 GPU / 无需服务。
+退出码：0 = 9 个分支都符合预期；1 = 有偏差。
 """
 from __future__ import annotations
 
@@ -46,6 +46,14 @@ CASES = [
     ("computed < replay_start ⇒ 调度重绕",
      LINE.format(reqs=1, pf="[1]", ql="[212]", comp="[1024]", st="[9216]", hit=1, pad=128), 1,
      "调度侧重绕"),
+    # —— 2026-11-10 新增两类分支（台账 #238）——
+    ("多请求同行：pad 无法归因 ⇒ 跳过（不判异常）",
+     LINE.format(reqs=2, pf="[1, 1]", ql="[212, 64]",
+                 comp="[9216, 9216]", st="[9216, 0]", hit=1, pad=128), 0,
+     "多请求步"),
+    ("pad_added=-1（仪器自测失败）⇒ 异常",
+     LINE.format(reqs=1, pf="[1]", ql="[212]", comp="[9216]", st="[9216]", hit=1, pad=-1), 1,
+     "仪器自身测失败"),
 ]
 
 
@@ -75,4 +83,4 @@ print()
 if fail:
     print(f"❌ {fail} 个分支不符合预期")
     raise SystemExit(1)
-print("✅ 7 个分支全部符合预期（健康/跳过后继 chunk/缺 pad/多余 pad/调度重绕）")
+print(f"✅ {len(CASES)} 个分支全部符合预期（健康/跳过后继 chunk/缺 pad/多余 pad/调度重绕/多请求跳过/仪器失败）")

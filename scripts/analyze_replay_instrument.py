@@ -55,11 +55,17 @@ def verdict(path: str) -> int:
     print(f"共 {len(steps)} 个重放步；逐条按三条判据检查：")
     bad = []
     skipped_chunks = 0
+    skipped_multi = 0
     for i, g in enumerate(steps, 1):
         comp = [x.strip() for x in g["computed"].split(",") if x.strip()]
         start = [x.strip() for x in g["start"].split(",") if x.strip()]
         pad = int(g["pad"])
         idxs = [j for j, p in enumerate(g["prefill"].split(",")) if p.strip() == "1"]
+        # ⚠️ 同一行里有 ≥2 个请求在 prefill 时，`pad_added` 是**多请求之和**，
+        #    无法归因到某一个 replay_start ⇒ 这一行不能用于 pad 语义判定，必须跳过（否则假告警）。
+        if len(idxs) > 1:
+            skipped_multi += 1
+            continue
         for j in idxs:
             c = comp[j] if j < len(comp) else "?"
             st = start[j] if j < len(start) else "?"
@@ -72,6 +78,9 @@ def verdict(path: str) -> int:
             #   只有"首个 chunk"带重放与 pad：那一步 computed == replay_start 且 pad_added == 128。
             #   后续 chunk 的 computed > replay_start、pad_added == 0 属于**正常**，必须跳过，
             #   否则会在真权重上产生假告警（本脚本的 dummy 演练实测踩到，见台账 #158）。
+            if pad < 0:
+                bad.append((i, j, "pad_added=-1 ⇒ 仪器自身测失败（dbg-failed 或计数异常）"))
+                continue
             if ci == si:
                 # 期望 pad 数 = min(窗口, 命中长度)：命中不足一个窗口时，重放行数就是命中长度。
                 # 固定写 128 会在"短命中"（生产并发下很常见）时产生假告警。
@@ -85,8 +94,9 @@ def verdict(path: str) -> int:
             else:
                 bad.append((i, j, f"computed({ci}) < replay_start({si}) ⇒ 调度侧重绕"))
     if not bad:
-        print("✅ 三条判据全满足：hit=1 / computed == replay_start / pad_added=128"
-              f"（另外跳过 {skipped_chunks} 个'后续 chunk'，属正常分块 prefill）")
+        print("✅ 三条判据全满足：hit=1 / computed == replay_start / pad_added=min(128, replay_start)"
+              f"（另外跳过 {skipped_chunks} 个'后续 chunk'，属正常分块 prefill"
+              + (f"；跳过 {skipped_multi} 个多请求步，pad 无法归因" if skipped_multi else "") + "）")
         return 0
     for i, j, why in bad[:12]:
         print(f"❌ 第 {i} 个重放步（批内第 {j} 个请求）：{why}")

@@ -23,6 +23,12 @@ TS="$(date +%Y%m%d-%H%M%S)"
 JSONL="$LOGDIR/needle_c_${TS}.jsonl"
 OUT="$LOGDIR/needle_c_${TS}.log"
 
+# 口径自证（#253）：C 要跑 6 小时，口径不符等于白跑一整夜
+if ! _prof=$(bash "$HERE/assert_profile_local.sh" "${INSTANCE_TAG:-prod}" 2>&1); then
+    printf '%s\n' "$_prof" | sed 's/^/[c]   /'
+    echo "[c] ⛔ 运行口径不符 ⇒ 不作废/不启动探测"; exit 2
+fi
+echo "[c] ✅ 运行口径符合生产期望"
 if ! curl -s -o /dev/null --max-time 4 "http://127.0.0.1:${PORT}/health"; then
     echo "[c] ⛔ 端口 ${PORT} 没有服务 ⇒ 先起服务再做验收 C" >&2
     exit 2

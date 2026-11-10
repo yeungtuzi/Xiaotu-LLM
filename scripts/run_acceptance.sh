@@ -19,22 +19,43 @@ PORT="${PORT:-8700}"
 A_ROUNDS="${A_ROUNDS:-10}"
 B_ROUNDS="${B_ROUNDS:-3}"
 N="${N:-1200}"
+# 验收 A 的**口径**必须够长：退化只在长上下文出现（台账 #224）。
+# 词表近似 1.3 token/词 ⇒ 100000 词 ≈130K tokens；不足 REQUIRE_LONG_TOKENS 时 A 会自行判不通过。
+LEN="${LEN:-100000}"
+REQUIRE_LONG_TOKENS="${REQUIRE_LONG_TOKENS:-120000}"
 MAXTOK="${MAXTOK:-64}"
 RUN_DIR="${RUN_DIR:-/home/user/lvllm/run}"
 HERE="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
 PY_BIN="${PY_BIN:-/home/user/anaconda3/envs/vllm-xiaotu-moe/bin/python}"
 [ -x "$PY_BIN" ] || PY_BIN=python3
 
-if ! curl -s -o /dev/null --max-time 4 "http://127.0.0.1:${PORT}/health"; then
+if [ "${DRY_RUN:-0}" != "1" ]; then
+    # 口径自证（#252/#253）：A/B 也算"生产口径下的验收"，服务口径不符 ⇒ 本轮作废
+    if ! _prof=$(bash "$HERE/assert_profile_local.sh" "${INSTANCE_TAG:-prod}" 2>&1); then
+        printf '%s\n' "$_prof" | sed 's/^/[acc]   /'
+        echo "[acc] ⛔ 运行口径不符 ⇒ 本轮作废"; exit 2
+    fi
+    echo "[acc] ✅ 运行口径符合生产期望"
+fi
+if [ "${DRY_RUN:-0}" != "1" ] && ! curl -s -o /dev/null --max-time 4 "http://127.0.0.1:${PORT}/health"; then
     echo "[acc] ⛔ 端口 ${PORT} 没有服务 ⇒ 先起服务（RUNBOOK §1）"
     exit 2
 fi
 
+A_CMD=("$PY_BIN" "$HERE/accept_abc.py" --port "$PORT" --a-rounds "$A_ROUNDS" --max-tokens "$MAXTOK"
+       --len "$LEN" --require-long-tokens "$REQUIRE_LONG_TOKENS" --a-only)
+B_ENV=(PORT="$PORT" ROUNDS="$B_ROUNDS" N="$N" MAXTOK="$MAXTOK")
+
+# DRY_RUN=1：只打印将要执行的命令（供回归测试断言"口径参数确实传了"，不真跑）
+if [ "${DRY_RUN:-0}" = "1" ]; then
+    printf 'A: %s\n' "${A_CMD[*]}"
+    printf 'B: env %s %s %s\n' "${B_ENV[*]}" "$PY_BIN" "$HERE/probe_degen_arms.py"
+    exit 0
+fi
+
 rc_a=0; rc_b=0
-"$PY_BIN" "$HERE/accept_abc.py" --port "$PORT" --a-rounds "$A_ROUNDS" --max-tokens "$MAXTOK" --a-only \
-    > "$RUN_DIR/acc_A.txt" 2>&1 || rc_a=$?
-PORT="$PORT" ROUNDS="$B_ROUNDS" N="$N" MAXTOK="$MAXTOK" \
-    "$PY_BIN" "$HERE/probe_degen_arms.py" > "$RUN_DIR/acc_B.txt" 2>&1 || rc_b=$?
+"${A_CMD[@]}" > "$RUN_DIR/acc_A.txt" 2>&1 || rc_a=$?
+env "${B_ENV[@]}" "$PY_BIN" "$HERE/probe_degen_arms.py" > "$RUN_DIR/acc_B.txt" 2>&1 || rc_b=$?
 
 a_line=$(grep -aE "^\[A\]" "$RUN_DIR/acc_A.txt" | tail -1)
 uniq=$(grep -aoE "不同输出 [0-9]+ 种" "$RUN_DIR/acc_A.txt" | tail -1)
@@ -42,7 +63,8 @@ b_uniq=$(grep -aE "^unique " "$RUN_DIR/acc_B.txt" | tail -1)
 armbroken=$(grep -ac "ARM-BROKEN" "$RUN_DIR/acc_B.txt" || true)
 
 printf '\n================ 验收汇总 ================\n'
-printf 'A（同一 prompt ×%s，要求签名唯一）: %s\n' "$A_ROUNDS" "${uniq:-未取得}"
+printf 'A（同一 prompt ×%s @ len=%s 词/要求 ≥%s tokens，签名唯一）: %s\n' \
+    "$A_ROUNDS" "$LEN" "$REQUIRE_LONG_TOKENS" "${uniq:-未取得}"
 printf 'B（四臂交错，要求 unique 100%%）    : %s\n' "${b_uniq:-未取得}"
 printf 'ARM-BROKEN 次数（应为 0）          : %s\n' "$armbroken"
 printf '原始输出: %s/acc_A.txt  %s/acc_B.txt\n' "$RUN_DIR" "$RUN_DIR"

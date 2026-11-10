@@ -48,7 +48,8 @@ for t in test_verdict_branches.py test_token_mapping_semantics.py test_b_pass_gu
          test_e1_rc_gate.sh test_e2_verdict.sh test_acceptance_wiring.sh \
          test_report_check.sh test_pc_expandable.sh test_preflight_go.sh \
          test_needle_ratio.py test_arms_accuracy.py test_needle_aggregate.py \
-         test_lint_verdict_exit.sh test_launch_cmd.sh test_pin_table_check.sh; do
+         test_lint_verdict_exit.sh test_launch_cmd.sh test_pin_table_check.sh \
+         test_d1_state.sh; do
     f="$HERE/$t"
     [ -f "$f" ] || { say "  ⏭  跳过（不存在）$t"; continue; }
     # ⛔ 防递归：preflight_go.sh 会调用本套件，而 test_preflight_go.sh 又会调用 preflight_go.sh。

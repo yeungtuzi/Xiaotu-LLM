@@ -31,18 +31,51 @@ WORDS = ("alpha bravo charlie delta echo foxtrot golf hotel india juliet kilo li
          "mike november oscar papa quebec romeo sierra tango uniform victor whiskey").split()
 
 
-def make_prompt(tokens: int, needle: int, rnd: random.Random) -> str:
-    # ⚠️ 用**单词**做填充会让 token 数比 `tokens` 大 1.2~1.4 倍（BPE 切分），
-    #    而验收 C 要的是"142K 上下文"⇒ 改成空白分隔的**单个字母/数字**，
-    #    每项约 1 token，`--tokens` 才近似等于真实 token 数。
+# 【2026-11-10 实测·台账 #256】"单个字母/数字 + 空格" **不是** 1 token/项：
+#   本模型 tokenizer 实测 ratio = 1.279（20000 项 ⇒ 25582 tokens）。
+#   原代码按 1 项≈1 token 估 ⇒ `--tokens 142000` 实际生成 **181,394 tokens（+27.7%）**，
+#   已经超出 142K±15% 的口径带。⇒ 改成**先向服务端标定 ratio**，再按 ratio 反算项数。
+FILLER_RATIO_FALLBACK = 1.279     # 标定失败时的兜底（偏保守；聚合阶段还有 ±15% 自证兜底）
+
+
+def make_prompt_items(items: int, needle: int, rnd: random.Random) -> str:
     body = " ".join(rnd.choice("abcdefghijklmnopqrstuvwxyz0123456789")
-                    for _ in range(max(tokens - 64, 64)))
+                    for _ in range(max(items, 64)))
     row = f"project Q access code {needle} end"
     return (body + "\n\n" + row + "\n\n"
             + "What is the access code for project Q? Answer with the number only.")
 
 
-def ask(port: int, prompt: str, max_tokens: int) -> tuple[str, float]:
+def make_prompt(tokens: int, needle: int, rnd: random.Random,
+                ratio: float = FILLER_RATIO_FALLBACK) -> str:
+    """按 `ratio`（每项填充项消耗的 token 数）反算填充项数，使真实 prompt ≈ tokens。"""
+    if ratio <= 0:
+        ratio = FILLER_RATIO_FALLBACK
+    items = max(int(round(tokens / ratio)), 64)
+    return make_prompt_items(items, needle, rnd)
+
+
+CAL_ITEMS = 2000
+
+
+def measure_ratio(port: int) -> float | None:
+    """向服务端发一条**小**标定请求，用 usage.prompt_tokens / 项数 得到真实 ratio。
+
+    为什么必须标定：ratio 依赖 tokenizer 与填充串形态（单词 1.57 / 单字母 1.279 / 逗号 2.69），
+    写死常量在下一次换模型/换填充串时就会悄悄失准。
+    """
+    try:
+        txt = make_prompt_items(CAL_ITEMS, 987654, random.Random(1))
+        _, _, usage = ask(port, txt, 1)
+        ptok = usage.get("prompt_tokens")
+        if isinstance(ptok, int) and ptok > CAL_ITEMS * 0.5:
+            return ptok / CAL_ITEMS
+    except Exception:
+        pass
+    return None
+
+
+def ask(port: int, prompt: str, max_tokens: int) -> tuple[str, float, dict]:
     payload = {"model": "DeepSeek-V4.1-Flash", "prompt": prompt,
                "max_tokens": max_tokens, "temperature": 0.0, "seed": 0}
     req = urllib.request.Request(
@@ -52,17 +85,20 @@ def ask(port: int, prompt: str, max_tokens: int) -> tuple[str, float]:
     t0 = time.time()
     with urllib.request.urlopen(req, timeout=1800) as r:
         d = json.loads(r.read())
-    return d["choices"][0]["text"], time.time() - t0
+    # ⚠️ 必须带出 usage.prompt_tokens：填充用的"单字母"并不严格 1 token/项，
+    #    不看这个数就无法证明本轮真的是 142K 上下文（判据会变成"我以为的 142K"）。
+    return d["choices"][0]["text"], time.time() - t0, (d.get("usage") or {})
 
 
-def probe_once(port: int, tokens: int, max_tokens: int) -> dict:
+def probe_once(port: int, tokens: int, max_tokens: int,
+               ratio: float = FILLER_RATIO_FALLBACK) -> dict:
     needle = random.randint(100000, 999999)
-    prompt = make_prompt(tokens, needle, random.Random(needle))
+    prompt = make_prompt(tokens, needle, random.Random(needle), ratio)
     try:
-        text, dt = ask(port, prompt, max_tokens)
+        text, dt, usage = ask(port, prompt, max_tokens)
         hit = str(needle) in text
         return {"t": time.time(), "needle": needle, "hit": hit, "dt": round(dt, 1),
-                "out": text[:40]}
+                "ptok": usage.get("prompt_tokens"), "out": text[:40]}
     except urllib.error.URLError as e:
         return {"t": time.time(), "needle": needle, "hit": False, "dt": None,
                 "error": str(e)[:80]}
@@ -116,6 +152,17 @@ def aggregate(path: str) -> int:
     buckets: dict[int, list[bool]] = defaultdict(list)
     for r in rows:
         buckets[int((r["t"] - t0) // 3600)].append(bool(r["hit"]))
+    ptoks = sorted(r["ptok"] for r in rows if isinstance(r.get("ptok"), int) and r["ptok"] > 0)
+    if ptoks:
+        med = ptoks[len(ptoks) // 2]
+        print(f"上下文实际 tokens（usage.prompt_tokens）：中位 {med:,}  最小 {ptoks[0]:,}  最大 {ptoks[-1]:,}")
+        if med < 120_000 or med > 170_000:
+            print(f"⚠️ 口径存疑：中位 {med:,} 不在 142K±15% 内 ⇒ 别把结论当作 142K 上下文")
+        else:
+            print("✅ 口径符合 142K±15%")
+    else:
+        print("⚠️ 记录里没有 ptok 字段（旧格式）⇒ 无法自证是 142K 上下文")
+
     print(f"{'小时':>4}  {'命中/总数':>10}  {'命中率':>7}")
     for h in sorted(buckets):
         hits, total = sum(buckets[h]), len(buckets[h])
@@ -151,11 +198,21 @@ def main() -> int:
               f"间隔 {a.interval_min} 分钟，共 {a.hours} 小时；端口 {a.port}")
         return 0
 
+    # 先用一条**小**请求标定"每项填充项 = 多少 token"，再按 ratio 反算 --tokens 对应的项数。
+    # 不标定就会像 #256 那样：--tokens 142000 实际生成 181,394 tokens。
+    ratio = measure_ratio(a.port)
+    if ratio:
+        print(f"# 标定：{CAL_ITEMS} 项 ⇒ ratio={ratio:.4f} tokens/项 ⇒ "
+              f"{a.tokens} tokens 用 {int(round(a.tokens / ratio))} 项", flush=True)
+    else:
+        ratio = FILLER_RATIO_FALLBACK
+        print(f"# ⚠️ 标定失败（拿不到 usage.prompt_tokens）⇒ 用兜底 ratio={ratio:.3f}", flush=True)
+
     deadline = time.time() + a.hours * 3600
     n = 0
     while time.time() < deadline:
         for _ in range(a.rounds):
-            r = probe_once(a.port, a.tokens, a.max_tokens)
+            r = probe_once(a.port, a.tokens, a.max_tokens, ratio)
             n += 1
             print(json.dumps(r, ensure_ascii=False), flush=True)
         time.sleep(max(a.interval_min * 60, 1))

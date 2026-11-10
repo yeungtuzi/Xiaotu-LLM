@@ -18,6 +18,8 @@ INSTANCE_TAG="${INSTANCE_TAG:-prod}"  # 服务的 TAG（决定读哪份实例日
 RUN_DIR="${RUN_DIR:-/home/user/lvllm/run}"
 TREE="${TREE:-/home/user/lvllm/process_data/ref/repos/vllm-mainline}"
 PY_BIN="${PY_BIN:-/home/user/anaconda3/envs/vllm-xiaotu-moe/bin/python}"
+# 环境路径可能随部署变化；解释器不存在就回落到 python3（否则 ③b 会以"没有命中"的形式误判缓存失效）
+[ -x "$PY_BIN" ] || PY_BIN=python3
 N="${N:-7430}"
 DEPTH="${DEPTH:-0.5}"
 HERE="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
@@ -28,11 +30,23 @@ LOG="$RUN_DIR/ds41_${INSTANCE_TAG}.log"
 say() { printf '[e1] %s\n' "$*"; }
 
 # ① 服务在跑？
-if ! curl -s -o /dev/null --max-time 4 "http://127.0.0.1:${PORT}/health"; then
+# SKIP_HEALTH=1 仅用于离线回归（见 test_e1_rc_gate.sh）；生产绝不要设
+if [ "${SKIP_HEALTH:-0}" != "1" ] && ! curl -s -o /dev/null --max-time 4 "http://127.0.0.1:${PORT}/health"; then
     say "⛔ 端口 ${PORT} 没有服务（/health 不通）⇒ 先按 RUNBOOK §1 起服务"
     exit 2
 fi
 say "✅ 服务在 ${PORT}"
+
+# ①a 口径自证：读**进程环境**（/proc/<pid>/environ），确认 MARLIN/PIN/SWA/NVCC 真的在这个进程里。
+#    不通过 ⇒ 本轮**作废**（否则 prefill 对照与"生产口径"都是假的；见台账 #251）。
+if [ "${SKIP_HEALTH:-0}" != "1" ]; then
+    if ! _prof=$(RUN_DIR="$RUN_DIR" bash "$HERE/assert_profile_local.sh" "$INSTANCE_TAG" 2>&1); then
+        printf '%s\n' "$_prof" | sed 's/^/[e1]   /'
+        say "⛔ 运行口径不符 ⇒ 本轮作废（不要用这一轮的失败/通过下任何结论）"
+        exit 2
+    fi
+    say "✅ 运行口径符合生产期望（MARLIN/PIN/SWA/NVCC 均在进程环境里）"
+fi
 
 # ①b 口径自检：只认**引擎日志里的自报**（不是"旗标传了"）
 if [ -f "$LOG" ]; then
@@ -44,7 +58,11 @@ if [ -f "$LOG" ]; then
     grep -aq "Decoder SWA bounded replay: in eager prefill steps" "$LOG" \
         && say "✅ 日志确认 decoder-side SWA bounded replay 生效" \
         || say "⚠️ 日志里没看到重放生效的自报行（对照 RUNBOOK 五查第 ⑤ 条）"
-    # 内存前缀缓存：本树**不打印** enable_prefix_caching 字面量 ⇒ 只能用行为判据（下面 ③b 的 cached>0）
+    # 内存前缀缓存：该串**确实会出现**，但它来自 core.py:133 的整行 "with config: …" 巨型 dump
+    # （只证明"参数传了 enable_prefix_caching=True"，不证明"真的命中过"）
+    # ⇒ 仍然只用行为判据（下面 ③b 的 cached>0）；这里留一句提示，避免有人拿 dump 当证据
+    grep -aq "enable_prefix_caching=True" "$LOG" \
+        && say "ℹ️ 配置 dump 里有 enable_prefix_caching=True（仅证明参数，不证明命中；行为判据见 ③b）"
 else
     say "⚠️ 找不到日志 $LOG ⇒ 跳过口径自检（INSTANCE_TAG=${INSTANCE_TAG}）"
 fi
@@ -70,8 +88,16 @@ mkdir -p "$(dirname "$TRIG")" && touch "$TRIG" && say "✅ 触发文件已就位
 OUT="$RUN_DIR/${TAG}_e1.txt"
 say "… 开始 ${CNT} 条 131K（每条约 2.3 min prefill，总计约 $((CNT * 3)) 分钟）"
 # ⚠️ PORT 必须一起传：degen_repro.sh 自己也读 PORT=${PORT:-8700}，不传就会打到 8700
-if ! PORT="$PORT" CNT="$CNT" TAG="$TAG" bash "$HERE/degen_repro.sh" > "$OUT" 2>&1; then
-    say "⚠️ degen_repro 返回非 0（仍继续分析，看是哪几条失败）"
+PORT="$PORT" CNT="$CNT" TAG="$TAG" bash "$HERE/degen_repro.sh" > "$OUT" 2>&1
+rc_repro=$?
+# rc 语义必须翻译：rc=2 是"口径不符"（例如 ptok 不足 131K）⇒ 本轮作废，不能继续拿结论（台账 #230）
+# TAG=e2 视为"修后"臂，其余视为基线臂。
+case "$TAG" in e2*) _mode=fix ;; *) _mode=base ;; esac
+_rv_out=$(bash "$HERE/repro_rc_verdict.sh" "$rc_repro" "$_mode"); _rv=$?
+printf '%s\n' "$_rv_out" | sed 's/^/[e1] /'
+if [ "$_rv" = "2" ]; then
+    say "⛔ 本轮口径不成立 ⇒ 中止（不产生任何「通过 / 未复现」结论）"
+    exit 2
 fi
 say "原始输出：$OUT"
 tail -n "$CNT" "$OUT" | sed 's/^/[e1]   /'

@@ -32,8 +32,23 @@ import torch
 
 _ENV = "XIAOTU_MOE4_MARLIN"
 SLOT = 16
-_KSPLIT_GU = 4
-_KSPLIT_DN = 4
+
+
+def _ksplit_default(v: int) -> int:
+    """K 方向切分数。`KSPLIT>1` 时多个线程块原子累加到同一 C 位置 ⇒ **浮点累加顺序不确定**，
+    同一输入可能给出不同结果（验收 A“同 prompt ×10 输出签名唯一”会因此不通过）。
+    设 `XIAOTU_MOE4_KSPLIT=1` 可关掉切分以获得逐位可复现（代价是少一些并行度）。"""
+    raw = os.environ.get("XIAOTU_MOE4_KSPLIT", "").strip()
+    if not raw:
+        return v
+    try:
+        return max(1, int(raw))
+    except ValueError:
+        return v
+
+
+_KSPLIT_GU = _ksplit_default(4)
+_KSPLIT_DN = _ksplit_default(4)
 
 _lib = None
 _failed = False

@@ -64,9 +64,15 @@ def main() -> int:
     if cached is None:
         cached = usage.get("cached_tokens", "?")
     ptok = usage.get("prompt_tokens", "?")
-    print("cached=%s ptok=%s %.1fs 命中=%s 期望=%d 实得=%s  out=%s"
+    # ⭐ 台账 #278：必须打印 finish_reason 与完成 token 数 —— "空输出"到底是
+    #    finish=length（思考吃掉预算）还是 finish=stop（模型真的立刻收尾）完全不同。
+    fin = ch.get("finish_reason")
+    ctok = usage.get("completion_tokens")
+    rz = (ch.get("message") or {}).get("reasoning") or ""
+    print("cached=%s ptok=%s %.1fs 命中=%s 期望=%d 实得=%s  finish=%s ctok=%s rzlen=%d  out=%s"
           % (cached, ptok, dt, "✓" if str(NEEDLE) in text else "✗",
-             NEEDLE, [x for x in text.split() if x.isdigit()][:3], text[:60].replace("\n", " ")))
+             NEEDLE, [x for x in text.split() if x.isdigit()][:3], fin, ctok, len(rz),
+             text[:60].replace("\n", " ")))
     return 0
 
 

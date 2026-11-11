@@ -18,6 +18,7 @@ __device__ __forceinline__ unsigned short e2m1_bits(int v) {
 }
 __launch_bounds__(128, 12) __global__ void gemm(const __nv_bfloat16* __restrict__ A, const uint8_t* __restrict__ W,
                      const uint8_t* __restrict__ SC, float* __restrict__ C,
+                     float* __restrict__ P,
                      int na, int K, int N, int NE) {
   __shared__ uint16_t sB[KC/2][NT2 + PADW];   // 每元素 = 相邻两列的原始字节（不扩展）
   __shared__ __nv_bfloat16 sA[16][KC + 8];
@@ -121,11 +122,21 @@ __launch_bounds__(128, 12) __global__ void gemm(const __nv_bfloat16* __restrict_
     // 4 个相邻列 (2c0, 2c0+1, 2c0+2, 2c0+3) 连续 ⇒ 一次 float4 写完（base0 是 4 的倍数，16B 对齐）
     float4 w0 = make_float4(acc[g*2+0][0], acc[g*2+1][0], acc[g*2+0][1], acc[g*2+1][1]);
     float4 w1 = make_float4(acc[g*2+0][2], acc[g*2+1][2], acc[g*2+0][3], acc[g*2+1][3]);
-    float* rowA = C + (int64_t)e*16*N + (int64_t)rr0*N;
-    float* rowB = C + (int64_t)e*16*N + (int64_t)(rr0+8)*N;
-    // ⚠️ KSPLIT>1 时多个线程块写同一 C 位置 ⇒ 必须原子累加。
+    // 目标平面：KSPLIT==1 或未提供 P ⇒ 直接写 C；
+    // 提供了 P 且 split>0 ⇒ 写第 (split-1) 个独立平面（无竞争 ⇒ 顺序完全确定）。
+    const bool use_planes = (P != nullptr && KSPLIT > 1 && blockIdx.y > 0);
+    float* base = use_planes
+        ? P + (int64_t)(blockIdx.y - 1) * (int64_t)NE * 16 * N
+        : C;
+    float* rowA = base + (int64_t)e*16*N + (int64_t)rr0*N;
+    float* rowB = base + (int64_t)e*16*N + (int64_t)(rr0+8)*N;
+    // ⚠️ KSPLIT>1 且**没有**提供 P 时，多个线程块写同一 C 位置 ⇒ 只能原子累加（顺序不定）。
     //    第 50~64 轮这里用的是普通写，导致 ksplit>1 的结果全错（数值校验只跑过 ksplit=1，没覆盖到）。
-    if (KSPLIT == 1) {
+    //    提供了 P 的路径不碰 C（split 0 独写，split>0 写各自平面）⇒ 无需原子、结果可复现。
+    // ⚠️ 只有「单段」或「提供了 P（各段写各自地址）」才允许普通写。
+    //    否则必须**所有段**都原子累加 —— 曾误写成 split 0 普通写、其余原子加，
+    //    普通写可能晚于别段的 atomicAdd 落地 ⇒ 覆盖掉累加值（实测偏差 1.19e+02）。
+    if (KSPLIT == 1 || P != nullptr) {
       if (rr0 < na)     { *(float4*)(rowA + base0) = w0; }
       if (rr0 + 8 < na) { *(float4*)(rowB + base0) = w1; }
     } else {
@@ -167,11 +178,44 @@ extern "C" int swiglu(const void* G, void* Out, int na, int I, int NE, float lim
   return (int)e;
 }
 
+// 确定性归约：C[i] += sum_{s} P[s][i]（s 从 0 递增，顺序固定 ⇒ 逐位可复现）。
+// 前提：调用前 C 已归零，且 pass1 的 split 0 已把部分和普通写入 C。
+__global__ void reduce_splits(float* __restrict__ C, const float* __restrict__ P,
+                              int64_t total, int nplanes) {
+  for (int64_t i = blockIdx.x * (int64_t)blockDim.x + threadIdx.x; i < total;
+       i += (int64_t)gridDim.x * blockDim.x) {
+    float acc = C[i];
+    for (int s = 0; s < nplanes; ++s) acc += P[(int64_t)s * total + i];
+    C[i] = acc;
+  }
+}
+
 extern "C" int run(const void* A, const void* W, const void* SC, void* C,
                    int na, int K, int N, int NE, int nblk, int ksplit, cudaStream_t s) {
   dim3 g(nblk, ksplit, NE);
-  gemm<<<g, WARPS*32, 0, s>>>((const __nv_bfloat16*)A,(const uint8_t*)W,(const uint8_t*)SC,(float*)C,na,K,N,NE);
+  gemm<<<g, WARPS*32, 0, s>>>((const __nv_bfloat16*)A,(const uint8_t*)W,(const uint8_t*)SC,(float*)C,
+                              (float*)nullptr, na,K,N,NE);
   cudaError_t e = cudaGetLastError();
   if (e != cudaSuccess) printf("[cu] %s\n", cudaGetErrorString(e));
+  return (int)e;
+}
+
+// 确定性版本：P 需能容纳 (ksplit-1) 个 [NE*16*N] 平面；ksplit<=1 时等价于 run。
+extern "C" int run_det(const void* A, const void* W, const void* SC, void* C, void* P,
+                       int na, int K, int N, int NE, int nblk, int ksplit, cudaStream_t s) {
+  if (ksplit <= 1 || P == nullptr) {
+    return run(A, W, SC, C, na, K, N, NE, nblk, ksplit, s);
+  }
+  dim3 g(nblk, ksplit, NE);
+  gemm<<<g, WARPS*32, 0, s>>>((const __nv_bfloat16*)A,(const uint8_t*)W,(const uint8_t*)SC,(float*)C,
+                              (float*)P, na,K,N,NE);
+  cudaError_t e = cudaGetLastError();
+  if (e != cudaSuccess) { printf("[cu-det] gemm %s\n", cudaGetErrorString(e)); return (int)e; }
+  const int64_t total = (int64_t)NE * 16 * N;
+  int grid = (int)((total + 255) / 256);
+  if (grid > 8192) grid = 8192;
+  reduce_splits<<<grid, 256, 0, s>>>((float*)C, (const float*)P, total, ksplit - 1);
+  e = cudaGetLastError();
+  if (e != cudaSuccess) printf("[cu-det] reduce %s\n", cudaGetErrorString(e));
   return (int)e;
 }

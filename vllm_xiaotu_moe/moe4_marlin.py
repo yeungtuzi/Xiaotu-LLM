@@ -49,6 +49,9 @@ def _ksplit_default(v: int) -> int:
 
 _KSPLIT_GU = _ksplit_default(4)
 _KSPLIT_DN = _ksplit_default(4)
+# 确定性归约（两段式：各 split 写独立平面 + 固定顺序累加）。
+# 关掉时走旧的 atomicAdd 路径（更快但结果不可复现）。
+_DET = os.environ.get("XIAOTU_MOE4_KSPLIT_DET", "0") == "1"
 
 _lib = None
 _failed = False
@@ -109,6 +112,8 @@ def _build():
         lib = ctypes.CDLL(so)
         lib.run.argtypes = [ctypes.c_void_p] * 4 + [ctypes.c_int] * 6 + [ctypes.c_void_p]
         lib.run.restype = ctypes.c_int
+        lib.run_det.argtypes = [ctypes.c_void_p] * 5 + [ctypes.c_int] * 6 + [ctypes.c_void_p]
+        lib.run_det.restype = ctypes.c_int
         lib.swiglu.argtypes = [ctypes.c_void_p] * 2 + [ctypes.c_int] * 3 + [ctypes.c_float, ctypes.c_void_p]
         lib.swiglu.restype = ctypes.c_int
         lib.e2e_dispatch.argtypes = [ctypes.c_void_p] * 8 + [ctypes.c_int] * 4 + [ctypes.c_void_p]
@@ -142,6 +147,9 @@ def _bufs(T: int, K: int, E: int, H: int, I: int, dev) -> dict:
         "Cg":   torch.empty(E, SLOT, 2 * I, dtype=f32, device=dev),
         "A2":   torch.empty(E, SLOT, I, dtype=bf16, device=dev),
         "Cd":   torch.empty(E, SLOT, H, dtype=f32, device=dev),
+        # 确定性归约用的部分和平面（(KSPLIT-1) 个 [E,SLOT,N]）；只有 _DET 时才用到
+        "Pg":   torch.empty(max(0, _KSPLIT_GU - 1) * E * SLOT * 2 * I, dtype=f32, device=dev),
+        "Pd":   torch.empty(max(0, _KSPLIT_DN - 1) * E * SLOT * H, dtype=f32, device=dev),
         "ids32": torch.empty(T, K, dtype=i32, device=dev),
         "w32":  torch.empty(T, K, dtype=f32, device=dev),
     }
@@ -181,12 +189,22 @@ def gemm(x, topk_ids, topk_weights, w13, s13, w2, s2, num_experts, H, I,
     nblk_gu = (2 * I + 127) // 128
     nblk_dn = (H + 127) // 128
     b["Cg"].zero_()
-    lib.run(p(b["As"]), p(w13), p(s13), p(b["Cg"]), SLOT, H, 2 * I, E,
-            nblk_gu, _KSPLIT_GU, stream)
+    _gu = (lib.run_det(p(b["As"]), p(w13), p(s13), p(b["Cg"]), p(b["Pg"]), SLOT, H, 2 * I, E,
+                       nblk_gu, _KSPLIT_GU, stream)
+           if (_DET and _KSPLIT_GU > 1) else
+           lib.run(p(b["As"]), p(w13), p(s13), p(b["Cg"]), SLOT, H, 2 * I, E,
+                   nblk_gu, _KSPLIT_GU, stream))
+    if _gu != 0:
+        return None
     lib.swiglu(p(b["Cg"]), p(b["A2"]), SLOT, I, E, float(swiglu_limit or 0.0), stream)
     b["Cd"].zero_()
-    lib.run(p(b["A2"]), p(w2), p(s2), p(b["Cd"]), SLOT, I, H, E,
-            nblk_dn, _KSPLIT_DN, stream)
+    _dn = (lib.run_det(p(b["A2"]), p(w2), p(s2), p(b["Cd"]), p(b["Pd"]), SLOT, I, H, E,
+                       nblk_dn, _KSPLIT_DN, stream)
+           if (_DET and _KSPLIT_DN > 1) else
+           lib.run(p(b["A2"]), p(w2), p(s2), p(b["Cd"]), SLOT, I, H, E,
+                   nblk_dn, _KSPLIT_DN, stream))
+    if _dn != 0:
+        return None
     lib.e2e_combine(p(b["Cd"]), p(b["ids32"]), p(b["w32"]), p(b["so"]),
                     p(b["part"]), p(b["out"]), T, K, E, H, stream)
     return b["out"]

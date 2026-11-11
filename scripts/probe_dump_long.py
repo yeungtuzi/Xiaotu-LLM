@@ -33,6 +33,8 @@ def main() -> int:
     ap.add_argument("--uuid", default="")
     ap.add_argument("--depth", type=float, default=0.5)
     ap.add_argument("--maxtok", type=int, default=2048)
+    ap.add_argument("--sig", action="store_true",
+                    help="额外打印完整回复文本的 sha256 前 16 位（用于“输出签名唯一”判据）")
     a = ap.parse_args()
     needle_row = int(a.n * a.depth)
     uid = a.uuid or os.urandom(8).hex()
@@ -69,10 +71,16 @@ def main() -> int:
     fin = ch.get("finish_reason")
     ctok = usage.get("completion_tokens")
     rz = (ch.get("message") or {}).get("reasoning") or ""
+    _sig = ""
+    if a.sig:
+        import hashlib
+        _h = hashlib.sha256((text + "\u0000" + rz).encode()).hexdigest()[:16]
+        _sig = " sig=%s" % _h
     print("cached=%s ptok=%s %.1fs 命中=%s 期望=%d 实得=%s  finish=%s ctok=%s rzlen=%d  out=%s"
           % (cached, ptok, dt, "✓" if str(NEEDLE) in text else "✗",
              NEEDLE, [x for x in text.split() if x.isdigit()][:3], fin, ctok, len(rz),
-             text[:60].replace("\n", " ")))
+             text[:60].replace("\n", " ")), end="")
+    print(_sig if a.sig else "")
     return 0
 
 

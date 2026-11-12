@@ -149,11 +149,22 @@ def main() -> int:
     ap.add_argument("--soak-n", type=int, default=2000)
     a = ap.parse_args()
 
+    want = [c.strip().upper() for c in a.checks.split(",") if c.strip()]
+
+    # ⚠️ 污染防护（台账 #399 的教训）：D/C 是“失败索引/失败率”类判据，
+    #    必须在**重启后的第一个**跑；若同一次调用里排在 A/B 之后，先给出明确提示，
+    #    避免把“实例已有存量”误读成“这个改动让退化变严重”。
+    failure_index_checks = [c for c in want if c in ("C", "D")]
+    earlier = [c for c in want[: want.index(failure_index_checks[0])]] if failure_index_checks else []
+    if failure_index_checks and earlier:
+        print(f"⚠️ 顺序提醒：{failure_index_checks[0]} 排在 {','.join(earlier)} 之后。")
+        print("   若前面已发过成规模的长请求，实例会带有累计 token 存量，D/C 的失败点可能提前；")
+        print("   结论只在『重启后第一个跑』时可比（见台账 #399）。")
     if health(a.port) != 200:
         print(f"⛔ 服务未就绪（port={a.port} /health 非 200）—— 先用 serve_ds41.sh 起服务")
         return 2
 
-    want = [c.strip().upper() for c in a.checks.split(",") if c.strip()]
+
     results = []
     t0 = time.time()
     for c in want:
@@ -177,6 +188,7 @@ def main() -> int:
         all_ok = all_ok and ok
     print("== 汇总：" + ("全部通过" if all_ok else "存在未通过项"))
     return 0 if all_ok else 1
+
 
 
 if __name__ == "__main__":

@@ -84,16 +84,29 @@ def probe(port: int, n: int, uuid: str, maxtok: int) -> dict:
     return rec
 
 
-def check_A(port: int, n: int, maxtok: int) -> tuple[bool, str]:
-    """同 prompt ×10：签名必须唯一（10 次完全相同）且每次都命中。"""
+def check_A(port: int, n: int, maxtok: int, rounds: int = 1) -> tuple[bool, str]:
+    """同 prompt ×10，可多轮采样：每一轮都必须 10/10 命中且签名唯一。
+
+    ⚠️ 为什么默认只跑 1 轮、却支持 `--a-rounds`：台账 #433 实测 A 有约 1/8 的**偶发**
+    非确定性（'DET' 已修掉主因，残余疑为 top-k 并列取舍）。单轮通过不足以证明“唯一”，
+    判验收时建议 `--a-rounds 3`（三轮全绿才算过）。
+    """
     sigs, hits = [], 0
-    for _ in range(10):
-        r = probe(port, n, "same-prompt-A", maxtok)
-        hits += int(r["hit"])
-        sigs.append(r["signature"])
-    uniq = len(set(sigs))
-    ok = hits == 10 and uniq == 1
-    return ok, f"A 同 prompt ×10：命中 {hits}/10，签名种类 {uniq}（要求 1）"
+    per_round = []
+    for _ in range(max(1, rounds)):
+        rsigs, rhits = [], 0
+        for _ in range(10):
+            r = probe(port, n, "same-prompt-A", maxtok)
+            rhits += int(r["hit"])
+            rsigs.append(r["signature"])
+        hits += rhits
+        sigs += rsigs
+        per_round.append((rhits, len(set(rsigs))))
+    total = 10 * max(1, rounds)
+    all_rounds_unique = all(u == 1 and h == 10 for h, u in per_round)
+    ok = hits == total and all_rounds_unique
+    detail = "；".join(f"第{i+1}轮 {h}/10 签名 {u} 种" for i, (h, u) in enumerate(per_round))
+    return ok, f"A 同 prompt ×10×{max(1, rounds)}：命中 {hits}/{total}，{detail}（要求每轮 1 种）"
 
 
 def check_D(port: int, n: int, maxtok: int) -> tuple[bool, str]:
@@ -145,6 +158,8 @@ def main() -> int:
                     help="逗号分隔：A / B / C / D（默认 A,B,D）")
     ap.add_argument("--n", type=int, default=7430, help="探针 --n（7430 ≈ 131.8K token）")
     ap.add_argument("--maxtok", type=int, default=512)
+    ap.add_argument("--a-rounds", type=int, default=1,
+                    help="A 判据采样轮数（验收建议 3；见台账 #433 的偶发非确定性）")
     ap.add_argument("--soak-hours", type=float, default=0.0)
     ap.add_argument("--soak-n", type=int, default=2000)
     a = ap.parse_args()
@@ -169,7 +184,7 @@ def main() -> int:
     t0 = time.time()
     for c in want:
         if c == "A":
-            results.append(check_A(a.port, a.n, a.maxtok))
+            results.append(check_A(a.port, a.n, a.maxtok, a.a_rounds))
         elif c == "B":
             results.append(check_B(a.port, a.n, a.maxtok))
         elif c == "C":

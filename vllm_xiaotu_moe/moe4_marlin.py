@@ -50,8 +50,10 @@ def _ksplit_default(v: int) -> int:
 _KSPLIT_GU = _ksplit_default(4)
 _KSPLIT_DN = _ksplit_default(4)
 # 确定性归约（两段式：各 split 写独立平面 + 固定顺序累加）。
-# 关掉时走旧的 atomicAdd 路径（更快但结果不可复现）。
-_DET = os.environ.get("XIAOTU_MOE4_KSPLIT_DET", "0") == "1"
+# **默认开启**：旧的 atomicAdd 路径浮点累加顺序不定 ⇒ 同一 prompt 多次运行可能给出不同文本
+# （验收 A“同 prompt ×10 输出签名唯一”会失败）。实测确定性路径反而快 ~2%（无原子竞争）。
+# 需要退回旧路径时设 XIAOTU_MOE4_KSPLIT_DET=0。
+_DET = os.environ.get("XIAOTU_MOE4_KSPLIT_DET", "1") == "1"
 
 _lib = None
 _failed = False

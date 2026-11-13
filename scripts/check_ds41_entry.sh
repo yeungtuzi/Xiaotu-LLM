@@ -140,7 +140,7 @@ esac
 # ⚠️ 取**最后一条**：vLLM 的 --compilation-config 不是 append 语义 ⇒ 最后一条才生效
 #   （取第一条会在 ALLOW_EXTRA_OVERRIDE 传了两条时把 NONE 误判成 FULL_DECODE_ONLY ⇒ 假的"合规"）。
 #   同时容忍 JSON 里的可选空白与大小写。
-cgm="$(printf '%s' "$cmdline" | grep -oE '"cudagraph_mode"[[:space:]]*:[[:space:]]*"[A-Za-z_]+"' | tail -1 | sed -E 's/.*"([A-Za-z_]+)"$//' | tr '[:lower:]' '[:upper:]')"
+cgm="$(printf '%s' "$cmdline" | grep -oE '"cudagraph_mode"[[:space:]]*:[[:space:]]*"[A-Za-z_]+"' | tail -1 | cut -d'"' -f4 | tr '[:lower:]' '[:upper:]')"
 case "${cgm:-}" in
     FULL_DECODE_ONLY) echo "✓ cudagraph_mode=FULL_DECODE_ONLY（生产档位）" ;;
     NONE)

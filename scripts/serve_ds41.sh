@@ -101,7 +101,13 @@ THREADS=60; IMAGE_MAX=128; COMPILE_RANGES="32,256,8192"
 # ⭐ 2026-11-14：图捕获档位。MUSA 上 CPU 专家路径的侧流在捕获期会触发
 #   `MUSA error: capturing stream has unjoined work` ⇒ 需要能关掉图捕获。
 #   合法值即 CUDAGraphMode 的字符串成员；**默认值保持原样**（行为不变）。
-CUDAGRAPH_MODE="${CUDAGRAPH_MODE:-FULL_DECODE_ONLY}"
+# ⭐ 显式性必须用 `${VAR+x}` 判定，**不能**用"非空"判定：
+#   显式传空串（`docker exec -e CUDAGRAPH_MODE=`）也算"给了" ⇒ 必须被 validate 拒，
+#   而且**不能**被 `run/ds41_<TAG>.cudagraph` 的回读掩盖（审计实测过的漏洞）。
+CGM_EXPLICIT=0; [ "${CUDAGRAPH_MODE+x}" = "x" ] && CGM_EXPLICIT=1
+# ⚠️ 用 `-` 而不是 `:-`：显式传空串要**保持为空**，由 validate 拒绝。
+#   否则 MUSA 上 "以为关了图捕获、其实没关" ⇒ `capturing stream has unjoined work` 原样复发。
+CUDAGRAPH_MODE="${CUDAGRAPH_MODE-FULL_DECODE_ONLY}"
 PIN=1; PIN_SLOTS=15; PIN_MAXQ=16; PIN_CUDA_MOE=0; MARLIN=0; WARMUP=1
 # ⭐⭐ 2026-11-10 复审 N1：必须在赋默认值**之前**记下"调用者是否显式给了 SWA_BOUNDED_REPLAY"，
 #    否则 SWA_EXPLICIT 恒为 1 ⇒ 单独写 `CED=0` 会被误判成"与显式 SWA 冲突"（fail-closed 但挡住合法用法）。
@@ -156,7 +162,7 @@ while [ $# -gt 0 ]; do
                 THREADS) THREADS="$v" ;;
                 IMAGE_MAX) IMAGE_MAX="$v" ;;
                 COMPILE_RANGES) COMPILE_RANGES="$v" ;;
-                CUDAGRAPH_MODE) CUDAGRAPH_MODE="$v" ;;
+                CUDAGRAPH_MODE) CUDAGRAPH_MODE="$v"; CGM_EXPLICIT=1 ;;
                 PIN) PIN="$v" ;;
                 PIN_SLOTS) PIN_SLOTS="$v" ;;
                 PIN_CUDA_MOE) PIN_CUDA_MOE="$v" ;;
@@ -208,6 +214,19 @@ if [ "$PORT_EXPLICIT" = "0" ] && [ -f "$PORT_FILE" ]; then
         PORT="$_xtu_p"
         echo "[ds41] 端口从 $PORT_FILE 回读为 $PORT" >&2
     fi
+fi
+# 同理：restart 不传参时，图捕获档位也必须从文件回读，否则 MUSA 上会静默
+# 回到 FULL_DECODE_ONLY ⇒ 图捕获重新打开 ⇒ 崩溃复发。
+CGM_FILE="$RUN_DIR/ds41_${TAG}.cudagraph"
+if [ "$CGM_EXPLICIT" = "0" ] && [ -f "$CGM_FILE" ]; then
+    _xtu_g="$(tr -d '[:space:]' < "$CGM_FILE" 2>/dev/null || true)"
+    case "$_xtu_g" in
+        NONE|PIECEWISE|FULL|FULL_DECODE_ONLY|FULL_AND_PIECEWISE)
+            CUDAGRAPH_MODE="$_xtu_g"
+            echo "[ds41] 图捕获档位从 $CGM_FILE 回读为 $CUDAGRAPH_MODE" >&2 ;;
+        "") ;;
+        *) echo "[ds41] ⚠️ $CGM_FILE 内容非法('$_xtu_g')，忽略，用 $CUDAGRAPH_MODE" >&2 ;;
+    esac
 fi
 # ⭐⭐ 2026-11-10 审计 B4（blocking）：锁**按 PORT**，否则两个 TAG 抢同一端口可同时通过检查。
 #    ⚠️ 复审 N2：这一行必须在**PORT 回读之后**，否则不带 PORT 的 start 会锁错端口。
@@ -598,6 +617,8 @@ start() {
         export XIAOTU_PIN="$PIN" XIAOTU_PIN_MAX_PER_LAYER="$PIN_SLOTS" XIAOTU_PIN_MAXQ="$PIN_MAXQ"
         export XIAOTU_MOE_THREADS="$THREADS" OMP_NUM_THREADS=1
         export XIAOTU_PIN_CUDA_MOE="$PIN_CUDA_MOE" XIAOTU_MOE4_MARLIN="$MARLIN" XIAOTU_ENGRAM_LAST=1
+        # 口径必须能从 status 读出（AGENTS.md「新增开关必须同步口径检查」）
+        export CUDAGRAPH_MODE="$CUDAGRAPH_MODE"
         if [ "$IDLE_EC" = "1" ]; then
             export XIAOTU_IDLE_EMPTY_CACHE=1 XIAOTU_IDLE_EC_SECONDS="$IDLE_EC_SECONDS"
             # ⭐ 预热收尾即归还：实测 10.8 GiB 高水位 100% 来自形状预热，
@@ -679,6 +700,7 @@ start() {
     fi
     printf '%s\n' "$pid" > "$PID_FILE" || die "PID 文件写入失败：$PID_FILE（已启动 pid=$pid）" 4
     printf '%s\n' "$PORT" > "$PORT_FILE" 2>/dev/null || say "⚠️ PORT 文件写入失败：$PORT_FILE"
+    printf '%s\n' "$CUDAGRAPH_MODE" > "$CGM_FILE" 2>/dev/null || say "⚠️ 图捕获档位文件写入失败：$CGM_FILE"
     say "已启动 pid=$pid 日志=$LOG_FILE"
 
     local ok=0
@@ -925,7 +947,7 @@ status() {
     say "GPU: $(nvidia-smi --query-gpu=index,memory.used --format=csv,noheader | tr '\n' ' ')"
     say "实际口径:"
     tr '\0' '\n' < "/proc/$pid/environ" 2>/dev/null \
-        | grep -E '^(XIAOTU_MOE_THREADS|XIAOTU_PIN|XIAOTU_PIN_CUDA_MOE|XIAOTU_PIN_MAX_PER_LAYER|XIAOTU_IMAGE_MAX|XIAOTU_MOE4_MARLIN|XIAOTU_IDLE_EMPTY_CACHE|XIAOTU_IDLE_EC_SECONDS|XIAOTU_PIN_MAXQ|GPU_UTIL|MAXSEQS|COMPILE_RANGES|PYTORCH_CUDA_ALLOC_CONF|EXPANDABLE|SWA_BOUNDED_REPLAY|NO_PREFIX_CACHE|MAX_NUM_BATCHED_TOKENS|MAX_NUM_SEQS|GPU_UTILIZATION|XIAOTU_MOE_MBT|DS41_MAXLEN|DS41_TP|DS41_SPEC|DS41_KV_DTYPE)=' \
+        | grep -E '^(CUDAGRAPH_MODE|XIAOTU_MOE_THREADS|XIAOTU_PIN|XIAOTU_PIN_CUDA_MOE|XIAOTU_PIN_MAX_PER_LAYER|XIAOTU_IMAGE_MAX|XIAOTU_MOE4_MARLIN|XIAOTU_IDLE_EMPTY_CACHE|XIAOTU_IDLE_EC_SECONDS|XIAOTU_PIN_MAXQ|GPU_UTIL|MAXSEQS|COMPILE_RANGES|PYTORCH_CUDA_ALLOC_CONF|EXPANDABLE|SWA_BOUNDED_REPLAY|NO_PREFIX_CACHE|MAX_NUM_BATCHED_TOKENS|MAX_NUM_SEQS|GPU_UTILIZATION|XIAOTU_MOE_MBT|DS41_MAXLEN|DS41_TP|DS41_SPEC|DS41_KV_DTYPE)=' \
         | sed 's/^/    /'
     cc="$(eff_compilation_config "$pid")"
     say "    [生效] --compilation-config $cc"

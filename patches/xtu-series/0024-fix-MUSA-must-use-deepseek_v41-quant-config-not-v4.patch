@@ -1,0 +1,22 @@
+--- a/vllm/model_executor/layers/quantization/__init__.py	2026-11-13 23:28:39.100502724 +0800
++++ b/vllm/model_executor/layers/quantization/__init__.py	2026-11-13 23:28:39.160504276 +0800
+@@ -117,7 +117,18 @@
+     from vllm.config.quantization import _ONLINE_SHORTHANDS
+     from vllm.model_executor.layers.quantization.quark.quark import QuarkConfig
+ 
+-    if current_platform.is_cuda() or current_platform.is_rocm():
++    # [xtu-musa-v41] MUSA 的平台类 MtmlMUSAPlatform 既不是 is_cuda() 也不是
++    # is_rocm()，于是原先落到 else 分支 ⇒ 使用**旧版 deepseek_v4** 的
++    # DeepseekV4FP8Config，而它没有 "32x32 MXFP8 线性层" 分支 ⇒ 线性层退化到
++    # Fp8LinearMethod（注册 weight_scale_inv），但加载器会把 checkpoint 的
++    # ".scale" 改名为 weight_scale ⇒
++    # KeyError: layers.N.attn.fused_wqa_wkv.weight_scale（实测于 2026-11-13）。
++    # MUSA 的 torch_musa 提供与 CUDA 同构的 fp8/MXFP8 张量核路径，直接复用 v4.1 类。
++    if (
++        current_platform.is_cuda()
++        or current_platform.is_rocm()
++        or getattr(current_platform, "device_name", "") == "musa"
++    ):
+         # The v4.1 class is the v4 one extended to accept model_type
+         # "deepseek_v41" and its 32x32 MXFP8 linear layout. V4.1 has
+         # platform-specific implementations for both CUDA and ROCm.

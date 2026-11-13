@@ -1,0 +1,19 @@
+--- a/vllm/models/deepseek_v4/common/ops/fused_inv_rope_fp8_quant.py	2026-11-13 23:39:40.029562740 +0800
++++ b/vllm/models/deepseek_v4/common/ops/fused_inv_rope_fp8_quant.py	2026-11-13 23:39:40.081564081 +0800
+@@ -389,7 +389,15 @@
+         empty when quantization is disabled.
+ 
+     """
+-    if _musa_deepseek_v4_is_musa_tensor(o):
++    # [xtu-musa-rope-quantize] MUSA 的 deepseek_v4_fused_inv_rope_fp8_quant
++    # **没有 quantize 参数**（vllm_musa/_custom_ops.py:926 签名里就没有），
++    # 因此它**永远返回 FP8**。而调用方在权重非 fp8 时会传 quantize=False
++    # 并把结果当 bf16 用（见 deepseek_v4/nvidia/ops/o_proj.py 的非 fp8 分支），
++    # 于是出现 "mat1 and mat2 must have the same dtype, got
++    # Float8_e4m3fn and BFloat16"（2026-11-13 实测）。
++    # 通用(Triton)实现已在本机验证：quantize=False 时返回 bf16 + 空 scale ✓
++    # ⇒ 只在 quantize=True 时走 MUSA 自定义算子，否则交给通用路径。
++    if _musa_deepseek_v4_is_musa_tensor(o) and quantize:
+         from vllm_musa import _custom_ops as _musa_custom_ops
+ 
+         return _musa_custom_ops.deepseek_v4_fused_inv_rope_fp8_quant(

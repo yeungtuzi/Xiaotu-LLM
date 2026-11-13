@@ -1,0 +1,25 @@
+--- a/vllm/model_executor/kernels/linear/__init__.py	2026-11-13 23:32:00.285702145 +0800
++++ b/vllm/model_executor/kernels/linear/__init__.py	2026-11-13 23:32:00.337703488 +0800
+@@ -994,11 +994,17 @@
+     platform = current_platform._enum
+     possible: list[type[Mxfp8LinearKernel]]
+     if bmm_batch_size is not None:
+-        possible = (
+-            [DeepGemmMxfp8BmmLinearKernel, EmulationMxfp8LinearKernel]
+-            if current_platform.is_cuda()
+-            else []
+-        )
++        # [xtu-musa-bmm] MUSA(MtmlMUSAPlatform, _enum=OOT) 既非 is_cuda() 也非
++        # is_rocm() ⇒ 原实现给空列表 ⇒ init_mxfp8_linear_kernel 抛
++        # "Failed to find a kernel ... Reasons:"（理由列表为空，极难定位）。
++        # MUSA 上 DeepGemm 不可用，但 Emulation 内核是纯 PyTorch、平台无关
++        # （is_supported/can_implement 均为 True）⇒ 单独给它。
++        if current_platform.is_cuda():
++            possible = [DeepGemmMxfp8BmmLinearKernel, EmulationMxfp8LinearKernel]
++        elif getattr(current_platform, "device_name", "") == "musa":
++            possible = [EmulationMxfp8LinearKernel]
++        else:
++            possible = []
+     else:
+         possible = list(_POSSIBLE_MXFP8_KERNELS.get(platform, []))
+ 

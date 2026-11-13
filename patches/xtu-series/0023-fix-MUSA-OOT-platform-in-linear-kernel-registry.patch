@@ -1,0 +1,18 @@
+--- a/vllm/model_executor/kernels/linear/__init__.py	2026-11-13 23:25:28.315563288 +0800
++++ b/vllm/model_executor/kernels/linear/__init__.py	2026-11-13 23:25:28.371564739 +0800
+@@ -569,6 +569,15 @@
+         XPUMxFp8LinearKernel,
+         EmulationMxfp8LinearKernel,
+     ],
++    # [xtu-musa-oot] MUSA 的平台类是 MtmlMUSAPlatform，其 _enum 是
++    # PlatformEnum.OOT（不在上表中）⇒ MXFP8 线性层**没有任何候选 kernel**，
++    # 于是静默回退到 Fp8LinearMethod（注册 weight_scale_inv），
++    # 而加载器把 checkpoint 的 ".scale" 改名为 weight_scale ⇒
++    # load_weights 抛 KeyError: layers.N.attn.fused_wqa_wkv.weight_scale。
++    # Emulation 内核是纯 PyTorch 实现（can_implement 恒 True），平台无关。
++    PlatformEnum.OOT: [
++        EmulationMxfp8LinearKernel,
++    ],
+ }
+ 
+ _POSSIBLE_NVFP4_KERNELS: dict[PlatformEnum, list[type[NvFp4LinearKernel]]] = {

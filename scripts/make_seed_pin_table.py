@@ -33,7 +33,9 @@ import sys
 MODELS = {
     # name: (层数, 每层专家数)
     "glm":  (62, 288),      # GLM-5.3-Flash:FP8 专家(block 128x128)
-    "ds41f": (40, 128),     # DeepSeek-V4.1-Flash:MXFP4 专家(gk=32)
+    # DeepSeek-V4.1-Flash-1017:MXFP4 专家(gk=32)。专家数 384 来自模型 config.json
+    #   (`num_hidden_layers=40, n_routed_experts=384`)；历史值 128 已过期 ✗
+    "ds41f": (40, 384),
     "qfn":  (48, 512),      # Qwen3.8-Flash-Next:FP8 专家
 }
 

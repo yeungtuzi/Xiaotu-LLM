@@ -98,6 +98,10 @@ TAG="${TAG:-prod}"; PORT="${PORT:-8700}"; TP="${TP:-2}"
 # ⭐ 2026-11-10 审计 B1：短名/全名的**环境变量**形式都必须生效（原先这行会把 env 值覆盖掉）
 GPU_UTIL="${GPU_UTIL:-0.9}"; MAXSEQS="${MAXSEQS:-4}"; MBT="${MBT:-8192}"; MAXLEN="${MAXLEN:-524288}"
 THREADS=60; IMAGE_MAX=128; COMPILE_RANGES="32,256,8192"
+# ⭐ 2026-11-14：图捕获档位。MUSA 上 CPU 专家路径的侧流在捕获期会触发
+#   `MUSA error: capturing stream has unjoined work` ⇒ 需要能关掉图捕获。
+#   合法值即 CUDAGraphMode 的字符串成员；**默认值保持原样**（行为不变）。
+CUDAGRAPH_MODE="${CUDAGRAPH_MODE:-FULL_DECODE_ONLY}"
 PIN=1; PIN_SLOTS=15; PIN_MAXQ=16; PIN_CUDA_MOE=0; MARLIN=0; WARMUP=1
 # ⭐⭐ 2026-11-10 复审 N1：必须在赋默认值**之前**记下"调用者是否显式给了 SWA_BOUNDED_REPLAY"，
 #    否则 SWA_EXPLICIT 恒为 1 ⇒ 单独写 `CED=0` 会被误判成"与显式 SWA 冲突"（fail-closed 但挡住合法用法）。
@@ -152,6 +156,7 @@ while [ $# -gt 0 ]; do
                 THREADS) THREADS="$v" ;;
                 IMAGE_MAX) IMAGE_MAX="$v" ;;
                 COMPILE_RANGES) COMPILE_RANGES="$v" ;;
+                CUDAGRAPH_MODE) CUDAGRAPH_MODE="$v" ;;
                 PIN) PIN="$v" ;;
                 PIN_SLOTS) PIN_SLOTS="$v" ;;
                 PIN_CUDA_MOE) PIN_CUDA_MOE="$v" ;;
@@ -298,6 +303,10 @@ validate() {
     is_uint "$THREADS" || die "THREADS 必须是正整数（得到 '$THREADS'）"
     [ $(( THREADS % 12 )) -eq 0 ] || die "THREADS=$THREADS 不是 12 的倍数（CCD=12 核）"
     [ "$THREADS" -ge 12 ] && [ "$THREADS" -le 192 ] || die "THREADS=$THREADS 超出 12..192"
+    case "$CUDAGRAPH_MODE" in
+        NONE|PIECEWISE|FULL|FULL_DECODE_ONLY|FULL_AND_PIECEWISE) ;;
+        *) die "CUDAGRAPH_MODE 非法：'$CUDAGRAPH_MODE'（合法：NONE/PIECEWISE/FULL/FULL_DECODE_ONLY/FULL_AND_PIECEWISE）" 2 ;;
+    esac
     is_uint "$PIN_SLOTS" && is_uint "$PIN_MAXQ" && is_uint "$IMAGE_MAX" \
         || die "PIN_SLOTS/PIN_MAXQ/IMAGE_MAX 必须是非负整数"
     [ "$IMAGE_MAX" -le 128 ] || die "IMAGE_MAX 上限 128（得到 '$IMAGE_MAX'）"
@@ -410,7 +419,7 @@ validate() {
 }
 
 build_compilation_config() {
-    local cc="{\"cudagraph_mode\":\"FULL_DECODE_ONLY\",\"mode\":\"VLLM_COMPILE\",\"cache_dir\":\"$CACHE_DIR\""
+    local cc="{\"cudagraph_mode\":\"$CUDAGRAPH_MODE\",\"mode\":\"VLLM_COMPILE\",\"cache_dir\":\"$CACHE_DIR\""
     [ -n "$COMPILE_RANGES" ] && cc="$cc,\"compile_ranges_endpoints\":[$COMPILE_RANGES]"
     printf '%s}' "$cc"
 }
@@ -513,6 +522,7 @@ start() {
 
     build_args
     say "启动 TAG=$TAG PORT=$PORT TP=$TP util=$GPU_UTIL seqs=$MAXSEQS MBT=$MBT maxlen=$MAXLEN"
+    say "图捕获 graph=$CUDAGRAPH_MODE"
     say "线程=$THREADS PIN=$PIN/$PIN_SLOTS MAXQ=$PIN_MAXQ CUDA_MOE=$PIN_CUDA_MOE MARLIN=$MARLIN IDLE_EC=$IDLE_EC/$IDLE_EC_SECONDS SWA_BOUNDED_REPLAY=$SWA_BOUNDED_REPLAY SPEC=$SPEC image=$IMAGE_MAX"
     # ⛔ [2026-11-05 审计 B · M] 小 M 内核**只走 PIN 常驻槽位**（gpu_prefill.py:3017
     #    `slot is not None and _moe4_ok`）；`PIN=0` 时 slot 恒为 None ⇒ 内核永不生效。
@@ -538,6 +548,12 @@ start() {
     fi
     [ "$SWA_BOUNDED_REPLAY" = "0" ] && say "⚠️ SWA_BOUNDED_REPLAY=0：这是基线臂（关闭 decoder-side SWA bounded replay），报告中必须标注"
     [ "$PC" = "0" ] && say "⚠️ PC=0（稳定口径）：不启用磁盘前缀缓存；如需持久缓存实验臂用 PC=1，须加 ALLOW_PC1=1"
+    if [ "$CUDAGRAPH_MODE" != "FULL_DECODE_ONLY" ]; then
+        say "⚠️ CUDAGRAPH_MODE=$CUDAGRAPH_MODE（非默认）：图捕获档位已改，性能数据须标注该口径"
+        say "    来由：MUSA 上 torch.cuda 的图捕获原语不可用（CUDAGraph 实例化即抛 RuntimeError；"
+        say "    is_current_stream_capturing 为占位实现、捕获期检测不出 ⇒ 走了跨流路径）"
+        say "    ⇒ 捕获期报 \"capturing stream has unjoined work\" ⇒ MUSA 必须用 NONE"
+    fi
 
     if [ "$PC" = "1" ]; then
         mkdir -p "$PC_ROOT" 2>/dev/null || die "PC_ROOT 无法创建：$PC_ROOT" 3
@@ -746,7 +762,7 @@ start() {
             | grep -qE 'enable-custom-all-reduce'; then
         die "EXPANDABLE=1 但生效命令行里出现 enable-custom-all-reduce ⇒ 绑定被破坏" 4
     fi
-    { echo "[ds41] [口径] CUDA_MOE=$PIN_CUDA_MOE IDLE_EC=$IDLE_EC/$IDLE_EC_SECONDS EXPANDABLE=$EXPANDABLE PYTORCH_CUDA_ALLOC_CONF=${ALLOC_CONF_EFFECTIVE:-unset} custom-AR=$([ "$EXPANDABLE" = "1" ] && echo off || echo on) PC=$PC PC_GB=$PC_GB PC_BLOCKS=$PC_BLOCKS PC_ROOT=$PC_ROOT GPU_UTIL=$GPU_UTIL PC_FILES_BASE=${_pc_base:-na}"; } >> "$LOG_FILE"
+    { echo "[ds41] [口径] CUDAGRAPH_MODE=$CUDAGRAPH_MODE CUDA_MOE=$PIN_CUDA_MOE IDLE_EC=$IDLE_EC/$IDLE_EC_SECONDS EXPANDABLE=$EXPANDABLE PYTORCH_CUDA_ALLOC_CONF=${ALLOC_CONF_EFFECTIVE:-unset} custom-AR=$([ "$EXPANDABLE" = "1" ] && echo off || echo on) PC=$PC PC_GB=$PC_GB PC_BLOCKS=$PC_BLOCKS PC_ROOT=$PC_ROOT GPU_UTIL=$GPU_UTIL PC_FILES_BASE=${_pc_base:-na}"; } >> "$LOG_FILE"
     say "显存: $(nvidia-smi --query-gpu=index,memory.used --format=csv,noheader | tr '\n' ' ')"
 
     # ⛔ 2026-11-04 审计 B 后重写：启动健康闸。

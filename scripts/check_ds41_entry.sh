@@ -133,6 +133,27 @@ case "${marlin:-}" in
     *) echo "✗ XIAOTU_MOE4_MARLIN=${marlin:-未设}（非 0/1，口径不明）" >&2; rc=1 ;;
 esac
 
+# 图捕获档位（cudagraph_mode，缺省 FULL_DECODE_ONLY）。
+# ⚠️ 该档位会左右性能（本仓 FULL_DECODE_ONLY 是 2.2× 档位）⇒ 必须能从 status 读出自洽口径。
+# MUSA 上因 torch.cuda.CUDAGraph / is_current_stream_capturing 为占位类，只能用 NONE；
+# 这种合法例外用 ALLOW_NONPROD_CUDAGRAPH=1 显式放行，缺省仍判不合规（fail-closed）。
+# ⚠️ 取**最后一条**：vLLM 的 --compilation-config 不是 append 语义 ⇒ 最后一条才生效
+#   （取第一条会在 ALLOW_EXTRA_OVERRIDE 传了两条时把 NONE 误判成 FULL_DECODE_ONLY ⇒ 假的"合规"）。
+#   同时容忍 JSON 里的可选空白与大小写。
+cgm="$(printf '%s' "$cmdline" | grep -oE '"cudagraph_mode"[[:space:]]*:[[:space:]]*"[A-Za-z_]+"' | tail -1 | sed -E 's/.*"([A-Za-z_]+)"$//' | tr '[:lower:]' '[:upper:]')"
+case "${cgm:-}" in
+    FULL_DECODE_ONLY) echo "✓ cudagraph_mode=FULL_DECODE_ONLY（生产档位）" ;;
+    NONE)
+        if [ "${ALLOW_NONPROD_CUDAGRAPH:-0}" = "1" ]; then
+            echo "⚠️ cudagraph_mode=NONE（已用 ALLOW_NONPROD_CUDAGRAPH=1 放行；性能为 eager 口径）"
+        else
+            echo "✗ cudagraph_mode=NONE（图捕获已关；如确属 MUSA 等后端限制，须显式 ALLOW_NONPROD_CUDAGRAPH=1）" >&2
+            rc=1
+        fi ;;
+    "") echo "✗ 命令行读不到 cudagraph_mode（口径不明）" >&2; rc=1 ;;
+    *) echo "⚠️ cudagraph_mode=${cgm}（非缺省档位，性能数据须标注该口径）" ;;
+esac
+
 alloc="$(printf '%s\n' "$environ" | grep '^PYTORCH_CUDA_ALLOC_CONF=' | cut -d= -f2-)"
 case "${alloc:-}" in
     *expandable_segments:True*)

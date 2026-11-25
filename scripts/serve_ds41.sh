@@ -125,8 +125,9 @@ PIN=1; PIN_SLOTS=15; PIN_MAXQ=16; PIN_CUDA_MOE=0; MARLIN=0; WARMUP=1
 #   * 缺省 **0 = 关闭**（与引擎缺省一致，遵循"缺省不进入未验证模式"）；
 #   * 生产口径显式给：`PIN_WINDOW=200 ...`（或父环境 `XIAOTU_PIN_WINDOW=200`）；
 #   * 父环境**生效**（此前硬赋值 200 会把唯一的关闭/调参通道掐断）。
-# m4（R3 复审）：显式性按"变量是否已定义"判定 —— `PIN_WINDOW=`（显式置空）也算显式，
-#   交给 validate 拒绝；否则 env 置空会被 .pinwindow 静默覆盖。
+# m4（R3 复审）：显式性按"变量是否已定义"判定 —— env `PIN_WINDOW=`（显式置空）也算显式，
+#   作用是不再回读 .pinwindow（避免被文件里的 200 顶掉）；其值按 0 处理（关闭）。
+#   ⚠️ 注意与 CLI 的差异：`start PIN_WINDOW=` 由 validate 直接拒绝，env 空值则是"显式关闭"。
 _XTU_PINW_ENV="${PIN_WINDOW:-}"          # canonical env（无 XIAOTU_ 前缀）
 _XTU_PINW_ENV2="${XIAOTU_PIN_WINDOW:-}"  # 推荐 env
 _XTU_PINW_SET=0

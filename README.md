@@ -55,6 +55,19 @@
 5. **硬件感知的 NUMA 切片**：按 NUMA 拓扑把进程均匀分布到核心，并把 MoE 权重做对应分片，**每个 node 的计算只访问本地内存**，避免跨 socket 访存；同时**内存总占用仍为单份权重**。
 6. **支持 GPU 常驻热专家，并按策略执行动态换入**，实现 **GPU + CPU 协同解码**，显著提升 **DeepSeek-V4.1-Flash** 的解码性能（自 **v0.2.8** 起）；**Qwen3.8-Flash-Next 自 v0.2.9 起支持「专家层常驻」**（12 层精选，见 [v0.2.9 发行说明](RELEASE_NOTES_v0.2.9.md)）；**暂不支持 GLM-5.3-Flash**（显存限制）。
 
+## 集群推理（规划）
+
+单机混合推理的天花板由「每层固定成本 × 层数」决定，因此下一步是**横向铺开**：
+GPU 机群只做注意力与 prefill，CPU 机群承担 MoE 解码并兼作 KV 池宿主，对外单一入口。
+
+* **已具备**：CPU/GPU 混合专家计算（生产验证：476 GB 模型跑在 2×40 GB 卡上）、GPU 侧 prefill 分流、
+  单机前缀缓存（131K 重复请求 127.9 s → 2.1 s）、**网关雏形**（虚拟 key 鉴权 + 按 key 计量 + 纯透传）；
+* **国产卡**：MTT S5000（MUSA）已完成移植，476 GB 模型 TP=2 实测 prefill 640 tok/s / decode 7.1 tok/s；
+  S5000 单卡算力约 0.40× H100（实测 vs 标称，保守下界）；
+* **尚未做**：跨机每层归约、跨机 KV 池、多实例编排与自动伸缩、故障演练。
+
+详见 [`docs/CLUSTER_INFERENCE.md`](docs/CLUSTER_INFERENCE.md)（含分阶段路线与未验证清单）。
+
 ## 实测平台
 
 下文所有性能数字都在这台机器上取得:
@@ -142,6 +155,8 @@ vllm serve <MODEL_DIR> --tensor-parallel-size 2 --enable-expert-parallel \
 | [`docs/BENCHMARKS.md`](docs/BENCHMARKS.md) | 实测数据与复现方式 |
 | [`docs/KNOWN_LIMITATIONS.md`](docs/KNOWN_LIMITATIONS.md) | 已知限制与不支持的组合 |
 | [`docs/MEMORY_GUARD.md`](docs/MEMORY_GUARD.md) | **显存守卫：对 vLLM 默认行为的改变** —— 自动回收空闲块、软/硬上限、OOM 现场取证、退出码 13 与关闭方法 |
+| [`docs/CLUSTER_INFERENCE.md`](docs/CLUSTER_INFERENCE.md) | **集群推理：规划与当前进展** —— 目标形态（GPU 跑注意力/prefill、CPU 跑 MoE 解码并兼作 KV 池）、与现有单机实现的关系、截至 2026-11 的实测进展（含国产 MTT S5000/MUSA）|
+| [`docs/STATUS_2026-11-25.md`](docs/STATUS_2026-11-25.md) | **状态快照（待续）** —— 已实测性能指标、当前运行实例参数（19 槽 / 窗口 200 / KV 3.16 GiB）、待续事项 |
 | [`docs/INSTALL_MAINLINE.md`](docs/INSTALL_MAINLINE.md) | 主线 vLLM 环境准备 |
 | [`docs/FP4_INT8_HARDWARE_OUTLOOK.md`](docs/FP4_INT8_HARDWARE_OUTLOOK.md) | **4-bit 推理格式的公开硬件路线图**(FP4 vs INT4;含出处与"已宣告/传闻"标注)与 **CPU 优先 MoE 服务的设计依据** |
 | [`docs/INT8_ACTIVATION_FOR_MXFP4_EXPERTS.md`](docs/INT8_ACTIVATION_FOR_MXFP4_EXPERTS.md) | **INT8 激活 × MXFP4 专家权重** —— 这条计算路径解决什么问题、内核级收益、端到端语义验收口径、启用方法与已知限制 |

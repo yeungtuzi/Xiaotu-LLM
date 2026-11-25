@@ -19,7 +19,14 @@
 #   TAG=prod PORT=8700 TP=2 GPU_UTILIZATION=0.90 MAX_NUM_SEQS=4 MAX_NUM_BATCHED_TOKENS=8192 MAXLEN=524288
 #   （旧短名 GPU_UTIL / MAXSEQS / MBT / NOPC / EXPANDABLE / CED 仍接受但弃用，见 dev-docs/GLOSSARY.md）
 #   THREADS=60 IMAGE_MAX=128 COMPILE_RANGES=32,256,8192
-#   PIN=1 PIN_SLOTS=15 PIN_MAXQ=16 PIN_CUDA_MOE=0 MARLIN=0 SWA_BOUNDED_REPLAY=1 WARMUP=1
+#   PIN=1 PIN_MAXQ=16 PIN_CUDA_MOE=0 MARLIN=0 SWA_BOUNDED_REPLAY=1 WARMUP=1
+#   缺省：PIN_SLOTS=15 / PIN_WINDOW=0（静态种子表）；生产口径：PIN_SLOTS=19 + PIN_WINDOW=200
+#     ⚠️ 15 槽 + 窗口 200 是**未验证**组合，勿作生产口径
+#      PIN_WINDOW：热专家在线自适应窗口（每 N 个 forward 规划一次换入）。
+#      ⭐ **默认 0 = 关闭**（与引擎缺省一致；2026-11-25 审计决定，不把未验证模式设为缺省）。
+#      生产口径为显式 200；父环境 `XIAOTU_PIN_WINDOW=` 同样生效，命令行优先并告警。
+#      仅在 PIN=1 且 PIN_SLOTS>0 时有效；关闭时槽位内容固定为钉选表，不再演化。
+#      ⚠️ 规划只在"非 GPU prefill staging"的 forward 上执行（prefill 活跃窗口会跳过）。
 #   ⭐ API_KEY 只接受**环境变量**：`API_KEY=<48位十六进制> bash scripts/serve_ds41.sh start ...`
 #      （启用 OpenAI 风格 Bearer 鉴权；缺省空=不鉴权；密钥经 VLLM_API_KEY 传给引擎，不进任何 argv/ps） KV_DTYPE=fp8_ds_mla
 #   IDLE_EC=0 IDLE_EC_SECONDS=60   预热收尾即归还 torch 缓存（**默认关**；1=开）
@@ -114,6 +121,23 @@ CGM_EXPLICIT=0; [ "${CUDAGRAPH_MODE+x}" = "x" ] && CGM_EXPLICIT=1
 #   否则 MUSA 上 "以为关了图捕获、其实没关" ⇒ `capturing stream has unjoined work` 原样复发。
 CUDAGRAPH_MODE="${CUDAGRAPH_MODE-FULL_DECODE_ONLY}"
 PIN=1; PIN_SLOTS=15; PIN_MAXQ=16; PIN_CUDA_MOE=0; MARLIN=0; WARMUP=1
+# ⭐ 2026-11-25 审计 B1/B2：在线自适应窗口
+#   * 缺省 **0 = 关闭**（与引擎缺省一致，遵循"缺省不进入未验证模式"）；
+#   * 生产口径显式给：`PIN_WINDOW=200 ...`（或父环境 `XIAOTU_PIN_WINDOW=200`）；
+#   * 父环境**生效**（此前硬赋值 200 会把唯一的关闭/调参通道掐断）。
+# m4（R3 复审）：显式性按"变量是否已定义"判定 —— `PIN_WINDOW=`（显式置空）也算显式，
+#   交给 validate 拒绝；否则 env 置空会被 .pinwindow 静默覆盖。
+_XTU_PINW_ENV="${PIN_WINDOW:-}"          # canonical env（无 XIAOTU_ 前缀）
+_XTU_PINW_ENV2="${XIAOTU_PIN_WINDOW:-}"  # 推荐 env
+_XTU_PINW_SET=0
+[ -n "${PIN_WINDOW+x}" ] && _XTU_PINW_SET=1
+[ -n "${XIAOTU_PIN_WINDOW+x}" ] && _XTU_PINW_SET=1
+PIN_WINDOW_EXPLICIT="$_XTU_PINW_SET"
+if [ -n "$_XTU_PINW_ENV" ] && [ -n "$_XTU_PINW_ENV2" ] && [ "$_XTU_PINW_ENV" != "$_XTU_PINW_ENV2" ]; then
+    echo "[ds41] ⚠️ 两路环境变量不一致：PIN_WINDOW=$_XTU_PINW_ENV / XIAOTU_PIN_WINDOW=$_XTU_PINW_ENV2 ⇒ 取后者" >&2
+fi
+PIN_WINDOW="${_XTU_PINW_ENV2:-${_XTU_PINW_ENV:-0}}"
+PIN_WINDOW_CLI=""; PIN_WINDOW_SEEN=0
 # ⭐⭐ 2026-11-10 复审 N1：必须在赋默认值**之前**记下"调用者是否显式给了 SWA_BOUNDED_REPLAY"，
 #    否则 SWA_EXPLICIT 恒为 1 ⇒ 单独写 `CED=0` 会被误判成"与显式 SWA 冲突"（fail-closed 但挡住合法用法）。
 _XTU_SWA_ENV="${SWA_BOUNDED_REPLAY:-}"
@@ -144,7 +168,7 @@ EXTRA_ARGS=()
 die() { printf '[ds41] ⛔ %s\n' "$1" >&2; exit "${2:-2}"; }
 say() { printf '[ds41] %s\n' "$*"; }
 # ⭐ 审计 §五.8：原先是 2,29p，把 30-33 行（MODEL_DIR / LOG_KEEP / EXPANDABLE）的帮助切掉了
-usage() { sed -n '2,34p' "$0" | sed 's/^# \{0,1\}//'; }
+usage() { sed -n '2,41p' "$0" | sed 's/^# \{0,1\}//'; }
 
 # ── 参数解析 ───────────────────────────────────────────────────────────────
 CMD="${1:-}"; shift || true
@@ -172,6 +196,17 @@ while [ $# -gt 0 ]; do
                 CUDAGRAPH_MODE) CUDAGRAPH_MODE="$v"; CGM_EXPLICIT=1 ;;
                 PIN) PIN="$v" ;;
                 PIN_SLOTS) PIN_SLOTS="$v" ;;
+                PIN_WINDOW|XIAOTU_PIN_WINDOW)
+                    # m5：以"是否已出现过"判冲突（首值为空也算已给，避免 空+200 静默取后者）
+                    if [ "$PIN_WINDOW_SEEN" = "1" ] && [ "$PIN_WINDOW_CLI" != "$v" ]; then
+                        die "PIN_WINDOW 冲突：已给 '$PIN_WINDOW_CLI'，又给 '$v'（同一参数只许一个值）" 2
+                    fi
+                    # B1：父环境给了不同值 ⇒ 明确告知"命令行覆盖"，不静默
+                    if [ "$PIN_WINDOW_EXPLICIT" = "1" ] && [ "$PIN_WINDOW" != "$v" ]; then
+                        say "⚠️ 父环境 PIN_WINDOW/XIAOTU_PIN_WINDOW=$PIN_WINDOW 被命令行 PIN_WINDOW=$v 覆盖"
+                    fi
+                    # 空串也置显式 ⇒ 由 validate 的 '' 分支拒绝（不得静默改用回读值）
+                    PIN_WINDOW_CLI="$v"; PIN_WINDOW_SEEN=1; PIN_WINDOW_EXPLICIT=1; PIN_WINDOW="$v" ;;
                 PIN_CUDA_MOE) PIN_CUDA_MOE="$v" ;;
                 MARLIN) MARLIN="$v" ;;
                 IDLE_EC) IDLE_EC="$v" ;;
@@ -237,6 +272,24 @@ if [ "$CGM_EXPLICIT" = "0" ] && [ -f "$CGM_FILE" ]; then
             echo "[ds41] 图捕获档位从 $CGM_FILE 回读为 $CUDAGRAPH_MODE" >&2 ;;
         "") ;;
         *) echo "[ds41] ⚠️ $CGM_FILE 内容非法('$_xtu_g')，忽略，用 $CUDAGRAPH_MODE" >&2 ;;
+    esac
+fi
+# m2（2026-11-25 审计）：PIN_WINDOW 同样可回读 —— 否则 `start PIN_WINDOW=0` 后
+# `restart`（不带参）会退回缺省，形成"以为关了、重启又开"的陷阱。
+PINW_FILE="$RUN_DIR/ds41_${TAG}.pinwindow"
+if [ "$PIN_WINDOW_EXPLICIT" = "0" ] && [ -f "$PINW_FILE" ]; then
+    # m2/m3：不剥空白（" 200 " 视为非法），并做上限检查；非法/空一律告警 + 忽略
+    _xtu_w="$(head -c 64 "$PINW_FILE" 2>/dev/null | tr -d '\n' || true)"
+    case "$_xtu_w" in
+        0|[1-9]|[1-9][0-9]|[1-9][0-9][0-9]|[1-9][0-9][0-9][0-9]|[1-9][0-9][0-9][0-9][0-9]|[1-9][0-9][0-9][0-9][0-9][0-9])
+            if [ "$_xtu_w" -le 100000 ]; then
+                PIN_WINDOW="$_xtu_w"
+                echo "[ds41] PIN_WINDOW 从 $PINW_FILE 回读为 $PIN_WINDOW（本次启动即生效，并持久化供下次）" >&2
+            else
+                echo "[ds41] ⚠️ $PINW_FILE 超上限 100000（'$_xtu_w'），忽略，用 $PIN_WINDOW" >&2
+            fi ;;
+        "") echo "[ds41] ⚠️ $PINW_FILE 为空，忽略，用 $PIN_WINDOW" >&2 ;;
+        *) echo "[ds41] ⚠️ $PINW_FILE 内容非法('$_xtu_w')（不许空白/符号/前导零），忽略，用 $PIN_WINDOW" >&2 ;;
     esac
 fi
 # ⭐⭐ 2026-11-10 审计 B4（blocking）：锁**按 PORT**，否则两个 TAG 抢同一端口可同时通过检查。
@@ -357,6 +410,21 @@ validate() {
         || die "PIN_SLOTS/PIN_MAXQ/IMAGE_MAX 必须是非负整数"
     [ "$IMAGE_MAX" -le 128 ] || die "IMAGE_MAX 上限 128（得到 '$IMAGE_MAX'）"
     [ "$PIN_SLOTS" -le 64 ] || die "PIN_SLOTS 上限 64（得到 '$PIN_SLOTS'）"
+    case "$PIN_WINDOW" in
+        0|[1-9]|[1-9][0-9]|[1-9][0-9][0-9]|[1-9][0-9][0-9][0-9]|[1-9][0-9][0-9][0-9][0-9]|[1-9][0-9][0-9][0-9][0-9][0-9]) ;;
+        '') die "PIN_WINDOW 不能为空（0=关闭自适应）" 2 ;;
+        *)  die "PIN_WINDOW 非法：'$PIN_WINDOW'（只允许 0 或 1..100000 的十进制，无前导零/符号/空格）" 2 ;;
+    esac
+    [ "$PIN_WINDOW" -le 100000 ] || die "PIN_WINDOW 上限 100000（得到 '$PIN_WINDOW'）" 2
+    if [ "$PIN_WINDOW" != "0" ]; then
+        if [ "$PIN" = "0" ]; then
+            say "⚠️ PIN=0 时热专家池不建，PIN_WINDOW=$PIN_WINDOW 不生效"
+        elif [ "$PIN_SLOTS" = "0" ]; then
+            say "⚠️ PIN_SLOTS=0 时每层无槽位，PIN_WINDOW=$PIN_WINDOW 不生效"
+        else
+            say "口径提示：PIN_WINDOW=$PIN_WINDOW（非缺省 0；性能/驻留数据须标注该口径）"
+        fi
+    fi
     case "$PIN_CUDA_MOE" in 0|1) ;; *) die "PIN_CUDA_MOE 只能是 0/1（得到 '$PIN_CUDA_MOE'）" ;; esac
     case "$MARLIN" in 0|1) ;; *) die "MARLIN 只能是 0/1（得到 '$MARLIN'）" ;; esac
     case "$IDLE_EC" in 0|1) ;; *) die "IDLE_EC 只能是 0/1（得到 '$IDLE_EC'）" ;; esac
@@ -587,7 +655,7 @@ start() {
     build_args
     say "启动 TAG=$TAG PORT=$PORT TP=$TP util=$GPU_UTIL seqs=$MAXSEQS MBT=$MBT maxlen=$MAXLEN"
     say "图捕获 graph=$CUDAGRAPH_MODE"
-    say "线程=$THREADS PIN=$PIN/$PIN_SLOTS MAXQ=$PIN_MAXQ CUDA_MOE=$PIN_CUDA_MOE MARLIN=$MARLIN IDLE_EC=$IDLE_EC/$IDLE_EC_SECONDS SWA_BOUNDED_REPLAY=$SWA_BOUNDED_REPLAY SPEC=$SPEC image=$IMAGE_MAX"
+    say "线程=$THREADS PIN=$PIN/$PIN_SLOTS WINDOW=$PIN_WINDOW MAXQ=$PIN_MAXQ CUDA_MOE=$PIN_CUDA_MOE MARLIN=$MARLIN IDLE_EC=$IDLE_EC/$IDLE_EC_SECONDS SWA_BOUNDED_REPLAY=$SWA_BOUNDED_REPLAY SPEC=$SPEC image=$IMAGE_MAX"
     # ⛔ [2026-11-05 审计 B · M] 小 M 内核**只走 PIN 常驻槽位**（gpu_prefill.py:3017
     #    `slot is not None and _moe4_ok`）；`PIN=0` 时 slot 恒为 None ⇒ 内核永不生效。
     #    不提示的话会白烧一次启动，且 A/B 结论会被误读成"内核无效"。
@@ -660,6 +728,8 @@ start() {
         cd "$REPO_DIR" || exit 97
         export CUDA_VISIBLE_DEVICES=1,2
         export XIAOTU_PIN="$PIN" XIAOTU_PIN_MAX_PER_LAYER="$PIN_SLOTS" XIAOTU_PIN_MAXQ="$PIN_MAXQ"
+        # 2026-11-25：在线自适应窗口升为一等参数（此前只能经父环境继承 ⇒ status 读不出）
+        export XIAOTU_PIN_WINDOW="$PIN_WINDOW"
         export XIAOTU_MOE_THREADS="$THREADS" OMP_NUM_THREADS=1
         export XIAOTU_PIN_CUDA_MOE="$PIN_CUDA_MOE" XIAOTU_MOE4_MARLIN="$MARLIN" XIAOTU_ENGRAM_LAST=1
         # 口径必须能从 status 读出（AGENTS.md「新增开关必须同步口径检查」）
@@ -760,6 +830,7 @@ start() {
     printf '%s\n' "$pid" > "$PID_FILE" || die "PID 文件写入失败：$PID_FILE（已启动 pid=$pid）" 4
     printf '%s\n' "$PORT" > "$PORT_FILE" 2>/dev/null || say "⚠️ PORT 文件写入失败：$PORT_FILE"
     printf '%s\n' "$CUDAGRAPH_MODE" > "$CGM_FILE" 2>/dev/null || say "⚠️ 图捕获档位文件写入失败：$CGM_FILE"
+    printf '%s\n' "$PIN_WINDOW" > "$PINW_FILE" 2>/dev/null || say "⚠️ PIN_WINDOW 文件写入失败：$PINW_FILE"
     say "已启动 pid=$pid 日志=$LOG_FILE"
 
     local ok=0
@@ -1032,7 +1103,7 @@ status() {
     say "GPU: $(nvidia-smi --query-gpu=index,memory.used --format=csv,noheader | tr '\n' ' ')"
     say "实际口径:"
     tr '\0' '\n' < "/proc/$pid/environ" 2>/dev/null \
-        | grep -E '^(DS41_API_KEY_STATE|DS41_FORCE_INCLUDE_USAGE|CUDAGRAPH_MODE|XIAOTU_MOE_THREADS|XIAOTU_PIN|XIAOTU_PIN_CUDA_MOE|XIAOTU_PIN_MAX_PER_LAYER|XIAOTU_IMAGE_MAX|XIAOTU_MOE4_MARLIN|XIAOTU_IDLE_EMPTY_CACHE|XIAOTU_IDLE_EC_SECONDS|XIAOTU_PIN_MAXQ|GPU_UTIL|MAXSEQS|COMPILE_RANGES|PYTORCH_CUDA_ALLOC_CONF|EXPANDABLE|SWA_BOUNDED_REPLAY|NO_PREFIX_CACHE|MAX_NUM_BATCHED_TOKENS|MAX_NUM_SEQS|GPU_UTILIZATION|XIAOTU_MOE_MBT|DS41_MAXLEN|DS41_TP|DS41_SPEC|DS41_KV_DTYPE|DRAFT_GREEDY)=' \
+        | grep -E '^(DS41_API_KEY_STATE|DS41_FORCE_INCLUDE_USAGE|CUDAGRAPH_MODE|XIAOTU_MOE_THREADS|XIAOTU_PIN|XIAOTU_PIN_CUDA_MOE|XIAOTU_PIN_MAX_PER_LAYER|XIAOTU_IMAGE_MAX|XIAOTU_MOE4_MARLIN|XIAOTU_IDLE_EMPTY_CACHE|XIAOTU_IDLE_EC_SECONDS|XIAOTU_PIN_MAXQ|XIAOTU_PIN_WINDOW|GPU_UTIL|MAXSEQS|COMPILE_RANGES|PYTORCH_CUDA_ALLOC_CONF|EXPANDABLE|SWA_BOUNDED_REPLAY|NO_PREFIX_CACHE|MAX_NUM_BATCHED_TOKENS|MAX_NUM_SEQS|GPU_UTILIZATION|XIAOTU_MOE_MBT|DS41_MAXLEN|DS41_TP|DS41_SPEC|DS41_KV_DTYPE|DRAFT_GREEDY)=' \
         | sed 's/^/    /'
     cc="$(eff_compilation_config "$pid")"
     say "    [生效] --compilation-config $cc"

@@ -133,6 +133,37 @@ case "${marlin:-}" in
     *) echo "✗ XIAOTU_MOE4_MARLIN=${marlin:-未设}（非 0/1，口径不明）" >&2; rc=1 ;;
 esac
 
+# PIN_WINDOW：热专家在线自适应窗口（缺省 0 = 关闭；生产口径 200）。
+# AGENTS.md「新增参数必须同步口径检查」⇒ 非 0 时必须判「非缺省口径」，
+# 且 PIN=0 / PIN_SLOTS=0 时窗口不生效，必须判「口径不明」而不是静默放行。
+pinw="$(printf '%s\n' "$environ" | grep '^XIAOTU_PIN_WINDOW=' | cut -d= -f2)"
+pin_on="$(printf '%s\n' "$environ" | grep '^XIAOTU_PIN=' | cut -d= -f2)"
+slots="$(printf '%s\n' "$environ" | grep '^XIAOTU_PIN_MAX_PER_LAYER=' | cut -d= -f2)"
+# m1：与 serve_ds41.sh 的 validate 复用同一判据（严格十进制 + 上限 100000），
+#   非法/越界一律 rc=1（此前 `[1-9]*` 会把 200abc/1e3/100001 判成"非缺省"而放过）。
+case "${pinw:-}" in
+    "")
+        echo "✗ XIAOTU_PIN_WINDOW 未出现在 status 口径里 ⇒ 口径不明（老版本脚本或绕过单一入口）" >&2
+        rc=1 ;;
+    0|[1-9]|[1-9][0-9]|[1-9][0-9][0-9]|[1-9][0-9][0-9][0-9]|[1-9][0-9][0-9][0-9][0-9]|[1-9][0-9][0-9][0-9][0-9][0-9])
+        if [ "$pinw" -gt 100000 ]; then
+            echo "✗ XIAOTU_PIN_WINDOW=${pinw} 超出上限 100000（口径不明）" >&2; rc=1
+        elif [ "$pinw" = "0" ]; then
+            echo "✓ XIAOTU_PIN_WINDOW=0（自适应关闭，钉选表静态驻留）"
+        elif [ "${pin_on:-?}" = "0" ] || [ "${slots:-?}" = "0" ]; then
+            echo "⚠️ XIAOTU_PIN_WINDOW=${pinw} 但 PIN=${pin_on:-?}/PIN_SLOTS=${slots:-?} ⇒ 窗口不生效（按 0 处理）"
+        else
+            # m9：生产口径要求 19 槽 + 200 窗口；其它组合合法但未验证，明确提示
+            if [ "${slots:-?}" != "19" ]; then
+                echo "⚠️ XIAOTU_PIN_WINDOW=${pinw} 但 PIN_SLOTS=${slots:-?}（生产口径为 19；该组合未验证）"
+            else
+                echo "⚠️ XIAOTU_PIN_WINDOW=${pinw}（非缺省口径：性能/驻留数据须标注该口径）"
+            fi
+        fi ;;
+    *)
+        echo "✗ XIAOTU_PIN_WINDOW=${pinw}（非严格十进制：不许前导零/符号/空白，口径不明）" >&2; rc=1 ;;
+esac
+
 # 图捕获档位（cudagraph_mode，缺省 FULL_DECODE_ONLY）。
 # ⚠️ 该档位会左右性能（本仓 FULL_DECODE_ONLY 是 2.2× 档位）⇒ 必须能从 status 读出自洽口径。
 # MUSA 上因 torch.cuda.CUDAGraph / is_current_stream_capturing 为占位类，只能用 NONE；

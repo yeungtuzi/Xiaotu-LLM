@@ -19,7 +19,9 @@
 #   TAG=prod PORT=8700 TP=2 GPU_UTILIZATION=0.90 MAX_NUM_SEQS=4 MAX_NUM_BATCHED_TOKENS=8192 MAXLEN=524288
 #   （旧短名 GPU_UTIL / MAXSEQS / MBT / NOPC / EXPANDABLE / CED 仍接受但弃用，见 dev-docs/GLOSSARY.md）
 #   THREADS=60 IMAGE_MAX=128 COMPILE_RANGES=32,256,8192
-#   PIN=1 PIN_SLOTS=15 PIN_MAXQ=16 PIN_CUDA_MOE=0 MARLIN=0 SWA_BOUNDED_REPLAY=1 WARMUP=1 KV_DTYPE=fp8_ds_mla
+#   PIN=1 PIN_SLOTS=15 PIN_MAXQ=16 PIN_CUDA_MOE=0 MARLIN=0 SWA_BOUNDED_REPLAY=1 WARMUP=1
+#   ⭐ API_KEY 只接受**环境变量**：`API_KEY=<48位十六进制> bash scripts/serve_ds41.sh start ...`
+#      （启用 OpenAI 风格 Bearer 鉴权；缺省空=不鉴权；密钥经 VLLM_API_KEY 传给引擎，不进任何 argv/ps） KV_DTYPE=fp8_ds_mla
 #   IDLE_EC=0 IDLE_EC_SECONDS=60   预热收尾即归还 torch 缓存（**默认关**；1=开）
 #                                  ⚠️ 2026-11-05 回退：C 判据（≥2h 带流量）未通过 ——
 #                                  实测窗口内无推理流量、且时长仅 1h50m，无证据支撑默认开启。
@@ -28,6 +30,7 @@
 #                                  主动让位、该参数用不到；仅"未设触发器的兜底臂"才用它。
 #                                  ⚠️ WARMUP=0 时**不会归还**（没有预热高水位，且空闲线程已让位）。
 #   SPEC=1 MODEL_DIR=<路径>
+#   DRAFT_GREEDY=0（默认，probabilistic=draft 概率采样）/ 1（greedy=上游默认，仅实验用）
 #   LOG_KEEP=3     启动时保留几份历史日志（环境变量；归档命名 <log>.<时间戳>，上限 50）
 #   EXPANDABLE=1（默认）  expandable_segments:True + 追加 --disable-custom-all-reduce（碎片治理；
 #                        custom AR 退回 NCCL）。=0 ⇒ expandable_segments:False，custom AR 保持开启。
@@ -88,7 +91,9 @@ fi
 MODEL_DIR_DEFAULT="/home/user/.cache/modelscope/models/deepseek-ai--DeepSeek-V4.1-Flash-1017/snapshots/master"
 SERVED_NAME="DeepSeek-V4.1-Flash"
 CACHE_DIR="/home/user/.cache/vllm/torch_compile_cache/xtu-master-tp2-vllm_compile-f03026a548-9afa2a11"
-WARMUP_SCRIPT="${WARMUP_SCRIPT:-/home/user/lvllm/stress-run5/warmup_shapes.py}"
+# ⭐ 2026-11-15：预热脚本改为**仓库内副本**（`scripts/warmup_shapes.py`），因为它必须支持 API key 鉴权；
+#    原先指向 /home/user/lvllm/stress-run5/warmup_shapes.py（远端未版本化副本，启用鉴权后会 401）。
+WARMUP_SCRIPT="${WARMUP_SCRIPT:-$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)/warmup_shapes.py}"
 MEM_GATE="${MEM_GATE:-$REPO_DIR/scripts/prelaunch_mem_gate.sh}"
 # 本机实际部署树（REPO_DIR/vllm 不存在；跨树校验按真实位置比对，不按名字猜）
 VLLM_DIR="${VLLM_DIR:-/home/user/lvllm/process_data/ref/repos/vllm-mainline/vllm}"   # 注意：vpath 是包目录 dirname(vllm.__file__)
@@ -131,7 +136,9 @@ PC=0; PC_GB=64; PC_BLOCKS=16; PC_ROOT="/home/user/.cache/prefix-cache"
 PC_FREE_MIN_MIB="${PC_FREE_MIN_MIB:-524288}"
 PC_WRITE_WAIT="${PC_WRITE_WAIT:-900}"
 ALLOC_CONF_EFFECTIVE=""
-KV_DTYPE="fp8_ds_mla"; SPEC=1; MODEL_DIR="$MODEL_DIR_DEFAULT"; EXPANDABLE=1
+KV_DTYPE="fp8_ds_mla"; SPEC=1; DRAFT_GREEDY=0; MODEL_DIR="$MODEL_DIR_DEFAULT"; EXPANDABLE=1
+FORCE_INCLUDE_USAGE="${FORCE_INCLUDE_USAGE:-1}"   # 1=流式响应也带 usage（前置网关计量需要；0=上游默认行为）
+API_KEY="${API_KEY:-}"                 # 空 = 不鉴权（默认，行为不变）；非空 = 启用 OpenAI 风格 Bearer 鉴权
 EXTRA_ARGS=()
 
 die() { printf '[ds41] ⛔ %s\n' "$1" >&2; exit "${2:-2}"; }
@@ -189,9 +196,12 @@ while [ $# -gt 0 ]; do
                 PC_ROOT) PC_ROOT="$v" ;;
                 KV_DTYPE) KV_DTYPE="$v" ;;
                 SPEC) SPEC="$v" ;;
+                DRAFT_GREEDY) DRAFT_GREEDY="$v" ;;
                 MODEL_DIR) MODEL_DIR="$v" ;;
                 EXPANDABLE) EXPANDABLE="$v"; EXPANDABLE_SEGMENTS="$v" ;;
                 # ↑ EXPANDABLE 为历史短名，等价于 EXPANDABLE_SEGMENTS（弃用）
+                FORCE_INCLUDE_USAGE) FORCE_INCLUDE_USAGE="$v" ;;
+                API_KEY) die "API_KEY 只接受**环境变量**（不要写成命令行参数，否则密钥会进 ps）。用法：API_KEY=<key> bash scripts/serve_ds41.sh start ..." 2 ;;
                 *) die "未知参数 '$k'（可用项见文件头；新增参数请改本脚本，不要绕过入口）" ;;
             esac
             shift ;;
@@ -201,6 +211,7 @@ while [ $# -gt 0 ]; do
 done
 
 case "$TAG" in ''|*[!A-Za-z0-9_-]*) die "TAG 只允许 [A-Za-z0-9_-]（得到 '$TAG'）" ;; esac
+
 
 PID_FILE="$RUN_DIR/ds41_${TAG}.pid"
 LOG_FILE="$RUN_DIR/ds41_${TAG}.log"
@@ -292,6 +303,22 @@ resolve_alloc_conf() {
 
 # ══ 校验（fail-closed） ═══════════════════════════════════════════════════════
 validate() {
+    # ⭐ 2026-11-15 用户要求：8700 加 API key 鉴权（校验放在 validate ⇒ 只有 start/restart 会检查，
+    #    `stop`/`status` 不会被非法 API_KEY 挡住 —— 审计 B4）。
+    #    空 ⇒ 不鉴权（与既有行为一致）；非空 ⇒ 经 VLLM_API_KEY 传给引擎（不走命令行，避免 ps 泄露）。
+    if [ -n "${API_KEY:-}" ]; then
+        _klen=${#API_KEY}
+        if [ "$_klen" -lt 40 ] || [ "$_klen" -gt 199 ]; then
+            die "API_KEY 长度不合法（${_klen}）：要求 40..199 字符（openssl rand -hex 24 ⇒ 48 字符）"
+        fi
+        case "$API_KEY" in
+            *[!A-Za-z0-9._~+-]*) die "API_KEY 只允许 [A-Za-z0-9._~+-]（避免 shell / 日志转义问题）" ;;
+        esac
+    elif [ -n "${VLLM_API_KEY:-}" ]; then
+        # ⭐ 审计 B2（blocking）：父环境已设 VLLM_API_KEY 而本次没传 API_KEY ⇒ 若继续启动，
+        #    引擎会**静默带上鉴权**（或反之被 unset 掉），两种都与操作者意图不符 ⇒ 显式拒绝。
+        die "父环境已设 VLLM_API_KEY 但未传 API_KEY ⇒ 拒绝启动（要么显式传 API_KEY=<同值>，要么先 unset VLLM_API_KEY）" 3
+    fi
     # ⭐⭐ 2026-11-10 审计 B1（blocking）：**先同步、后校验**。
     #   原先同步块在范围校验之后 ⇒ 用全长名（CLI 或环境变量）传 MAX_NUM_SEQS /
     #   MAX_NUM_BATCHED_TOKENS / GPU_UTILIZATION 时，校验读到的是旧默认值 ⇒ **非法值直接进 vllm**。
@@ -399,7 +426,7 @@ validate() {
 
     # 额外参数：必须 --flag，且不得覆盖本脚本保证的口径
     local _a _k
-    local deny='^(--port|--model|--served-model-name|--tensor-parallel-size|--gpu-memory-utilization|--max-model-len|--max-num-seqs|--max-num-batched-tokens|--compilation-config|--kv-cache-dtype|--limit-mm-per-prompt|--speculative-config|--kv-transfer-config|--kv-offloading-size|--kv-offloading-backend|--swa-bounded-replay|--no-swa-bounded-replay|--enforce-eager|--enable-sleep-mode|--swap-space|--num-gpu-blocks-override|--block-size|--dtype|--quantization|--load-format|--kernel-config|--mm-processor-cache-gb)$'
+    local deny='^(--api-key|--port|--model|--served-model-name|--tensor-parallel-size|--gpu-memory-utilization|--max-model-len|--max-num-seqs|--max-num-batched-tokens|--compilation-config|--kv-cache-dtype|--limit-mm-per-prompt|--speculative-config|--kv-transfer-config|--kv-offloading-size|--kv-offloading-backend|--swa-bounded-replay|--no-swa-bounded-replay|--enforce-eager|--enable-sleep-mode|--swap-space|--num-gpu-blocks-override|--block-size|--dtype|--quantization|--load-format|--kernel-config|--mm-processor-cache-gb)$'
     for _a in ${EXTRA_ARGS[@]+"${EXTRA_ARGS[@]}"}; do
         case "$_a" in --*) ;; *) die "额外参数必须是 --flag 或 --flag=值（得到 '$_a'）" ;; esac
         _k="${_a%%=*}"
@@ -414,6 +441,7 @@ validate() {
                   --prefix-caching-hash-algo --enable-prefix-caching \
                   --no-enable-prefix-caching --swa-bounded-replay \
                   --no-swa-bounded-replay \
+                  --api-key \
                   --disable-custom-all-reduce --enable-custom-all-reduce \
                   --no-enable-custom-all-reduce; do
             if [ "$_d" = "$_k" ] || [[ "$_d" == "$_k"* ]]; then
@@ -464,9 +492,26 @@ build_args() {
         --limit-mm-per-prompt "{\"image\":$IMAGE_MAX,\"video\":0}"
         --mm-processor-device cpu
         --mm-processor-cache-gb 0
-        --kernel-config '{"enable_jit_warmup": false}'
+        --kernel-config '{"enable_jit_warmup": false}')
+    # ⭐ 2026-11-17 用户要求：前置网关要按 key 计量，而 vLLM 流式默认**不返回 usage**；
+    #    改由服务端参数打开（而不是让网关改写请求）⇒ 网关保持纯透传。
+    if [ "$FORCE_INCLUDE_USAGE" = "1" ]; then
+        ARGS+=(--enable-force-include-usage)
+    fi
+    ARGS+=(
         --port "$PORT")
-    [ "$SPEC" = "1" ] && ARGS+=(--speculative-config '{"method":"dspark","num_speculative_tokens":5,"draft_sample_method":"probabilistic"}')
+    # ⭐ 2026-11-14：draft 采样方式可切换（**缺省 DRAFT_GREEDY=0 = probabilistic = 现状生产行为**，
+    #    即本开关**不改变**任何既有口径；要试上游默认 greedy 时显式传 `DRAFT_GREEDY=1`）。
+    #    背景：曾怀疑 `probabilistic` 导致验收 A（同 prompt ×10 签名唯一）不通过；
+    #    实测把 draft 改成 greedy 后 A **仍然 3 种签名**（台账 #563）⇒ 该假设已否证，
+    #    因此**不**把 greedy 设为默认。上游 `vllm/config/speculative.py` 的默认值是 "greedy"。
+    local _dsm="probabilistic"
+    case "${DRAFT_GREEDY:-0}" in
+        0) _dsm="probabilistic" ;;
+        1) _dsm="greedy" ;;
+        *) die "DRAFT_GREEDY 只能是 0（probabilistic，默认）或 1（greedy）；收到 '${DRAFT_GREEDY}'" ;;
+    esac
+    [ "$SPEC" = "1" ] && ARGS+=(--speculative-config "{\"method\":\"dspark\",\"num_speculative_tokens\":5,\"draft_sample_method\":\"$_dsm\"}")
     if [ "$PC" = "1" ]; then
         # 引擎版本层（取编译缓存目录名末尾 hash）⇒ 升级引擎自动换目录；
         # 模型名/dtype/TP/KV 组等指纹由上游 FileMapper 自动追加在下一层。
@@ -635,6 +680,7 @@ start() {
         #    （它会 connect GPU0 socket，失败后回落 identity draft ⇒ 启动即崩）。
         export XIAOTU_DSPARK_REMOTE=0
         export GPU_UTIL="$GPU_UTIL" MAXSEQS="$MAXSEQS" MBT="$MBT" MAXLEN="$MAXLEN"
+        export DRAFT_GREEDY="$DRAFT_GREEDY"
         export COMPILE_RANGES="$COMPILE_RANGES"
         # 碎片治理（2026-11-01 用户指示，默认关、显式开）：
         #   expandable_segments 用 CUDA VMM 分配，VMM 显存**不能导出 IPC 句柄**
@@ -649,6 +695,12 @@ start() {
         export VLLM_ENGINE_READY_TIMEOUT_S="${VLLM_ENGINE_READY_TIMEOUT_S:-7200}"
         export VLLM_HANDSHAKE_TIMEOUT_MINS="${VLLM_HANDSHAKE_TIMEOUT_MINS:-120}"
         export VLLM_USE_FLASHINFER_SAMPLER="${VLLM_USE_FLASHINFER_SAMPLER:-0}"
+        # ⭐ 鉴权：空则不动（vLLM 缺省不鉴权）；非空用 env 传入（不走命令行）
+        if [ -n "${API_KEY:-}" ]; then
+            export VLLM_API_KEY="$API_KEY"
+        else
+            unset VLLM_API_KEY 2>/dev/null || true      # 防父环境残留意外给生产加上鉴权
+        fi
         export VLLM_XIAOTU_GPU_PREFILL_MIN_TOKENS="${VLLM_XIAOTU_GPU_PREFILL_MIN_TOKENS:-2560}"
         export XIAOTU_PIN_TABLE="${XIAOTU_PIN_TABLE:-/home/user/lvllm/tmp/pin_1017/expert_pin_pin700.bin}"
         export XIAOTU_RELEASE_SOURCE="${XIAOTU_RELEASE_SOURCE:-1}"
@@ -660,7 +712,14 @@ start() {
         # ⭐ 审计 B4：TAG nonce（端口派生 PID 的归属判据）+ 口径变量（供 status 读出）
         export XTU_DS41_TAG="$TAG"
         export SWA_BOUNDED_REPLAY NO_PREFIX_CACHE MAX_NUM_BATCHED_TOKENS MAX_NUM_SEQS GPU_UTILIZATION
+        export DS41_FORCE_INCLUDE_USAGE="$FORCE_INCLUDE_USAGE"
         export DS41_MAXLEN="$MAXLEN" DS41_TP="$TP" DS41_SPEC="$SPEC" DS41_KV_DTYPE="$KV_DTYPE"
+        # ⭐ 鉴权口径（只暴露“是否设置 + 长度”，绝不写密钥本身）
+        if [ -n "${API_KEY:-}" ]; then
+            export DS41_API_KEY_STATE="set(len=${#API_KEY})"
+        else
+            export DS41_API_KEY_STATE="unset"
+        fi
         export XIAOTU_PIN_MAX_PER_LAYER="$PIN_SLOTS" XIAOTU_IMAGE_MAX="$IMAGE_MAX"
         # ⭐ 复审 N4：旁路必须留痕（事后只看 cmdline 是发现不了的）
         export DS41_EXTRA_ARGS="${EXTRA_ARGS[*]:-}" DS41_ALLOW_EXTRA_OVERRIDE="${ALLOW_EXTRA_OVERRIDE:-0}"
@@ -799,7 +858,8 @@ start() {
         sm() { printf '%s\n' "$*" >> "$RUN_DIR/ds41_${TAG}_smoke.log"; }
         # 清理必须在任何早退之前（审计 B · M-3：否则无 curl 时旧失败标记会一直挂着）
         rm -f "$RUN_DIR/ds41_${TAG}_smoke_"*.code "$RUN_DIR/ds41_${TAG}_smoke_"*.rc \
-              "$RUN_DIR/ds41_${TAG}_smoke_"*.req "$RUN_DIR/ds41_${TAG}.smoke.fail" 2>/dev/null
+              "$RUN_DIR/ds41_${TAG}_smoke_"*.req "$RUN_DIR/ds41_${TAG}_smoke_"*.hdr \
+              "$RUN_DIR/ds41_${TAG}.smoke.fail" 2>/dev/null
         if ! command -v curl >/dev/null 2>&1; then
             sm "[$(date +%H:%M:%S)] ⚠️ 冒烟跳过：无 curl"
             exit 0
@@ -821,9 +881,29 @@ start() {
             "$SERVED_NAME" "$_pad" > "$RUN_DIR/ds41_${TAG}_smoke_${_rid}_2.req"
         printf 'started %s rid=%s\n' "$(date '+%H:%M:%S')" "$_rid" > "$RUN_DIR/ds41_${TAG}.smoke.busy" 2>/dev/null
         _url="http://127.0.0.1:${PORT}/v1/chat/completions"
+        # ⭐ 2026-11-15：启用鉴权时，冒烟请求也必须带 Bearer，否则 401 ⇒ 冒烟必失败。
+        #    ⛔ 密钥**不得进 argv**（审计 B1）：用 0600 临时头文件 + `curl -H @file`。
+        local _SMOKE_AUTH=()
+        local _SMOKE_HDR=""
+        if [ -n "${API_KEY:-}" ]; then
+            _SMOKE_HDR="$(mktemp "${RUN_DIR}/ds41_${TAG}_smoke_XXXXXX.hdr" 2>/dev/null)" \
+                || _SMOKE_HDR=""
+            if [ -z "$_SMOKE_HDR" ] \
+               || ! ( umask 077; printf 'Authorization: Bearer %s\n' "$API_KEY" > "$_SMOKE_HDR" ); then
+                # 审计 N3：写失败不能让冒烟“静默降级”⇒ 落标记 + 清 busy 再退出
+                printf 'smoke auth header write failed\n' > "$RUN_DIR/ds41_${TAG}.smoke.fail" 2>/dev/null
+                sm "⛔ 冒烟鉴权头文件写入失败：${_SMOKE_HDR:-mktemp 失败}"
+                rm -f "$RUN_DIR/ds41_${TAG}.smoke.busy" "$_SMOKE_HDR" 2>/dev/null
+                exit 4
+            fi
+            # 审计 N2：异常退出（SIGTERM/SIGKILL 之外的路径）也要清掉 0600 密钥文件
+            trap 'rm -f "$_SMOKE_HDR"' EXIT
+            _SMOKE_AUTH=(-H "@$_SMOKE_HDR")
+        fi
         _fire() {  # $1=序号 $2=请求体文件
             { curl -s -o /dev/null --noproxy '*' --max-time 600 -w '%{http_code}' \
-                  -H 'Content-Type: application/json' --data-binary "@$2" "$_url" \
+                  -H 'Content-Type: application/json' "${_SMOKE_AUTH[@]}" \
+                  --data-binary "@$2" "$_url" \
                   > "$RUN_DIR/ds41_${TAG}_smoke_${_rid}_$1.code" 2>/dev/null
               echo $? > "$RUN_DIR/ds41_${TAG}_smoke_${_rid}_$1.rc"; } &
         }
@@ -831,6 +911,7 @@ start() {
         sleep 0.3
         _fire 2 "$RUN_DIR/ds41_${TAG}_smoke_${_rid}_2.req"     # 再起 A（长 prefill）
         wait
+        [ -n "$_SMOKE_HDR" ] && rm -f "$_SMOKE_HDR" 2>/dev/null
         _ok=0; _bad=""
         for _n in 1 2; do
             _c="$(cat "$RUN_DIR/ds41_${TAG}_smoke_${_rid}_${_n}.code" 2>/dev/null)"
@@ -855,7 +936,11 @@ start() {
     if [ "$WARMUP" = "1" ]; then
         if [ -f "$WARMUP_SCRIPT" ]; then
             say "形状预热开始（文本多长度 + 1/4 图 + 并发 2）…"
-            ( exec 9>&-; cd "$(dirname "$WARMUP_SCRIPT")" && setsid "$PYTHON" -u "$WARMUP_SCRIPT" --port "$PORT" \
+            # ⭐ 2026-11-15：预热脚本也走 /v1，鉴权开启后不带 Bearer 会 401。
+            #    ⛔ 密钥**不进 argv**（审计 B1）：用 VLLM_API_KEY 环境变量传给子进程，
+            #    预热脚本自己从 env 读取（scripts/warmup_shapes.py）。
+            ( exec 9>&-; cd "$(dirname "$WARMUP_SCRIPT")" \
+                && VLLM_API_KEY="${API_KEY:-}" setsid "$PYTHON" -u "$WARMUP_SCRIPT" --port "$PORT" \
                 >> "$RUN_DIR/ds41_${TAG}_warmup.log" 2>&1 < /dev/null & )
             say "预热在后台跑，日志 $RUN_DIR/ds41_${TAG}_warmup.log"
         else
@@ -947,7 +1032,7 @@ status() {
     say "GPU: $(nvidia-smi --query-gpu=index,memory.used --format=csv,noheader | tr '\n' ' ')"
     say "实际口径:"
     tr '\0' '\n' < "/proc/$pid/environ" 2>/dev/null \
-        | grep -E '^(CUDAGRAPH_MODE|XIAOTU_MOE_THREADS|XIAOTU_PIN|XIAOTU_PIN_CUDA_MOE|XIAOTU_PIN_MAX_PER_LAYER|XIAOTU_IMAGE_MAX|XIAOTU_MOE4_MARLIN|XIAOTU_IDLE_EMPTY_CACHE|XIAOTU_IDLE_EC_SECONDS|XIAOTU_PIN_MAXQ|GPU_UTIL|MAXSEQS|COMPILE_RANGES|PYTORCH_CUDA_ALLOC_CONF|EXPANDABLE|SWA_BOUNDED_REPLAY|NO_PREFIX_CACHE|MAX_NUM_BATCHED_TOKENS|MAX_NUM_SEQS|GPU_UTILIZATION|XIAOTU_MOE_MBT|DS41_MAXLEN|DS41_TP|DS41_SPEC|DS41_KV_DTYPE)=' \
+        | grep -E '^(DS41_API_KEY_STATE|DS41_FORCE_INCLUDE_USAGE|CUDAGRAPH_MODE|XIAOTU_MOE_THREADS|XIAOTU_PIN|XIAOTU_PIN_CUDA_MOE|XIAOTU_PIN_MAX_PER_LAYER|XIAOTU_IMAGE_MAX|XIAOTU_MOE4_MARLIN|XIAOTU_IDLE_EMPTY_CACHE|XIAOTU_IDLE_EC_SECONDS|XIAOTU_PIN_MAXQ|GPU_UTIL|MAXSEQS|COMPILE_RANGES|PYTORCH_CUDA_ALLOC_CONF|EXPANDABLE|SWA_BOUNDED_REPLAY|NO_PREFIX_CACHE|MAX_NUM_BATCHED_TOKENS|MAX_NUM_SEQS|GPU_UTILIZATION|XIAOTU_MOE_MBT|DS41_MAXLEN|DS41_TP|DS41_SPEC|DS41_KV_DTYPE|DRAFT_GREEDY)=' \
         | sed 's/^/    /'
     cc="$(eff_compilation_config "$pid")"
     say "    [生效] --compilation-config $cc"

@@ -91,6 +91,13 @@ TARGET=( "MODEL_DIR=$MODEL_DIR" "TAG=$TAG" "PORT=$PORT" "GPU_UTILIZATION=0.9" "M
 [ -d "$REPO" ] || die "仓库目录不存在：$REPO"
 cd "$REPO" || die "无法进入 $REPO"
 [ -f scripts/serve_ds41.sh ] || die "缺少 scripts/serve_ds41.sh"
+# 部署版本一致性：目标档用到的每个参数名都必须在本机 serve_ds41.sh 的参数表里，
+# 否则 restart 会在校验阶段拒绝、夜间静默变成 aborted_no_change（2026-11-26 实际发生）。
+for kv in "${TARGET[@]}"; do
+    n="${kv%%=*}"
+    grep -qE "(^|[ |])${n}[|)]" scripts/serve_ds41.sh \
+        || die "本机 scripts/serve_ds41.sh 不支持参数 ${n}（远端部署版本落后？先同步再重启）"
+done
 [ -d "$MODEL_DIR" ] || die "模型目录不存在：$MODEL_DIR"
 mkdir -p "$RUN" || die "无法写 $RUN"
 
@@ -235,7 +242,7 @@ TARGET_OK=0
 if [ "$RC" = "0" ] && wait_health && accept_all 1 19 200 FULL_DECODE_ONLY; then TARGET_OK=1; fi
 if [ "$TARGET_OK" = "1" ]; then
     say "✅ 目标口径成功"
-    rm -f "$FAILEDF" "$ALERT" "$DEGRADED"; write_last 0 "target_ok"; exit 0
+    rm -f "$FAILEDF" "$ALERT" "$DEGRADED" "$RUN/nightly_pending"; write_last 0 "target_ok"; exit 0
 fi
 
 NOW_PID="$(cat "$PIDFILE" 2>/dev/null || true)"

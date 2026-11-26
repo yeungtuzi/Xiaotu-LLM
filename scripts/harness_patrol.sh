@@ -57,13 +57,28 @@ REASONS=()
 # nightly 最近一次结果：0=目标成功 / 10=回滚成功 / 其它（11/12）=异常
 NL_EXIT="$(printf '%s' "${LAST:-}" | sed -n 's/.*"exit":\([0-9-]*\).*/\1/p')"
 NL_RES="$(printf '%s' "${LAST:-}" | sed -n 's/.*"result":"\([a-z_]*\)".*/\1/p')"
-case "${NL_EXIT:-}" in
-    0|10) ;;
-    11) REASONS+=("nightly 回滚失败(exit=11)") ;;
-    12) REASONS+=("nightly 未执行(exit=12,${NL_RES:-?})") ;;
-    "") REASONS+=("nightly 无结果文件") ;;
-    *) REASONS+=("nightly 异常退出(exit=${NL_EXIT})") ;;
-esac
+# 是否存在"一次待执行的重启"（单次调度器在启动时写，nightly 目标档成功后删）
+# pending 的内容含目标时刻；未到点前不追责、不提前补跑
+PENDING_N=0; PENDING_DUE=0
+PINFO="$(timeout 10 $SSH 'cat /home/user/lvllm/run/nightly_pending 2>/dev/null' 2>/dev/null | tr -d "\r")"
+P_TGT="$(printf '%s' "$PINFO" | sed -n 's/.*target=\([0-9: -]*\).*/\1/p')"
+if [ -n "$PINFO" ]; then
+    PENDING_N=1
+    if [ -n "$P_TGT" ]; then
+        TGT_EPOCH="$(date -d "$P_TGT" +%s 2>/dev/null || echo 0)"
+        [ "$(date +%s)" -ge "$TGT_EPOCH" ] && PENDING_DUE=1
+    else
+        PENDING_DUE=1
+    fi
+fi
+if [ "$PENDING_N" = "1" ] && [ "$PENDING_DUE" = "1" ]; then
+    case "${NL_EXIT:-}" in
+        0|10) ;;
+        11) REASONS+=("nightly 回滚失败(exit=11)") ;;
+        12) REASONS+=("nightly 未执行(exit=12,${NL_RES:-?})") ;;
+        *) REASONS+=("nightly 异常退出(exit=${NL_EXIT:-none})") ;;
+    esac
+fi
 case "$HIT" in NA) REASONS+=("命中率读不到") ;; *) awk -v h="$HIT" -v m="$HIT_MIN" 'BEGIN{exit !(h+0<m+0)}' && REASONS+=("命中率${HIT}%<${HIT_MIN}%") ;; esac
 [ "${DISK:-0}" -lt "$DISK_MIN_GB" ] 2>/dev/null && REASONS+=("磁盘可用${DISK}GB<${DISK_MIN_GB}GB")
 [ "${ERRKV:-0}" -gt 0 ] 2>/dev/null && REASONS+=("日志最近300行含${ERRKV}条致命行")
@@ -74,7 +89,7 @@ RETRY_MARK="/root/lvllm/backup/patrol/.retried-$(date +%Y%m%d)"
 NEED="/root/lvllm/backup/patrol/NEEDS_ATTENTION.txt"
 ACTED=""
 NL_EXIT_V="${NL_EXIT:-}"
-if [ "${NL_EXIT_V:-}" != "0" ] && [ "${NL_EXIT_V:-}" != "10" ]; then
+if [ "$PENDING_N" = "1" ] && [ "$PENDING_DUE" = "1" ] && [ "${NL_EXIT_V:-}" != "0" ] && [ "${NL_EXIT_V:-}" != "10" ]; then
     NOW_H="$(date +%H | sed 's/^0//')"
     ELAPSED=$(( (NOW_H - AT_H + 24) % 24 ))
     if [ "$ELAPSED" -lt "$RETRY_WINDOW_H" ] && [ ! -e "$RETRY_MARK" ]; then
@@ -90,7 +105,7 @@ fi
 
 # ---- 守护动作 ②：口径漂移（CUDA_MOE≠1）在维护窗口内 ⇒ 触发一次稳定档重启 ----
 MAINT_FROM="${MAINT_FROM:-2}"; MAINT_TO="${MAINT_TO:-6}"
-if [ "${CUDA:-NA}" != "1" ] && [ "${HEALTH:-0}" = "200" ]; then
+if [ "$PENDING_N" = "1" ] && [ "$PENDING_DUE" = "1" ] && [ "${CUDA:-NA}" != "1" ] && [ "${HEALTH:-0}" = "200" ]; then
     NOW_H2="$(date +%H | sed 's/^0//')"
     IN_MAINT=0
     if [ "$MAINT_FROM" -le "$MAINT_TO" ]; then
@@ -107,6 +122,7 @@ if [ "${CUDA:-NA}" != "1" ] && [ "${HEALTH:-0}" = "200" ]; then
     fi
 fi
 
+[ "$PENDING_N" = "1" ] && [ "$PENDING_DUE" = "0" ] && ACTED="${ACTED} 待 ${P_TGT:-下一个 03:00} 执行（未到点）"
 ALERT_N=0; REASON_STR=""
 if [ "${#REASONS[@]}" -gt 0 ]; then
     ALERT_N=1

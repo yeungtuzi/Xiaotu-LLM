@@ -54,20 +54,75 @@ REASONS=()
 [ "$SCHED" = "0" ] && REASONS+=("夜间调度未运行")
 [ "$FAILEDF" = "1" ] && REASONS+=("nightly_FAILED 存在")
 [ "$ALERTF" = "1" ] && REASONS+=("nightly_alert 存在")
+# nightly 最近一次结果：0=目标成功 / 10=回滚成功 / 其它（11/12）=异常
+NL_EXIT="$(printf '%s' "${LAST:-}" | sed -n 's/.*"exit":\([0-9-]*\).*/\1/p')"
+NL_RES="$(printf '%s' "${LAST:-}" | sed -n 's/.*"result":"\([a-z_]*\)".*/\1/p')"
+case "${NL_EXIT:-}" in
+    0|10) ;;
+    11) REASONS+=("nightly 回滚失败(exit=11)") ;;
+    12) REASONS+=("nightly 未执行(exit=12,${NL_RES:-?})") ;;
+    "") REASONS+=("nightly 无结果文件") ;;
+    *) REASONS+=("nightly 异常退出(exit=${NL_EXIT})") ;;
+esac
 case "$HIT" in NA) REASONS+=("命中率读不到") ;; *) awk -v h="$HIT" -v m="$HIT_MIN" 'BEGIN{exit !(h+0<m+0)}' && REASONS+=("命中率${HIT}%<${HIT_MIN}%") ;; esac
 [ "${DISK:-0}" -lt "$DISK_MIN_GB" ] 2>/dev/null && REASONS+=("磁盘可用${DISK}GB<${DISK_MIN_GB}GB")
 [ "${ERRKV:-0}" -gt 0 ] 2>/dev/null && REASONS+=("日志最近300行含${ERRKV}条致命行")
+
+# ---- 守护动作：夜间任务失败且仍在可补跑窗口 ⇒ 立刻在远端补跑一次（每晚至多一次）----
+AT_H="${AT_H:-3}"; RETRY_WINDOW_H="${RETRY_WINDOW_H:-4}"
+RETRY_MARK="/root/lvllm/backup/patrol/.retried-$(date +%Y%m%d)"
+NEED="/root/lvllm/backup/patrol/NEEDS_ATTENTION.txt"
+ACTED=""
+NL_EXIT_V="${NL_EXIT:-}"
+if [ "${NL_EXIT_V:-}" != "0" ] && [ "${NL_EXIT_V:-}" != "10" ]; then
+    NOW_H="$(date +%H | sed 's/^0//')"
+    ELAPSED=$(( (NOW_H - AT_H + 24) % 24 ))
+    if [ "$ELAPSED" -lt "$RETRY_WINDOW_H" ] && [ ! -e "$RETRY_MARK" ]; then
+        : > "$RETRY_MARK"
+        timeout 20 $SSH 'cd /home/user/lvllm/vllm-xiaotu-moe && setsid nohup bash scripts/nightly_restart_stable.sh > /home/user/lvllm/run/nightly_retry_'"$(date +%Y%m%d-%H%M%S)"'.log 2>&1 < /dev/null & echo RETRY_STARTED' >/dev/null 2>&1 \
+            && ACTED="已自动补跑一次"
+    elif [ -e "$RETRY_MARK" ]; then
+        ACTED="今晚已补跑过，仍未成功"
+    else
+        ACTED="不在补跑窗口(03:00-07:00)"
+    fi
+fi
+
+# ---- 守护动作 ②：口径漂移（CUDA_MOE≠1）在维护窗口内 ⇒ 触发一次稳定档重启 ----
+MAINT_FROM="${MAINT_FROM:-2}"; MAINT_TO="${MAINT_TO:-6}"
+if [ "${CUDA:-NA}" != "1" ] && [ "${HEALTH:-0}" = "200" ]; then
+    NOW_H2="$(date +%H | sed 's/^0//')"
+    IN_MAINT=0
+    if [ "$MAINT_FROM" -le "$MAINT_TO" ]; then
+        [ "$NOW_H2" -ge "$MAINT_FROM" ] && [ "$NOW_H2" -lt "$MAINT_TO" ] && IN_MAINT=1
+    else
+        { [ "$NOW_H2" -ge "$MAINT_FROM" ] || [ "$NOW_H2" -lt "$MAINT_TO" ]; } && IN_MAINT=1
+    fi
+    if [ "$IN_MAINT" = "1" ] && [ ! -e "$RETRY_MARK" ]; then
+        : > "$RETRY_MARK"
+        timeout 20 $SSH 'cd /home/user/lvllm/vllm-xiaotu-moe && setsid nohup bash scripts/nightly_restart_stable.sh > /home/user/lvllm/run/nightly_retry_drift_'"$(date +%Y%m%d-%H%M%S)"'.log 2>&1 < /dev/null & echo RETRY_STARTED' >/dev/null 2>&1 \
+            && ACTED="${ACTED} 已在维护窗口内触发稳定档重启"
+    elif [ "$IN_MAINT" = "0" ]; then
+        ACTED="${ACTED} 口径漂移但在维护窗口外(02:00-06:00)，需人工确认"
+    fi
+fi
 
 ALERT_N=0; REASON_STR=""
 if [ "${#REASONS[@]}" -gt 0 ]; then
     ALERT_N=1
     REASON_STR="$(printf '%s; ' "${REASONS[@]}")"
+    [ -n "$ACTED" ] && REASON_STR="${REASON_STR}[$ACTED] "
     { printf '%s ALERT health=%s pid=%s cuda_moe=%s slots=%s window=%s hit=%s%% sched=%s disk=%sGB err=%s :: %s\n' \
         "$(date '+%F %T')" "$HEALTH" "$PID" "$CUDA" "$SLOTS" "$WINDOW" "$HIT" "$SCHED" "$DISK" "$ERRKV" "$REASON_STR"; } >> "$ALERT"
     tail -200 "$ALERT" > "$ALERT.tmp" && mv "$ALERT.tmp" "$ALERT"
 fi
-printf '{"ts":"%s","alert":%s,"health":"%s","pid":"%s","owner":"%s","cuda_moe":"%s","slots":"%s","window":"%s","hit":"%s","sched":"%s","disk_gb":"%s","err":%s,"last":%s,"reason":"%s"}\n' \
-    "$(date '+%F %T')" "$ALERT_N" "$HEALTH" "$PID" "$OWNER" "$CUDA" "$SLOTS" "$WINDOW" "$HIT" "$SCHED" "$DISK" "${ERRKV:-0}" "${LAST:-{\}}" "$REASON_STR" >> "$OUT"
+if [ "$ALERT_N" = "1" ]; then
+    { echo "== 未处理告警（首次出现 $(date '+%F %T')）=="; printf '%s\n' "${REASONS[@]}"; } > "$NEED"
+else
+    rm -f "$NEED"
+fi
+printf '{"ts":"%s","alert":%s,"health":"%s","pid":"%s","owner":"%s","cuda_moe":"%s","slots":"%s","window":"%s","hit":"%s","sched":"%s","disk_gb":"%s","err":%s,"last":%s,"acted":"%s","reason":"%s"}\n' \
+    "$(date '+%F %T')" "$ALERT_N" "$HEALTH" "$PID" "$OWNER" "$CUDA" "$SLOTS" "$WINDOW" "$HIT" "$SCHED" "$DISK" "${ERRKV:-0}" "${LAST:-{\}}" "${ACTED}" "$REASON_STR" >> "$OUT"
 [ "$ALERT_N" = "1" ] && { echo "⚠️ $REASON_STR"; exit 3; }
 echo "✅ 巡检正常 health=$HEALTH cuda_moe=$CUDA slots=$SLOTS window=$WINDOW hit=${HIT}% sched=$SCHED disk=${DISK}GB"
 exit 0

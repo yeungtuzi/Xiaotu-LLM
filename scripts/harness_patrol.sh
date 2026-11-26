@@ -137,8 +137,9 @@ if [ "$ALERT_N" = "1" ]; then
 else
     rm -f "$NEED"
 fi
-printf '{"ts":"%s","alert":%s,"health":"%s","pid":"%s","owner":"%s","cuda_moe":"%s","slots":"%s","window":"%s","hit":"%s","sched":"%s","disk_gb":"%s","err":%s,"last":%s,"acted":"%s","reason":"%s"}\n' \
-    "$(date '+%F %T')" "$ALERT_N" "$HEALTH" "$PID" "$OWNER" "$CUDA" "$SLOTS" "$WINDOW" "$HIT" "$SCHED" "$DISK" "${ERRKV:-0}" "${LAST:-{\}}" "${ACTED}" "$REASON_STR" >> "$OUT"
+printf '{"ts":"%s","alert":%s,"health":"%s","pid":"%s","owner":"%s","cuda_moe":"%s","slots":"%s","window":"%s","hit":"%s","sched":"%s","disk_gb":"%s","err":%s,"last_exit":"%s","last_result":"%s","last_ts":"%s","acted":"%s","reason":"%s"}\n' \
+    "$(date '+%F %T')" "$ALERT_N" "$HEALTH" "$PID" "$OWNER" "$CUDA" "$SLOTS" "$WINDOW" "$HIT" "$SCHED" "$DISK" "${ERRKV:-0}" \
+    "${NL_EXIT:-}" "${NL_RES:-}" "${P_TGT:-}" "${ACTED//\"/}" "${REASON_STR//\"/}" >> "$OUT"
 [ "$ALERT_N" = "1" ] && { echo "⚠️ $REASON_STR"; exit 3; }
 echo "✅ 巡检正常 health=$HEALTH cuda_moe=$CUDA slots=$SLOTS window=$WINDOW hit=${HIT}% sched=$SCHED disk=${DISK}GB"
 exit 0

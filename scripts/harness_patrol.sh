@@ -39,7 +39,7 @@ WIN=$(printf "%s\n" "$E" | sed -n "s/^XIAOTU_PIN_WINDOW=//p" | head -1)
 HITW=$(grep -a "\[xtu-pin\]\[hit\]" $R/ds41_prod.log 2>/dev/null | grep -oE "=[0-9.]+%" | tr -d "=%" | tail -10)
 HIT=$(printf "%s\n" "$HITW" | awk "NF{s+=\$1;n++} END{if(n) printf \"%.1f\", s/n}")
 HIT_LAST=$(printf "%s\n" "$HITW" | tail -1)
-S=$(pgrep -f "schedule_nightly.sh" | head -1)
+S=$(cat $R/nightly_scheduler.pid 2>/dev/null); [ -z "$S" ] && S=0
 L=$(head -c 400 $R/nightly_last.json 2>/dev/null | tr -d " \n\r")
 AF=$([ -e $R/nightly_alert.txt ] && echo 1 || echo 0)
 FF=$([ -e $R/nightly_FAILED ] && echo 1 || echo 0)
@@ -53,7 +53,6 @@ REASONS=()
 [ "$PID" = "NA" ] && REASONS+=("PID文件缺失")
 [ "$PID" != "NA" ] && [ "$OWNER" != "NA" ] && [ "$PID" != "$OWNER" ] && REASONS+=("PID($PID)≠端口属主($OWNER)")
 [ "$CUDA" != "1" ] && REASONS+=("CUDA_MOE=$CUDA(应1)")
-[ "$SCHED" = "0" ] && REASONS+=("夜间调度未运行")
 [ "$FAILEDF" = "1" ] && REASONS+=("nightly_FAILED 存在")
 [ "$ALERTF" = "1" ] && REASONS+=("nightly_alert 存在")
 # nightly 最近一次结果：0=目标成功 / 10=回滚成功 / 其它（11/12）=异常
@@ -85,6 +84,7 @@ case "$HIT" in NA) REASONS+=("命中率读不到") ;; *) awk -v h="$HIT" -v m="$
 [ "${DISK:-0}" -lt "$DISK_MIN_GB" ] 2>/dev/null && REASONS+=("磁盘可用${DISK}GB<${DISK_MIN_GB}GB")
 [ "${ERRKV:-0}" -gt 0 ] 2>/dev/null && REASONS+=("日志最近300行含${ERRKV}条致命行")
 
+[ "$PENDING_N" = "1" ] && [ "$SCHED" = "0" ] && REASONS+=("夜间调度未运行（pending 未完成）")
 # ---- 守护动作：夜间任务失败且仍在可补跑窗口 ⇒ 立刻在远端补跑一次（每晚至多一次）----
 AT_H="${AT_H:-3}"; RETRY_WINDOW_H="${RETRY_WINDOW_H:-4}"
 RETRY_MARK="/root/lvllm/backup/patrol/.retried-$(date +%Y%m%d)"

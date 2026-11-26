@@ -27,7 +27,7 @@ mkdir -p "$OUTDIR" || exit 1
 OUT="$OUTDIR/patrol-$(date +%Y%m%d).jsonl"
 ALERT="$OUTDIR/ALERT.txt"
 
-read -r HEALTH PID OWNER CUDA SLOTS WINDOW HIT SCHED LAST ALERTF FAILEDF DISK ERRKV <<<"$(timeout 25 $SSH '
+read -r HEALTH PID OWNER CUDA SLOTS WINDOW HIT HIT_LAST SCHED LAST ALERTF FAILEDF DISK ERRKV <<<"$(timeout 25 $SSH '
 R=/home/user/lvllm/run
 H=$(curl -s --noproxy "*" -o /dev/null -w "%{http_code}" --max-time 5 http://127.0.0.1:8700/health 2>/dev/null)
 P=$(cat $R/ds41_prod.pid 2>/dev/null)
@@ -36,14 +36,16 @@ E=$(tr "\0" "\n" < /proc/$O/environ 2>/dev/null)
 CUDA=$(printf "%s\n" "$E" | sed -n "s/^XIAOTU_PIN_CUDA_MOE=//p" | head -1)
 SLOTS=$(printf "%s\n" "$E" | sed -n "s/^XIAOTU_PIN_MAX_PER_LAYER=//p" | head -1)
 WIN=$(printf "%s\n" "$E" | sed -n "s/^XIAOTU_PIN_WINDOW=//p" | head -1)
-HIT=$(grep -a "\[xtu-pin\]\[hit\]" $R/ds41_prod.log 2>/dev/null | tail -1 | grep -oE "=[0-9.]+%" | tail -1 | tr -d "=%")
+HITW=$(grep -a "\[xtu-pin\]\[hit\]" $R/ds41_prod.log 2>/dev/null | grep -oE "=[0-9.]+%" | tr -d "=%" | tail -10)
+HIT=$(printf "%s\n" "$HITW" | awk "NF{s+=\$1;n++} END{if(n) printf \"%.1f\", s/n}")
+HIT_LAST=$(printf "%s\n" "$HITW" | tail -1)
 S=$(pgrep -f "schedule_nightly.sh" | head -1)
 L=$(head -c 400 $R/nightly_last.json 2>/dev/null | tr -d " \n\r")
 AF=$([ -e $R/nightly_alert.txt ] && echo 1 || echo 0)
 FF=$([ -e $R/nightly_FAILED ] && echo 1 || echo 0)
 D=$(df -BG / 2>/dev/null | awk "NR==2{gsub(/[^0-9]/,\"\",\$4); print \$4}")
 ERR=$(tail -300 $R/ds41_prod.log 2>/dev/null | grep -acE "Traceback \(most recent call last\)|CUDA error|Xid [0-9]")
-printf "%s %s %s %s %s %s %s %s %s %s %s %s %s\n" "${H:-0}" "${P:-NA}" "${O:-NA}" "${CUDA:-NA}" "${SLOTS:-NA}" "${WIN:-NA}" "${HIT:-NA}" "${S:-0}" "${L:-{}}" "$AF" "$FF" "${D:-0}" "${ERR:-0}"
+printf "%s %s %s %s %s %s %s %s %s %s %s %s %s %s\n" "${H:-0}" "${P:-NA}" "${O:-NA}" "${CUDA:-NA}" "${SLOTS:-NA}" "${WIN:-NA}" "${HIT:-NA}" "${HIT_LAST:-NA}" "${S:-0}" "${L:-{}}" "$AF" "$FF" "${D:-0}" "${ERR:-0}"
 ')" || { read -r HEALTH PID OWNER CUDA SLOTS WINDOW HIT SCHED LAST ALERTF FAILEDF DISK ERRKV <<<"0 NA NA NA NA NA NA 0 {} 1 1 0 1"; }
 
 REASONS=()

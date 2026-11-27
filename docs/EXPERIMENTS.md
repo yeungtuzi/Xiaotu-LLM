@@ -37786,7 +37786,7 @@ GPU 数值稳定，CPU 波动来自主机调度/线程，不应拿 CPU 的 871 �
 
 **判据**：同样显存预算下，选「每 GiB 显存换到的命中专家权重比例」更高的粒度；
 并计入两项修正（整层额外省槽表/换入开销；槽位有换入成本且依赖流量稳定）。
-全文见 `dev-docs/PIN_GRANULARITY_CRITERION.md`。
+全文见内部文档 `dev-docs/PIN_GRANULARITY_CRITERION.md`（`dev-docs/` 不入库，要点已摘录于本条）。
 
 **两个方向相反的最优解（同一条判据）**：
 

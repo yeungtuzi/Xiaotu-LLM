@@ -134,6 +134,10 @@ if [ "${#REASONS[@]}" -gt 0 ]; then
         "$(date '+%F %T')" "$HEALTH" "$PID" "$CUDA" "$SLOTS" "$WINDOW" "$HIT" "$SCHED" "$DISK" "$ERRKV" "$REASON_STR"; } >> "$ALERT"
     tail -200 "$ALERT" > "$ALERT.tmp" && mv "$ALERT.tmp" "$ALERT"
 fi
+# 供"播报"读取的一行状态摘要（避免每次播报都要翻 jsonl）
+printf 'state=%s health=%s cuda_moe=%s slots=%s window=%s hit=%s%% err=%s disk=%sGB\n' \
+    "$([ "$ALERT_N" = "1" ] && echo ALERT || echo OK)" "$HEALTH" "$CUDA" "$SLOTS" "$WINDOW" "$HIT" "${ERRKV:-0}" "$DISK" > "$OUTDIR/STATE.txt" 2>/dev/null || true
+
 if [ "$ALERT_N" = "1" ]; then
     { echo "== 未处理告警（首次出现 $(date '+%F %T')）=="; printf '%s\n' "${REASONS[@]}"; } > "$NEED"
 else
